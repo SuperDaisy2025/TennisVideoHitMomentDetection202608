@@ -1,0 +1,29 @@
+# Tennis Form Analyzer 依存ライブラリ (v62時点)
+# Python 3.10+ (Windows miniforge3 で動作確認)
+
+# ── 画像・動画処理 ──
+opencv-python>=4.8.0
+Pillow>=10.0.0
+ffmpeg-python>=0.2.0
+
+# ── 音声解析 ──
+librosa>=0.10.0
+scipy>=1.11.0
+
+# ── 数値計算・データ ──
+numpy>=1.24.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# ── グラフ描画 ──
+matplotlib>=3.7.0
+
+# ── 姿勢推定 ──
+mediapipe>=0.10.0
+ultralytics>=8.0.0
+
+# ── MediaPipe 依存 ──
+absl-py>=1.4.0
+protobuf>=4.0.0
+
+# tkinter は Python 標準ライブラリ (miniforge3 に同梱)

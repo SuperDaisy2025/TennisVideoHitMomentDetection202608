@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+*.task
+audio/
+managed_videos/
+1_thumbnails/
+2_yolo_output/
+*.db
+*.npz
