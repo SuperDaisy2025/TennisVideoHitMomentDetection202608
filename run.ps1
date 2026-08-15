@@ -1,9 +1,9 @@
 $ErrorActionPreference = "Stop"
 $projectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$venvPython = Join-Path $projectDir ".venv\Scripts\python.exe"
+$venvPython = Join-Path $projectDir ".venv\python.exe"
 
 if (-not (Test-Path -LiteralPath $venvPython)) {
-    throw ".venv がありません。先に .\setup.ps1 を実行してください。"
+    throw "Python environment not found. Run setup.ps1 first."
 }
 
 Push-Location $projectDir

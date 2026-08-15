@@ -317,11 +317,11 @@ BG=     "#0f1117"; PANEL=  "#1a1d27"; PANEL2= "#141720"
 ACCENT= "#e8593c"; ACCENT2="#3b8bd4"; GOLD=   "#ef9f27"
 GREEN=  "#1d9e75"; TEXT=   "#d4d0c8"; SUBTEXT="#888780"
 BORDER= "#2c2e3a"; DARK2=  "#12141e"; RED= "#ff5252"
-APP_VERSION = "v63"; APP_VERSION_DESC = "高速MediaPipe HP検出"
+APP_VERSION = "v64"; APP_VERSION_DESC = "HP詳細・判定可視化"
 
 # v63: 音声HP候補を姿勢で検証する高速パラメータ。
 # 最初は候補時刻と前後0.1秒の3枚だけを解析し、打点探索は1フレームずつ行う。
-HP_POSE_COARSE_SEC = 0.10
+HP_POSE_COARSE_SEC = 0.30
 HP_POSE_MAX_REFINE_SEC = 0.18
 HP_POSE_MIN_VIS = 0.35
 HP_POSE_MIN_WRIST_TRAVEL = 0.12  # 肩幅で正規化した3点間の右手首移動量
@@ -1245,7 +1245,8 @@ class TennisApp(tk.Tk):
         lf=tk.Frame(p,bg=PANEL)
         lf.pack(fill="both",expand=True,padx=12,pady=(0,4))
         sb=tk.Scrollbar(lf,bg=PANEL); sb.pack(side="right",fill="y")
-        self.peak_list=tk.Listbox(lf,bg=DARK2,fg=TEXT,selectbackground=ACCENT,
+        self.peak_list=tk.Listbox(lf,bg=DARK2,fg=TEXT,selectbackground=GOLD,
+                                   selectforeground="#111111",exportselection=False,
                                    relief="flat",font=("Courier",10),
                                    yscrollcommand=sb.set,activestyle="none")
         self.peak_list.pack(side="left",fill="both",expand=True)
@@ -1312,10 +1313,13 @@ class TennisApp(tk.Tk):
         self.tabs.pack(fill="both",expand=True)
 
         self.tab_main    = tk.Frame(self.tabs,bg=BG)
-        self.tabs.add(self.tab_main,   text="ヒットポイント")
+        self.tab_hp_detail = tk.Frame(self.tabs,bg=BG)
+        self.tabs.add(self.tab_main,   text="ヒットポイント一覧")
+        self.tabs.add(self.tab_hp_detail, text="ヒットポイント詳細")
         self.tabs.bind("<<NotebookTabChanged>>",self._on_tab_changed)
 
         self._build_tab_main(self.tab_main)
+        self._build_tab_hp_detail(self.tab_hp_detail)
         # v63: 今回の画面はヒットポイント検出に限定する。
         self.refiner = None
 
@@ -1426,6 +1430,41 @@ class TennisApp(tk.Tk):
         self._label_bar=tk.Frame(m,bg=PANEL2)
         self._label_bar.pack(fill="x")
         self._build_label_bar(self._label_bar)
+
+    def _build_tab_hp_detail(self,parent):
+        """選択HPの3姿勢フレーム、音声エネルギー、判定結果を表示。"""
+        self._hp_detail_title=tk.StringVar(value="左の一覧からヒットポイントを選択してください")
+        tk.Label(parent,textvariable=self._hp_detail_title,bg=PANEL,fg=GOLD,
+                 font=_tk_font(13,bold=True),anchor="w").pack(fill="x",padx=12,pady=(8,4),ipady=5)
+        photos=tk.Frame(parent,bg=BG); photos.pack(fill="both",expand=True,padx=8,pady=3)
+        self._hp_detail_canvases=[]; self._hp_detail_time_vars=[]
+        for label in ("-0.3秒","候補フレーム","+0.3秒"):
+            col=tk.Frame(photos,bg=PANEL2); col.pack(side="left",fill="both",expand=True,padx=5)
+            v=tk.StringVar(value=label); self._hp_detail_time_vars.append(v)
+            tk.Label(col,textvariable=v,bg=PANEL2,fg=GOLD if label=="候補フレーム" else TEXT,
+                     font=_tk_font(10,bold=True)).pack(fill="x",pady=4)
+            cv=tk.Canvas(col,bg="#0b0d12",height=260,highlightthickness=0)
+            cv.pack(fill="both",expand=True,padx=4,pady=(0,4))
+            cv.bind("<Configure>",lambda e:self.after_idle(self._refresh_hp_detail))
+            self._hp_detail_canvases.append(cv)
+        self._hp_detail_photo_refs=[None,None,None]
+        chartbox=tk.Frame(parent,bg=PANEL2); chartbox.pack(fill="x",padx=13,pady=4)
+        tk.Label(chartbox,text="サウンドエネルギー（候補の前後2秒）",bg=PANEL2,fg=TEXT,
+                 font=_tk_font(10,bold=True),anchor="w").pack(fill="x",padx=7,pady=(4,0))
+        self._hp_detail_chart=tk.Canvas(chartbox,bg="#0b0d12",height=170,highlightthickness=0)
+        self._hp_detail_chart.pack(fill="x",padx=7,pady=5)
+        self._hp_detail_chart.bind("<Configure>",lambda e:self.after_idle(self._refresh_hp_detail))
+        row=tk.Frame(parent,bg=PANEL); row.pack(fill="x",padx=10,pady=(0,8))
+        self._hp_detail_result_vars={}
+        items=(("serve","サーブ判定"),("stroke","ストローク判定"),
+               ("wall","動きのない壁音候補の除外"),("safe","姿勢検出失敗時の安全な候補保持"))
+        for key,title in items:
+            box=tk.Frame(row,bg=DARK2); box.pack(side="left",fill="both",expand=True,padx=4,pady=3)
+            tk.Label(box,text=title,bg=DARK2,fg=SUBTEXT,font=_tk_font(9,bold=True),
+                     wraplength=210).pack(padx=5,pady=(6,2))
+            v=tk.StringVar(value="─"); self._hp_detail_result_vars[key]=v
+            tk.Label(box,textvariable=v,bg=DARK2,fg=TEXT,font=_tk_font(9,bold=True),
+                     wraplength=210).pack(padx=5,pady=(0,6))
 
     def _build_label_bar(self,parent):
         # ショット
@@ -2422,7 +2461,14 @@ class TennisApp(tk.Tk):
                     img=mp.Image(image_format=mp.ImageFormat.SRGB,data=np.ascontiguousarray(rgb))
                     with _suppress_stderr(): res=det.detect(img)
                     lms=res.pose_landmarks[0] if res.pose_landmarks else None
-                    result={"time":frame_no/fps,"feat":self._hp_pose_features(lms)}
+                    kps={}
+                    if lms:
+                        for mp_i,coco_i in self.MP_TO_COCO.items():
+                            if mp_i < len(lms):
+                                lm=lms[mp_i]
+                                kps[str(coco_i)]=[float(lm.x),float(lm.y),
+                                                  float(getattr(lm,"visibility",1.0))]
+                    result={"time":frame_no/fps,"feat":self._hp_pose_features(lms),"kps":kps}
                     frame_cache[frame_no]=result
                     return result
 
@@ -2460,7 +2506,11 @@ class TennisApp(tk.Tk):
                                     if stale>=2: break
                             item=dict(cand); item.update({"frame_time":float(best_t),
                                 "pose_shot":shot,"pose_confidence":verdict["confidence"],
-                                "pose_reason":verdict["reason"]})
+                                "pose_reason":verdict["reason"],
+                                "pose_travel":verdict.get("travel"),
+                                "pose_arm_change":verdict.get("arm_change"),
+                                "pose_samples":[{"time":float(s["time"]),"kps":s.get("kps",{})}
+                                                for s in coarse]})
                             accepted.append(item)
                         self.after(0,lambda d=n,total=len(candidates),r=rejected:
                             self._set_progress(62+7*d/max(1,total),
@@ -2476,6 +2526,80 @@ class TennisApp(tk.Tk):
             finally:
                 if cap is not None: cap.release()
         threading.Thread(target=_worker,daemon=True).start()
+
+    def _render_hp_detail_photo(self,canvas,sample,slot):
+        canvas.delete("all"); path=self.video_path.get()
+        frame=grab_frame(path,float(sample.get("time",0))) if path and sample else None
+        if frame is None:
+            canvas.create_text(max(canvas.winfo_width()//2,100),max(canvas.winfo_height()//2,80),
+                               text="画像なし",fill=SUBTEXT,font=_tk_font(10)); return
+        img=Image.fromarray(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)); iw,ih=img.size
+        points={}
+        for key,val in sample.get("kps",{}).items():
+            try:
+                if float(val[2])>=HP_POSE_MIN_VIS:
+                    points[int(key)]=(float(val[0])*iw,float(val[1])*ih)
+            except Exception: pass
+        if points:
+            xs=[v[0] for v in points.values()]; ys=[v[1] for v in points.values()]
+            sx=max(max(xs)-min(xs),iw*.08); sy=max(max(ys)-min(ys),ih*.12)
+            px=max(iw*.035,sx*.24); py=max(ih*.035,sy*.18)
+            x1=max(0,int(min(xs)-px)); y1=max(0,int(min(ys)-py))
+            x2=min(iw,int(max(xs)+px)); y2=min(ih,int(max(ys)+py))
+            if x2>x1 and y2>y1:
+                img=img.crop((x1,y1,x2,y2)); points={k:(x-x1,y-y1) for k,(x,y) in points.items()}
+        draw=ImageDraw.Draw(img,"RGBA"); radius=max(4,int(min(img.size)*.018))
+        for ki,(x,y) in points.items():
+            _draw_kp_shape_pil(draw,KP_SHAPES[ki],x,y,radius,KP_COLORS[ki],"white",1)
+        cw=max(canvas.winfo_width(),220); ch=max(canvas.winfo_height(),170)
+        scale=min(cw/max(img.width,1),ch/max(img.height,1))
+        disp=img.resize((max(1,int(img.width*scale)),max(1,int(img.height*scale))),Image.LANCZOS)
+        photo=ImageTk.PhotoImage(disp); self._hp_detail_photo_refs[slot]=photo
+        canvas.create_image(cw//2,ch//2,image=photo,anchor="center")
+        if not points:
+            canvas.create_text(cw//2,ch-16,text="MediaPipe姿勢検出なし",fill=RED,font=_tk_font(9,bold=True))
+
+    def _draw_hp_detail_energy(self,peak,samples):
+        cv=self._hp_detail_chart; cv.delete("all"); w=max(cv.winfo_width(),500); h=max(cv.winfo_height(),140)
+        if self.data is None:return
+        center=float(peak["time"]); lo=center-2; hi=center+2
+        times=np.asarray(self.data.get("times",[])); energy=np.asarray(self.data.get("combined",[]))
+        mask=(times>=lo)&(times<=hi); tx=times[mask]; ey=energy[mask]
+        pl,pr,pt,pb=42,14,12,25
+        cv.create_line(pl,h-pb,w-pr,h-pb,fill=BORDER); cv.create_line(pl,pt,pl,h-pb,fill=BORDER)
+        if len(tx)>1:
+            top=max(float(np.max(ey)),1e-6); coords=[]
+            for t,e in zip(tx,ey):
+                coords += [pl+(float(t)-lo)/4*(w-pl-pr),h-pb-float(e)/top*(h-pt-pb)]
+            cv.create_line(*coords,fill=ACCENT2,width=2,smooth=True)
+        for rel in range(-2,3):
+            x=pl+(rel+2)/4*(w-pl-pr); cv.create_text(x,h-10,text=f"{rel:+d}s",fill=SUBTEXT,font=_tk_font(8))
+        for i,s in enumerate(samples[:3]):
+            x=pl+(float(s.get("time",center))-lo)/4*(w-pl-pr); color=GOLD if i==1 else "#68a9ff"
+            cv.create_line(x,pt,x,h-pb,fill=color,width=3 if i==1 else 2)
+            cv.create_text(x+3,pt+5,text=("候補" if i==1 else f"{float(s['time'])-center:+.1f}s"),
+                           fill=color,font=_tk_font(8,bold=True),anchor="nw")
+
+    def _refresh_hp_detail(self):
+        if not hasattr(self,"_hp_detail_canvases") or not self.peaks:return
+        peak=self.peaks[self.peak_idx]; samples=list(peak.get("pose_samples") or [])
+        while len(samples)<3:
+            i=len(samples); samples.append({"time":max(0,peak["time"]+(-.3,0,.3)[i]),"kps":{}})
+        self._hp_detail_title.set(f"HP #{peak['rank']}  音声候補 {peak['time']:.3f}秒  "
+                                  f"採用フレーム {(peak.get('frame_time') or peak['time']):.3f}秒")
+        for i,(cv,s) in enumerate(zip(self._hp_detail_canvases,samples[:3])):
+            rel=float(s["time"])-float(peak["time"]); title="候補フレーム" if i==1 else f"{rel:+.3f}秒"
+            self._hp_detail_time_vars[i].set(f"{title}  ({float(s['time']):.3f}秒)")
+            self._render_hp_detail_photo(cv,s,i)
+        self._draw_hp_detail_energy(peak,samples)
+        shot=peak.get("pose_shot"); reason=peak.get("pose_reason"); conf=peak.get("pose_confidence")
+        pct=f" {float(conf):.0%}" if conf is not None else ""
+        self._hp_detail_result_vars["serve"].set("✓ サーブ"+pct if shot=="serve" else "─ 条件なし")
+        self._hp_detail_result_vars["stroke"].set("✓ ストローク"+pct if shot=="stroke" else "─ 条件なし")
+        self._hp_detail_result_vars["wall"].set("✓ 除外せず（動作あり）" if reason=="swing" else
+                                                "✓ 壁音として除外" if reason=="no_swing" else "─ 判定保留")
+        self._hp_detail_result_vars["safe"].set("✓ 姿勢失敗のため保持" if reason=="pose_uncertain" else
+                                                "─ 姿勢検出成功")
 
     def _on_error(self,msg):
         try: self.progress.stop()
@@ -2546,6 +2670,9 @@ class TennisApp(tk.Tk):
                                "pose_shot":pose_meta.get("pose_shot"),
                                "pose_confidence":pose_meta.get("pose_confidence"),
                                "pose_reason":pose_meta.get("pose_reason"),
+                               "pose_travel":pose_meta.get("pose_travel"),
+                               "pose_arm_change":pose_meta.get("pose_arm_change"),
+                               "pose_samples":pose_meta.get("pose_samples",[]),
                                "source":"auto"})
 
         # 手動CP
@@ -2575,6 +2702,7 @@ class TennisApp(tk.Tk):
         self.peak_idx=0; self.frame_offset=0
         self._update_shot_list()
         self._update_view()
+        self._refresh_hp_detail()
         self._set_progress(100,"完了")
         self.status_var.set(
             f"ヒットポイント: {len(self.peaks)} 件"
@@ -3303,6 +3431,7 @@ class TennisApp(tk.Tk):
         else:
             self.frame_offset=0
         self._update_view()
+        self._refresh_hp_detail()
         # v24: 連続写真タブの CP セレクタを同期 + そのタブ表示中なら再描画
         try:
             if hasattr(self,"cs_peak_sel") and self.cs_peak_sel.winfo_exists():
@@ -4051,9 +4180,7 @@ class TennisApp(tk.Tk):
         try: idx=self.tabs.index(self.tabs.select())
         except Exception: return
         if idx==1:
-            if not self.peaks: return
-            self._update_cs_dropdowns()
-            if hasattr(self,"_cs_regen"): self._cs_regen()
+            self._refresh_hp_detail()
         elif idx==2:
             if not self.peaks: return
             self._update_c1_dropdowns()

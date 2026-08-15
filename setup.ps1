@@ -1,11 +1,18 @@
 $ErrorActionPreference = "Stop"
 $projectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$venvPython = Join-Path $projectDir ".venv\Scripts\python.exe"
+$condaExe = Join-Path $env:USERPROFILE "miniforge3\Scripts\conda.exe"
+$envDir = Join-Path $projectDir ".venv"
+$venvPython = Join-Path $envDir "python.exe"
 
 if (-not (Test-Path -LiteralPath $venvPython)) {
-    py -3.10 -m venv (Join-Path $projectDir ".venv")
+    if (-not (Test-Path -LiteralPath $condaExe)) {
+        throw "Miniforge was not found at $condaExe"
+    }
+    & $condaExe create --prefix $envDir python=3.10 pip tk ffmpeg -y
+} else {
+    & $condaExe install --prefix $envDir tk ffmpeg -y
 }
 
 & $venvPython -m pip install --upgrade pip
 & $venvPython -m pip install -r (Join-Path $projectDir "requirements.txt")
-Write-Host "セットアップが完了しました。次は .\run.ps1 を実行してください。"
+Write-Host "Setup completed. Run .\run.ps1 next."
