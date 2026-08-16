@@ -1,4 +1,5 @@
 import importlib.util
+import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -152,10 +153,31 @@ def test_verified_hit_point_database_persists_and_unchecks():
         row={"video_key":TA._ground_truth_video_key(video),"video_path":video,
              "video_file":"sample.mp4","peak_rank":2,"peak_time":1.234,
              "frame_time":1.235,"camera_dir":"正面","video_shots":"[\"バックハンド\"]",
-             "shot_type":"バックハンド","rw_x":2.0,"rw_y":-1.0,"lw_x":1.0,
+             "content_type":"壁打ち","shot_type":"backhand","sensitivity":0.3,
+             "rw_x":2.0,"rw_y":-1.0,"lw_x":1.0,
              "lw_y":0.0,"re_x":3.0,"re_y":2.0,"le_x":-2.0,"le_y":1.0,
              "ball_detected":1,"pose_backend":"yolo"}
         TA.save_ground_truth(row,True,db_path)
         assert (2,1.234) in TA.load_ground_truth_keys(video,db_path)
+        con=sqlite3.connect(db_path)
+        saved=con.execute("SELECT camera_dir,content_type,shot_type,sensitivity "
+                          "FROM verified_hit_points").fetchone()
+        con.close()
+        assert saved == ("正面","壁打ち","backhand",0.3)
         TA.save_ground_truth(row,False,db_path)
         assert TA.load_ground_truth_keys(video,db_path)==set()
+
+
+def test_verified_database_migrates_existing_schema_for_sensitivity():
+    with tempfile.TemporaryDirectory() as folder:
+        db_path=str(Path(folder)/"old_truth.db")
+        con=sqlite3.connect(db_path)
+        con.execute("CREATE TABLE verified_hit_points (video_key TEXT, peak_rank INTEGER, "
+                    "peak_time REAL, camera_dir TEXT, shot_type TEXT, "
+                    "PRIMARY KEY(video_key,peak_rank,peak_time))")
+        con.commit(); con.close()
+        TA.init_ground_truth_db(db_path)
+        con=sqlite3.connect(db_path)
+        columns={row[1] for row in con.execute("PRAGMA table_info(verified_hit_points)")}
+        con.close()
+        assert {"content_type","sensitivity"}.issubset(columns)

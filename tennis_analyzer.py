@@ -321,7 +321,7 @@ BG=     "#0f1117"; PANEL=  "#1a1d27"; PANEL2= "#141720"
 ACCENT= "#e8593c"; ACCENT2="#3b8bd4"; GOLD=   "#ef9f27"
 GREEN=  "#1d9e75"; TEXT=   "#d4d0c8"; SUBTEXT="#888780"
 BORDER= "#2c2e3a"; DARK2=  "#12141e"; RED= "#ff5252"
-APP_VERSION = "v72"; APP_VERSION_DESC = "正解教師データ蓄積"
+APP_VERSION = "v73"; APP_VERSION_DESC = "感度付き正解教師データ"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -489,7 +489,8 @@ def init_ground_truth_db(db_path=None):
     con.execute("""CREATE TABLE IF NOT EXISTS verified_hit_points (
         video_key TEXT NOT NULL, video_path TEXT, video_file TEXT,
         peak_rank INTEGER, peak_time REAL, frame_time REAL,
-        camera_dir TEXT, video_shots TEXT, shot_type TEXT,
+        camera_dir TEXT, content_type TEXT, video_shots TEXT, shot_type TEXT,
+        sensitivity REAL,
         rw_x REAL, rw_y REAL, lw_x REAL, lw_y REAL,
         re_x REAL, re_y REAL, le_x REAL, le_y REAL,
         ball_detected INTEGER, pose_backend TEXT,
@@ -498,6 +499,10 @@ def init_ground_truth_db(db_path=None):
         PRIMARY KEY(video_key, peak_rank, peak_time))""")
     con.execute("CREATE INDEX IF NOT EXISTS idx_verified_video ON verified_hit_points(video_key)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_verified_group ON verified_hit_points(camera_dir,shot_type)")
+    # v73: 既存の正解DBを壊さず、解析条件列だけを追加する。
+    for column,sql_type in (("content_type","TEXT"),("sensitivity","REAL")):
+        try:con.execute(f"ALTER TABLE verified_hit_points ADD COLUMN {column} {sql_type}")
+        except sqlite3.OperationalError:pass
     con.commit(); con.close()
     return db_path
 
@@ -521,7 +526,8 @@ def save_ground_truth(row,checked=True,db_path=None):
                     (key,row["peak_rank"],row["peak_time"]))
     else:
         cols=("video_key","video_path","video_file","peak_rank","peak_time","frame_time",
-              "camera_dir","video_shots","shot_type","rw_x","rw_y","lw_x","lw_y",
+              "camera_dir","content_type","video_shots","shot_type","sensitivity",
+              "rw_x","rw_y","lw_x","lw_y",
               "re_x","re_y","le_x","le_y","ball_detected","pose_backend")
         values=[row.get(c) for c in cols]
         placeholders=",".join("?" for _ in cols)
@@ -3003,6 +3009,7 @@ class TennisApp(tk.Tk):
                                "pose_travel":pose_meta.get("pose_travel"),
                                "pose_arm_change":pose_meta.get("pose_arm_change"),
                                "pose_samples":pose_meta.get("pose_samples",[]),
+                               "detection_sensitivity":float(self.sensitivity.get()),
                                "source":"auto"})
 
         # 手動CP
@@ -3013,7 +3020,9 @@ class TennisApp(tk.Tk):
             lbl=all_labels.get(m["rank"])
             ft=float(lbl[3]) if (lbl and lbl[3] is not None and lbl[3]>0) else t
             self.peaks.append({"rank":m["rank"],"idx":-1,"time":t,
-                               "thumb":"","frame_time":ft,"source":"manual"})
+                               "thumb":"","frame_time":ft,
+                               "detection_sensitivity":float(self.sensitivity.get()),
+                               "source":"manual"})
 
         # 時系列に並べる
         self.peaks.sort(key=lambda p: p["time"])
@@ -3109,12 +3118,16 @@ class TennisApp(tk.Tk):
         main_codes=[popup_shot_codes.get(s,s) for s in main_shots]
         effective_shot=manual if manual not in ("","other","unknown") else \
                        (main_codes[0] if len(main_codes)==1 else ",".join(main_codes))
+        try:sensitivity=float(peak.get("detection_sensitivity",self.sensitivity.get()))
+        except Exception:sensitivity=float(extra.get("sensitivity",0.4))
         row={"video_key":_ground_truth_video_key(path),"video_path":os.path.abspath(path),
              "video_file":os.path.basename(path),"peak_rank":rank,"peak_time":t,
              "frame_time":float(peak.get("frame_time") or t),
              "camera_dir":str(extra.get("camera_dir","") or ""),
+             "content_type":str(extra.get("content_type","") or ""),
              "video_shots":json.dumps(main_shots,ensure_ascii=False),
-             "shot_type":effective_shot,"ball_detected":1 if ball else 0,
+             "shot_type":effective_shot,"sensitivity":sensitivity,
+             "ball_detected":1 if ball else 0,
              "pose_backend":str(peak.get("pose_backend","") or "")}
         for key in ("rw_x","rw_y","lw_x","lw_y","re_x","re_y","le_x","le_y"):
             row[key]=motion.get(key)
@@ -3161,6 +3174,8 @@ class TennisApp(tk.Tk):
         if not out_path:return
         try:
             all_labels=load_all_labels(get_db_path(path),os.path.basename(path))
+            extra=getattr(self,"_video_meta_extra",{}) or {}
+            export_sensitivity=float(self.sensitivity.get())
             rows=[]
             names=(("右手首_X_cm","rw_x"),("右手首_Y_cm","rw_y"),
                    ("左手首_X_cm","lw_x"),("左手首_Y_cm","lw_y"),
@@ -3173,6 +3188,10 @@ class TennisApp(tk.Tk):
                 truth_key=(int(rank),round(float(peak.get("time",0)),3))
                 row={"正解":("✓" if truth_key in truth_keys else ""),
                      "HP番号":rank,"候補時刻_秒":round(float(peak.get("time",0)),3),
+                     "撮影方向":extra.get("camera_dir",""),
+                     "内容":extra.get("content_type",""),
+                     "動画の主ショット":",".join(extra.get("main_shots") or []),
+                     "検出感度":float(peak.get("detection_sensitivity",export_sensitivity)),
                      "採用フレーム_秒":round(float(peak.get("frame_time") or peak.get("time",0)),3),
                      "姿勢検出":("YOLO" if peak.get("pose_backend")=="yolo" else "MediaPipe"),
                      "自動判定":peak.get("pose_shot") or "",
