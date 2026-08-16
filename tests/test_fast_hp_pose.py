@@ -65,3 +65,18 @@ def test_missing_pose_is_kept_as_uncertain():
     result = classify([None, None, feat(0.5, 0.5, stroke=True)])
     assert result["keep"] is True
     assert result["reason"] == "pose_uncertain"
+
+
+def test_frequency_filter_toggle_changes_peak_source():
+    data = {
+        "combined": np.array([0.0, 1.0, 0.0, 0.1, 0.0]),
+        "broadband": np.array([0.0, 0.1, 0.0, 1.0, 0.0]),
+        "times": np.arange(5, dtype=float),
+        "sr": 512,
+    }
+    filtered, _ = TA.detect_peaks(data, sensitivity=0.2, min_gap=0.1,
+                                  use_frequency_filter=True)
+    broadband, _ = TA.detect_peaks(data, sensitivity=0.2, min_gap=0.1,
+                                   use_frequency_filter=False)
+    assert filtered.tolist() == [1]
+    assert broadband.tolist() == [3]

@@ -317,10 +317,10 @@ BG=     "#0f1117"; PANEL=  "#1a1d27"; PANEL2= "#141720"
 ACCENT= "#e8593c"; ACCENT2="#3b8bd4"; GOLD=   "#ef9f27"
 GREEN=  "#1d9e75"; TEXT=   "#d4d0c8"; SUBTEXT="#888780"
 BORDER= "#2c2e3a"; DARK2=  "#12141e"; RED= "#ff5252"
-APP_VERSION = "v64"; APP_VERSION_DESC = "HP詳細・判定可視化"
+APP_VERSION = "v65"; APP_VERSION_DESC = "候補監査・音声拡大"
 
 # v63: 音声HP候補を姿勢で検証する高速パラメータ。
-# 最初は候補時刻と前後0.1秒の3枚だけを解析し、打点探索は1フレームずつ行う。
+# 最初は候補時刻と前後0.3秒の3枚だけを解析し、打点探索は1フレームずつ行う。
 HP_POSE_COARSE_SEC = 0.30
 HP_POSE_MAX_REFINE_SEC = 0.18
 HP_POSE_MIN_VIS = 0.35
@@ -382,20 +382,26 @@ def analyze_audio(audio_path):
         y=sp.sosfilt(sos_hi, y_perc), sr=sr, hop_length=512, aggregate=np.median)
     wall     = librosa.onset.onset_strength(
         y=sp.sosfilt(sos_mid, y), sr=sr, hop_length=512, aggregate=np.median)
-    n = min(len(impact), len(wall))
+    broadband = librosa.onset.onset_strength(
+        y=y, sr=sr, hop_length=512, aggregate=np.median)
+    n = min(len(impact), len(wall), len(broadband))
     times = np.arange(n) * (512/sr)
     def norm(x): m=np.max(x); return x/m if m>0 else x
-    impact_n=norm(impact[:n]); wall_n=norm(wall[:n])
+    impact_n=norm(impact[:n]); wall_n=norm(wall[:n]); broadband_n=norm(broadband[:n])
     return {"y":y,"sr":sr,"duration":duration,"times":times,
-            "impact":impact_n,"wall":wall_n,"combined":0.65*impact_n+0.35*wall_n}
+            "impact":impact_n,"wall":wall_n,"broadband":broadband_n,
+            "combined":0.65*impact_n+0.35*wall_n}
 
-def detect_peaks(data, sensitivity=0.5, min_gap=1.0, wall_mode=False):
+def detect_peaks(data, sensitivity=0.5, min_gap=1.0, wall_mode=False,
+                 use_frequency_filter=True):
     """ピーク検出。
        wall_mode=True なら壁打ちモード: min_gap を 0.5s 以上に強制し、
        0.05〜0.30秒間隔のペアピーク (壁エコー想定) を抑制"""
     if wall_mode:
         min_gap=max(min_gap,0.5)
-    combined=data["combined"]; times=data["times"]; sr=data["sr"]
+    combined=(data["combined"] if use_frequency_filter else
+              data.get("broadband",data["combined"]))
+    times=data["times"]; sr=data["sr"]
     raw,_=sp.find_peaks(combined, height=np.max(combined)*(1-sensitivity),
                         distance=max(1,int(min_gap*sr/512)) if not wall_mode else 1)
     filtered,last_t=[],- np.inf
@@ -953,6 +959,7 @@ class TennisApp(tk.Tk):
         self.sensitivity  = tk.DoubleVar(value=0.5)
         self.min_gap      = tk.DoubleVar(value=0.35)   # v18: 1.0 → 0.35s
         self.wall_mode    = tk.BooleanVar(value=False) # v18: 壁打ちモード
+        self.audio_filter_enabled = tk.BooleanVar(value=True)
         self.camera_dist  = tk.DoubleVar(value=3.0)
         # v23: プレイヤー身長 (cm)
         self.player_height = tk.IntVar(value=DEFAULT_PLAYER_HEIGHT_CM)
@@ -961,6 +968,9 @@ class TennisApp(tk.Tk):
         #   各要素 {"rank":int(1始まり,検出順で固定), "idx":int, "time":float, "thumb":str}
         self.peaks        = []
         self.video_fps    = 30.0
+        self._hp_candidate_audit = []
+        self._timeline_zoomed = False
+        self._timeline_candidate_markers = []
 
         # 現在の選択状態
         self.peak_idx     = 0        # self.peaks 内のインデックス(表示位置)
@@ -1036,6 +1046,13 @@ class TennisApp(tk.Tk):
         self._video_wh = (1920, 1080)
         self._video_duration = 0
         self._pending_jump_rank = None
+        self._hp_candidate_audit = []
+        self._timeline_zoomed = False
+        self._timeline_candidate_markers = []
+        try:
+            self.timeline.configure(height=60)
+            self.btn_timeline_zoom.configure(text="拡大",bg=DARK2)
+        except Exception: pass
 
         # v24: 手ぶれ判定
         self._shake_scores = {}        # {rank: float} px/frame 平均移動量
@@ -1336,6 +1353,8 @@ class TennisApp(tk.Tk):
         self.timeline=tk.Canvas(m,bg="#111",height=60,highlightthickness=0)
         self.timeline.pack(fill="x",padx=4,pady=(0,0))
         self.timeline.bind("<Button-1>",self._on_timeline_click)
+        self.timeline.bind("<Motion>",self._on_timeline_motion)
+        self.timeline.bind("<Leave>",lambda e:self._hide_timeline_tooltip())
         self.timeline.bind("<Configure>",lambda e:self._draw_timeline())
         self.tl_placeholder=True
 
@@ -1361,6 +1380,14 @@ class TennisApp(tk.Tk):
         self.time_lbl=tk.Label(trans,text="00:00.00 / 00:00",bg=PANEL2,fg=GOLD,
                                font=("Courier",12,"bold"))
         self.time_lbl.pack(side="left",padx=12)
+        self.btn_timeline_zoom=tk.Button(trans,text="拡大",bg=DARK2,fg=GOLD,relief="flat",
+                                         font=_tk_font(9,bold=True),width=7,
+                                         command=self._toggle_timeline_zoom,cursor="hand2")
+        self.btn_timeline_zoom.pack(side="right",padx=5,ipady=4,pady=3)
+        self.btn_audio_filter=tk.Button(trans,text="周波数フィルター ON",bg=GREEN,fg="white",
+                                        relief="flat",font=_tk_font(9,bold=True),width=16,
+                                        command=self._toggle_audio_filter,cursor="hand2")
+        self.btn_audio_filter.pack(side="right",padx=3,ipady=4,pady=3)
 
         # コンパクト再生コントロール (v22: 同じ PANEL2 上のサブ行として配置、
         #  トランスポートと視覚的に近接させ、デフォルト 1.5/1.5)
@@ -2311,6 +2338,9 @@ class TennisApp(tk.Tk):
         # キャッシュ確認 (.npz が存在すれば再解析せず即ロード)
         cache_path=get_analysis_cache_path(path)
         cached=load_analysis_cache(cache_path)
+        # v65: 旧キャッシュには周波数フィルターOFF用の広帯域エネルギーがない。
+        if cached is not None and "broadband" not in cached:
+            cached=None
         if cached is not None:
             self.data=cached
             self._set_progress(50,"キャッシュ読込完了")
@@ -2425,7 +2455,8 @@ class TennisApp(tk.Tk):
         # find_peaksのdistanceで先に片方を消さないよう、この段階だけ間隔を短くする。
         candidate_gap=0.12 if bool(self.wall_mode.get()) else self.min_gap.get()
         indices,_=detect_peaks(self.data,self.sensitivity.get(),candidate_gap,
-                               wall_mode=False)
+                               wall_mode=False,
+                               use_frequency_filter=bool(self.audio_filter_enabled.get()))
         candidates=[{"idx":int(i),"time":float(self.data["times"][i])} for i in indices]
         if not candidates:
             self._refresh_peaks(refined_candidates=[])
@@ -2456,7 +2487,8 @@ class TennisApp(tk.Tk):
                     cap.set(cv2.CAP_PROP_POS_FRAMES,frame_no)
                     ok,bgr=cap.read()
                     if not ok:
-                        result={"time":frame_no/fps,"feat":None}; frame_cache[frame_no]=result; return result
+                        result={"time":frame_no/fps,"frame_no":frame_no,"feat":None,"kps":{}}
+                        frame_cache[frame_no]=result; return result
                     rgb=cv2.cvtColor(bgr,cv2.COLOR_BGR2RGB)
                     img=mp.Image(image_format=mp.ImageFormat.SRGB,data=np.ascontiguousarray(rgb))
                     with _suppress_stderr(): res=det.detect(img)
@@ -2468,11 +2500,12 @@ class TennisApp(tk.Tk):
                                 lm=lms[mp_i]
                                 kps[str(coco_i)]=[float(lm.x),float(lm.y),
                                                   float(getattr(lm,"visibility",1.0))]
-                    result={"time":frame_no/fps,"feat":self._hp_pose_features(lms),"kps":kps}
+                    result={"time":frame_no/fps,"frame_no":frame_no,
+                            "feat":self._hp_pose_features(lms),"kps":kps}
                     frame_cache[frame_no]=result
                     return result
 
-                accepted=[]; rejected=0
+                accepted=[]; rejected=0; audit=[]
                 with _suppress_stderr(): detector_cm=vision.PoseLandmarker.create_from_options(opts)
                 with detector_cm as det:
                     for n,cand in enumerate(candidates,1):
@@ -2481,6 +2514,13 @@ class TennisApp(tk.Tk):
                         coarse=[detect_at(det,max(0.0,min(duration,t+d)))
                                 for d in (-HP_POSE_COARSE_SEC,0.0,HP_POSE_COARSE_SEC)]
                         verdict=self._classify_hp_pose_triplet(coarse)
+                        audit_item={"time":float(t),"idx":int(cand["idx"]),
+                                    "selected":bool(verdict["keep"]),
+                                    "reason":verdict.get("reason","unknown"),
+                                    "shot":verdict.get("shot","unknown"),
+                                    "travel":verdict.get("travel"),
+                                    "arm_change":verdict.get("arm_change")}
+                        audit.append(audit_item)
                         if not verdict["keep"]:
                             rejected+=1
                         else:
@@ -2509,15 +2549,17 @@ class TennisApp(tk.Tk):
                                 "pose_reason":verdict["reason"],
                                 "pose_travel":verdict.get("travel"),
                                 "pose_arm_change":verdict.get("arm_change"),
-                                "pose_samples":[{"time":float(s["time"]),"kps":s.get("kps",{})}
+                                "pose_samples":[{"time":float(s["time"]),
+                                                "frame_no":int(s.get("frame_no",round(s["time"]*fps))),
+                                                "kps":s.get("kps",{})}
                                                 for s in coarse]})
                             accepted.append(item)
                         self.after(0,lambda d=n,total=len(candidates),r=rejected:
                             self._set_progress(62+7*d/max(1,total),
                                 f"姿勢で候補確認中… {d}/{total}  除外 {r}"))
                 if self._gen==gen:
-                    self.after(0,lambda a=accepted,r=rejected:
-                        self._refresh_peaks(refined_candidates=a,pose_rejected=r))
+                    self.after(0,lambda a=accepted,r=rejected,au=audit:
+                        self._finish_fast_hp_pose_filter(a,r,au))
             except Exception as e:
                 print(f"[高速HP姿勢判定エラー] {e}")
                 # モデルや環境の問題では音声候補を失わない。
@@ -2527,9 +2569,24 @@ class TennisApp(tk.Tk):
                 if cap is not None: cap.release()
         threading.Thread(target=_worker,daemon=True).start()
 
+    def _finish_fast_hp_pose_filter(self,accepted,rejected,audit):
+        self._hp_candidate_audit=list(audit)
+        self._refresh_peaks(refined_candidates=accepted,pose_rejected=rejected)
+
     def _render_hp_detail_photo(self,canvas,sample,slot):
         canvas.delete("all"); path=self.video_path.get()
-        frame=grab_frame(path,float(sample.get("time",0))) if path and sample else None
+        frame=None
+        if path and sample:
+            cap=cv2.VideoCapture(path)
+            try:
+                if "frame_no" in sample:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES,int(sample["frame_no"]))
+                else:
+                    fps=cap.get(cv2.CAP_PROP_FPS) or self.video_fps
+                    cap.set(cv2.CAP_PROP_POS_FRAMES,int(round(float(sample.get("time",0))*fps)))
+                ok,frame=cap.read()
+                if not ok: frame=None
+            finally: cap.release()
         if frame is None:
             canvas.create_text(max(canvas.winfo_width()//2,100),max(canvas.winfo_height()//2,80),
                                text="画像なし",fill=SUBTEXT,font=_tk_font(10)); return
@@ -2563,7 +2620,9 @@ class TennisApp(tk.Tk):
         cv=self._hp_detail_chart; cv.delete("all"); w=max(cv.winfo_width(),500); h=max(cv.winfo_height(),140)
         if self.data is None:return
         center=float(peak["time"]); lo=center-2; hi=center+2
-        times=np.asarray(self.data.get("times",[])); energy=np.asarray(self.data.get("combined",[]))
+        times=np.asarray(self.data.get("times",[]))
+        energy=np.asarray(self.data.get("combined",[]) if self.audio_filter_enabled.get() else
+                          self.data.get("broadband",self.data.get("combined",[])))
         mask=(times>=lo)&(times<=hi); tx=times[mask]; ey=energy[mask]
         pl,pr,pt,pb=42,14,12,25
         cv.create_line(pl,h-pb,w-pr,h-pb,fill=BORDER); cv.create_line(pl,pt,pl,h-pb,fill=BORDER)
@@ -2618,7 +2677,8 @@ class TennisApp(tk.Tk):
         if refined_candidates is None:
             indices,n_echo=detect_peaks(self.data,self.sensitivity.get(),
                                          self.min_gap.get(),
-                                         wall_mode=bool(self.wall_mode.get()))
+                                         wall_mode=bool(self.wall_mode.get()),
+                                         use_frequency_filter=bool(self.audio_filter_enabled.get()))
             all_times=[float(self.data["times"][i]) for i in indices]
             refined_candidates=[{"idx":int(i),"time":t} for i,t in zip(indices,all_times)]
         else:
@@ -3232,14 +3292,23 @@ class TennisApp(tk.Tk):
                            fill=SUBTEXT,font=_tk_font(10)); return
         duration=self.data["duration"]
         if duration<=0: return
-        times=self.data["times"]; combined=self.data["combined"]
+        if self._timeline_zoomed and self.peaks:
+            center=float(self.peaks[self.peak_idx]["time"])
+            view_lo=max(0.0,center-2.0); view_hi=min(duration,center+2.0)
+        else:
+            view_lo=0.0; view_hi=duration
+        view_span=max(view_hi-view_lo,1e-6)
+        times=self.data["times"]
+        combined=(self.data["combined"] if self.audio_filter_enabled.get() else
+                  self.data.get("broadband",self.data["combined"]))
         n=len(times)
 
         # 波形
         pts=[]
-        stepn=max(1,n//max(1,cw))
-        for j in range(0,n,stepn):
-            x=int(times[j]/duration*cw)
+        view_indices=np.flatnonzero((np.asarray(times)>=view_lo)&(np.asarray(times)<=view_hi))
+        stepn=max(1,len(view_indices)//max(1,cw))
+        for j in view_indices[::stepn]:
+            x=int((times[j]-view_lo)/view_span*cw)
             y=int(ch-combined[j]*(ch-14)-4)
             pts.extend([x,max(4,y)])
         if len(pts)>=4:
@@ -3264,7 +3333,8 @@ class TennisApp(tk.Tk):
                 continue
             # ラベル保存済みなら frame_time (人手で合わせた位置) を使う
             disp_t=p.get("frame_time") or p["time"]
-            x=int(disp_t/duration*cw)
+            if disp_t<view_lo or disp_t>view_hi: continue
+            x=int((disp_t-view_lo)/view_span*cw)
             is_sel=(i==self.peak_idx)
             color=GOLD if is_sel else ACCENT2
             lw=3 if is_sel else 1
@@ -3276,15 +3346,78 @@ class TennisApp(tk.Tk):
                                fill=GREEN,font=("Helvetica",7,"bold"))
 
         # 再生位置マーカー
-        cx=int(min(max(cur_t,0),duration)/duration*cw)
+        cx=int((min(max(cur_t,view_lo),view_hi)-view_lo)/view_span*cw)
         tl.create_line(cx,0,cx,ch,fill="#ffd24a",width=2)
+
+        # v65: 拡大時、現在HP前後1秒の全候補を採用=緑、不採用=赤で表示。
+        self._timeline_candidate_markers=[]
+        if self._timeline_zoomed and self.peaks:
+            center=float(self.peaks[self.peak_idx]["time"])
+            for cand in self._hp_candidate_audit:
+                ct=float(cand.get("time",0.0))
+                if abs(ct-center)>1.0 or not (view_lo<=ct<=view_hi): continue
+                x=(ct-view_lo)/view_span*cw
+                j=int(np.argmin(np.abs(np.asarray(times)-ct))) if len(times) else 0
+                level=float(combined[j]) if len(combined)>j else 0.5
+                y=max(13,min(ch-10,ch-level*(ch-22)-5))
+                color="#26c281" if cand.get("selected") else "#ff5252"
+                tl.create_oval(x-6,y-6,x+6,y+6,fill=color,outline="white",width=1)
+                self._timeline_candidate_markers.append({"x":x,"y":y,"candidate":cand})
+
+    def _timeline_bounds(self):
+        duration=float(self.data["duration"]) if self.data is not None else 0.0
+        if self._timeline_zoomed and self.peaks:
+            center=float(self.peaks[self.peak_idx]["time"])
+            return max(0.0,center-2.0),min(duration,center+2.0)
+        return 0.0,duration
+
+    def _toggle_timeline_zoom(self):
+        self._timeline_zoomed=not self._timeline_zoomed
+        self.timeline.configure(height=230 if self._timeline_zoomed else 60)
+        self.btn_timeline_zoom.configure(text="元に戻す" if self._timeline_zoomed else "拡大",
+                                         bg=ACCENT2 if self._timeline_zoomed else DARK2,
+                                         fg="white" if self._timeline_zoomed else GOLD)
+        self._draw_timeline()
+
+    def _toggle_audio_filter(self):
+        enabled=not bool(self.audio_filter_enabled.get()); self.audio_filter_enabled.set(enabled)
+        self.btn_audio_filter.configure(text=f"周波数フィルター {'ON' if enabled else 'OFF'}",
+                                        bg=GREEN if enabled else DARK2,
+                                        fg="white" if enabled else GOLD)
+        self.status_var.set("周波数フィルターを切り替えて候補を再判定中…")
+        self._start_fast_hp_pose_filter()
+
+    def _hide_timeline_tooltip(self):
+        try:self.timeline.delete("candidate_tooltip")
+        except Exception:pass
+
+    def _on_timeline_motion(self,event):
+        self._hide_timeline_tooltip()
+        for marker in self._timeline_candidate_markers:
+            if (event.x-marker["x"])**2+(event.y-marker["y"])**2<=100:
+                cand=marker["candidate"]
+                if cand.get("selected"): return
+                reason=cand.get("reason","unknown")
+                if reason=="no_swing":
+                    travel=cand.get("travel"); angle=cand.get("arm_change")
+                    text="不採用: スイング動作不足"
+                    if travel is not None:text+=f"\n手首移動={float(travel):.2f}肩幅"
+                    if angle is not None:text+=f" / 肘角度変化={float(angle):.1f}°"
+                else:text=f"不採用: {reason}"
+                x=min(event.x+12,max(self.timeline.winfo_width()-220,10)); y=max(event.y-42,6)
+                self.timeline.create_rectangle(x,y,x+210,y+38,fill="#2b1111",outline=RED,
+                                               tags="candidate_tooltip")
+                self.timeline.create_text(x+6,y+5,text=text,fill="white",anchor="nw",
+                                          font=_tk_font(8),tags="candidate_tooltip")
+                return
 
     def _on_timeline_click(self,event):
         if self.data is None: return
         duration=self.data["duration"]
         cw=self.timeline.winfo_width()
         if cw<=0 or duration<=0: return
-        t=event.x/cw*duration
+        view_lo,view_hi=self._timeline_bounds()
+        t=view_lo+event.x/cw*max(view_hi-view_lo,1e-6)
         if self._play_running:
             # 再生中: その位置へシーク
             self._play_seek_delta += (t-self._play_cur_time[0])
