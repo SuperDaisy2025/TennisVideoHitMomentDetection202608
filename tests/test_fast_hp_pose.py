@@ -106,3 +106,16 @@ def test_selected_sensitivity_is_direct_energy_threshold():
 
 def test_pose_sampling_uses_five_requested_offsets():
     assert TA.HP_POSE_SAMPLE_OFFSETS == (-0.2, -0.1, 0.0, 0.1, 0.2)
+
+
+def test_motion_summary_is_hip_relative_cm_delta_and_reports_ball():
+    def sample(joint_x, ball=False):
+        kps={"0":[0.5,0.1,0.9], "15":[0.45,0.9,0.9], "16":[0.55,0.9,0.9],
+             "11":[0.45,0.5,0.9], "12":[0.55,0.5,0.9]}
+        for index in (10,9,6,5,8,7):kps[str(index)]=[joint_x,0.5,0.9]
+        if ball:kps["18"]=[0.75,0.5,0.9]
+        return {"kps":kps}
+    samples=[sample(0.6),sample(0.62),sample(0.65,True),sample(0.68),sample(0.7)]
+    values,ball=TA.TennisApp._compute_hp_motion_cm(samples,(100,100),160)
+    assert ball is True
+    assert all(abs(value-20.0)<1e-6 for value in values.values())

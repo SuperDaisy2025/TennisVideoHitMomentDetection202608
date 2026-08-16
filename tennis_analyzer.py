@@ -321,7 +321,7 @@ BG=     "#0f1117"; PANEL=  "#1a1d27"; PANEL2= "#141720"
 ACCENT= "#e8593c"; ACCENT2="#3b8bd4"; GOLD=   "#ef9f27"
 GREEN=  "#1d9e75"; TEXT=   "#d4d0c8"; SUBTEXT="#888780"
 BORDER= "#2c2e3a"; DARK2=  "#12141e"; RED= "#ff5252"
-APP_VERSION = "v68"; APP_VERSION_DESC = "5点姿勢・XYスパーク"
+APP_VERSION = "v69"; APP_VERSION_DESC = "5点姿勢・腰基準移動量"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -1187,8 +1187,8 @@ class TennisApp(tk.Tk):
     #  UI構築
     # ══════════════════════════════════════════
     def _build_ui(self):
-        # 左パネル (幅300)
-        self.left=tk.Frame(self, bg=PANEL, width=300)
+        # 6関節の移動量を一覧に収めるため、左パネルを少し拡張
+        self.left=tk.Frame(self, bg=PANEL, width=540)
         self.left.pack(side="left", fill="y")
         self.left.pack_propagate(False)
         self._build_left()
@@ -1261,7 +1261,13 @@ class TennisApp(tk.Tk):
         tk.Checkbutton(hp_hdr,text="分類済",variable=self._show_classified_only,
                        bg=PANEL,fg=SUBTEXT,activebackground=PANEL,selectcolor=DARK2,
                        font=_tk_font(9),command=self._on_classified_filter_changed
-                       ).pack(side="right")
+                        ).pack(side="right")
+        tk.Label(p,text="時刻・分類 | RW  LW  RS  LS  RE  LE (cm)  B",
+                 bg=PANEL,fg=SUBTEXT,font=("Courier",8),anchor="w"
+                 ).pack(fill="x",padx=12)
+        tk.Label(p,text="R/L:右/左  W:手首  S:肩  E:ひじ  B:ボール",
+                 bg=PANEL,fg=SUBTEXT,font=_tk_font(7),anchor="w"
+                 ).pack(fill="x",padx=12)
         lf=tk.Frame(p,bg=PANEL)
         lf.pack(fill="both",expand=True,padx=12,pady=(0,4))
         sb=tk.Scrollbar(lf,bg=PANEL); sb.pack(side="right",fill="y")
@@ -1484,16 +1490,21 @@ class TennisApp(tk.Tk):
         self._hp_detail_chart=tk.Canvas(chartbox,bg="#0b0d12",height=170,highlightthickness=0)
         self._hp_detail_chart.pack(fill="x",padx=7,pady=5)
         self._hp_detail_chart.bind("<Configure>",lambda e:self.after_idle(self._refresh_hp_detail))
-        sparkrow=tk.Frame(parent,bg=BG); sparkrow.pack(fill="x",padx=13,pady=(0,4))
-        self._hp_spark_canvases={}
-        for axis,title in (("x","キーポイント X座標"),("y","キーポイント Y座標")):
-            box=tk.Frame(sparkrow,bg=PANEL2); box.pack(side="left",fill="x",expand=True,padx=4)
-            tk.Label(box,text=title,bg=PANEL2,fg=TEXT,font=_tk_font(9,bold=True),
-                     anchor="w").pack(fill="x",padx=6,pady=(3,0))
-            cv=tk.Canvas(box,bg="#0b0d12",height=115,highlightthickness=0)
-            cv.pack(fill="x",padx=5,pady=4)
-            cv.bind("<Configure>",lambda e:self.after_idle(self._refresh_hp_detail))
-            self._hp_spark_canvases[axis]=cv
+        motion=tk.Frame(parent,bg=PANEL2); motion.pack(fill="x",padx=13,pady=(0,4))
+        tk.Label(motion,text="腰中点からの距離変化  (+0.2秒 − -0.2秒)",bg=PANEL2,fg=TEXT,
+                 font=_tk_font(9,bold=True),anchor="w").pack(fill="x",padx=7,pady=(4,2))
+        self._hp_motion_vars={}
+        for key,title,ki in (("rw","右手首",10),("lw","左手首",9),("rs","右肩",6),
+                             ("ls","左肩",5),("re","右ひじ",8),("le","左ひじ",7)):
+            box=tk.Frame(motion,bg=DARK2); box.pack(side="left",fill="x",expand=True,padx=3,pady=(0,5))
+            tk.Label(box,text=title,bg=DARK2,fg=KP_COLORS[ki],font=_tk_font(8,bold=True)).pack(pady=(3,0))
+            v=tk.StringVar(value="-- cm"); self._hp_motion_vars[key]=v
+            tk.Label(box,textvariable=v,bg=DARK2,fg=TEXT,font=_tk_font(9,bold=True)).pack(pady=(0,3))
+        ball_box=tk.Frame(motion,bg=DARK2); ball_box.pack(side="left",fill="x",expand=True,padx=3,pady=(0,5))
+        tk.Label(ball_box,text="ボール",bg=DARK2,fg=GOLD,font=_tk_font(8,bold=True)).pack(pady=(3,0))
+        self._hp_motion_ball_var=tk.StringVar(value="未検出")
+        tk.Label(ball_box,textvariable=self._hp_motion_ball_var,bg=DARK2,fg=TEXT,
+                 font=_tk_font(9,bold=True)).pack(pady=(0,3))
         row=tk.Frame(parent,bg=PANEL); row.pack(fill="x",padx=10,pady=(0,8))
         self._hp_detail_result_vars={}
         items=(("serve","サーブ判定"),("stroke","ストローク判定"),
@@ -2770,31 +2781,63 @@ class TennisApp(tk.Tk):
             color="#26c281" if cand.get("selected") else RED
             cv.create_oval(x-5,y-5,x+5,y+5,fill=color,outline="white",width=1)
 
-    def _draw_hp_sparklines(self,samples):
-        joints=((10,"右手首"),(9,"左手首"),(6,"右肩"),(5,"左肩"),(8,"右ひじ"),(7,"左ひじ"))
-        for axis,cv in self._hp_spark_canvases.items():
-            cv.delete("all"); w=max(cv.winfo_width(),420); h=max(cv.winfo_height(),100)
-            left,right,top,bottom=28,10,30,14
-            cv.create_line(left,h-bottom,w-right,h-bottom,fill=BORDER)
-            cv.create_line(left,top,left,h-bottom,fill=BORDER)
-            for n,(ki,name) in enumerate(joints):
-                lx=8+(n%3)*(w/3); ly=5+(n//3)*12
-                _draw_kp_shape_canvas(cv,KP_SHAPES[ki],lx+4,ly+4,3,KP_COLORS[ki],"white",1)
-                cv.create_text(lx+11,ly,text=name,fill=KP_COLORS[ki],font=_tk_font(7),anchor="nw")
-                coords=[]; plotted=[]
-                for i,sample in enumerate(samples[:5]):
-                    value=sample.get("kps",{}).get(str(ki))
-                    if not value or len(value)<3 or float(value[2])<HP_POSE_MIN_VIS:continue
-                    val=float(value[0] if axis=="x" else value[1])
-                    x=left+i/4*max(w-left-right,1)
-                    y=top+np.clip(val,0,1)*(h-top-bottom)
-                    coords.extend((x,y)); plotted.append((x,y))
-                if len(coords)>=4:cv.create_line(*coords,fill=KP_COLORS[ki],width=2)
-                for x,y in plotted:
-                    _draw_kp_shape_canvas(cv,KP_SHAPES[ki],x,y,4,KP_COLORS[ki],"white",1)
-            for i,rel in enumerate(HP_POSE_SAMPLE_OFFSETS):
-                x=left+i/4*max(w-left-right,1)
-                cv.create_text(x,h-2,text=f"{rel:+.1f}",fill=SUBTEXT,font=_tk_font(7),anchor="s")
+    @staticmethod
+    def _compute_hp_motion_cm(samples,video_wh,player_height_cm):
+        """Return six hip-relative distance deltas and five-frame ball detection.
+
+        Coordinates are normalized.  The cm scale follows the existing analyzer
+        convention: player height divided by the largest nose-to-ankle span.
+        """
+        joint_map=(("rw",10),("lw",9),("rs",6),("ls",5),("re",8),("le",7))
+        result={key:None for key,_ in joint_map}
+        ball=any((lambda v: bool(v and len(v)>=3 and float(v[2])>=HP_POSE_MIN_VIS))(
+                 s.get("kps",{}).get("18")) for s in samples[:5])
+        if len(samples)<5:return result,ball
+        w,h=video_wh if video_wh and len(video_wh)>=2 else (0,0)
+        if w<=0 or h<=0:return result,ball
+
+        heights=[]
+        for sample in samples[:5]:
+            kps=sample.get("kps",{})
+            nose=kps.get("0"); la=kps.get("15"); ra=kps.get("16")
+            valid=lambda v: bool(v and len(v)>=3 and float(v[2])>=HP_POSE_MIN_VIS)
+            ankles=[v for v in (la,ra) if valid(v)]
+            if valid(nose) and ankles:
+                ankle_y=sum(float(v[1]) for v in ankles)/len(ankles)
+                ph=abs(ankle_y-float(nose[1]))*h
+                if ph>10:heights.append(ph)
+        if not heights:return result,ball
+        cm_per_px=float(player_height_cm)/max(heights)
+
+        def distances(sample):
+            kps=sample.get("kps",{}); lh=kps.get("11"); rh=kps.get("12")
+            valid=lambda v: bool(v and len(v)>=3 and float(v[2])>=HP_POSE_MIN_VIS)
+            if not (valid(lh) and valid(rh)):return {}
+            hx=(float(lh[0])+float(rh[0]))*.5*w
+            hy=(float(lh[1])+float(rh[1]))*.5*h
+            out={}
+            for key,ki in joint_map:
+                v=kps.get(str(ki))
+                if valid(v):out[key]=math.hypot(float(v[0])*w-hx,float(v[1])*h-hy)
+            return out
+        before=distances(samples[0]); after=distances(samples[4])
+        for key,_ in joint_map:
+            if key in before and key in after:
+                result[key]=(after[key]-before[key])*cm_per_px
+        return result,ball
+
+    def _hp_motion_summary(self,peak):
+        samples=list(peak.get("pose_samples") or [])
+        try: height=float(self.player_height.get())
+        except Exception: height=DEFAULT_PLAYER_HEIGHT_CM
+        return self._compute_hp_motion_cm(samples,getattr(self,"_video_wh",(0,0)),height)
+
+    def _update_hp_motion_summary(self,peak):
+        values,ball=self._hp_motion_summary(peak)
+        for key,var in self._hp_motion_vars.items():
+            value=values.get(key)
+            var.set("-- cm" if value is None else f"{value:+.1f} cm")
+        self._hp_motion_ball_var.set("検出 ✓" if ball else "未検出")
 
     def _refresh_hp_detail(self):
         if not hasattr(self,"_hp_detail_canvases") or not self.peaks:return
@@ -2802,7 +2845,7 @@ class TennisApp(tk.Tk):
         while len(samples)<5:
             i=len(samples); samples.append({"time":max(0,peak["time"]+HP_POSE_SAMPLE_OFFSETS[i]),"kps":{}})
         backend="YOLO" if peak.get("pose_backend")=="yolo" else "MediaPipe"
-        ball_found=any("18" in s.get("kps",{}) for s in samples)
+        _,ball_found=self._hp_motion_summary(peak)
         ball_text="  ボール検出✓" if ball_found else ""
         self._hp_detail_title.set(f"HP #{peak['rank']}  {backend}{ball_text}  "
                                   f"音声候補 {peak['time']:.3f}秒  "
@@ -2812,7 +2855,7 @@ class TennisApp(tk.Tk):
             self._hp_detail_time_vars[i].set(f"{title}  ({float(s['time']):.3f}秒)")
             self._render_hp_detail_photo(cv,s,i)
         self._draw_hp_detail_energy(peak,samples)
-        self._draw_hp_sparklines(samples)
+        self._update_hp_motion_summary(peak)
         shot=peak.get("pose_shot"); reason=peak.get("pose_reason"); conf=peak.get("pose_confidence")
         pct=f" {float(conf):.0%}" if conf is not None else ""
         self._hp_detail_result_vars["serve"].set("✓ サーブ"+pct if shot=="serve" else "─ 条件なし")
@@ -3029,6 +3072,13 @@ class TennisApp(tk.Tk):
                 tag=f"#{rank:2d}{icons}{rating_icon} {ft_str:>7} {shot_ja}/{spin_ja}{cb}"
             else:
                 tag=f"#{rank:2d}{icons}    {t:6.2f}s   未{cb}"
+            motion,ball=self._hp_motion_summary(p)
+            def compact(key):
+                value=motion.get(key)
+                return "  --" if value is None else f"{value:+4.0f}"
+            tag += (" |"+"".join(compact(key) for key in
+                                  ("rw","lw","rs","ls","re","le"))+
+                    ("  ●" if ball else "  ─"))
             self.peak_list.insert("end",tag)
             self._list_to_peak_idx.append(i)
 
