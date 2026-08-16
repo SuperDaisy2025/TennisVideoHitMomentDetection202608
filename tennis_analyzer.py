@@ -321,7 +321,7 @@ BG=     "#0f1117"; PANEL=  "#1a1d27"; PANEL2= "#141720"
 ACCENT= "#e8593c"; ACCENT2="#3b8bd4"; GOLD=   "#ef9f27"
 GREEN=  "#1d9e75"; TEXT=   "#d4d0c8"; SUBTEXT="#888780"
 BORDER= "#2c2e3a"; DARK2=  "#12141e"; RED= "#ff5252"
-APP_VERSION = "v70"; APP_VERSION_DESC = "左右移動量・Excel出力"
+APP_VERSION = "v71"; APP_VERSION_DESC = "手首・ひじXY移動量"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -1262,10 +1262,10 @@ class TennisApp(tk.Tk):
                        bg=PANEL,fg=SUBTEXT,activebackground=PANEL,selectcolor=DARK2,
                        font=_tk_font(9),command=self._on_classified_filter_changed
                         ).pack(side="right")
-        tk.Label(p,text="時刻・分類 | RW  LW  RS  LS  RE  LE (cm)  B",
+        tk.Label(p,text="時刻・分類 | RWx RWy LWx LWy REx REy LEx LEy  B",
                  bg=PANEL,fg=SUBTEXT,font=("Courier",8),anchor="w"
                  ).pack(fill="x",padx=12)
-        tk.Label(p,text="R/L:右/左  W:手首  S:肩  E:ひじ  B:ボール",
+        tk.Label(p,text="R/L:右/左  W:手首  E:ひじ  x=右＋  y=下＋  B=ボール (cm)",
                  bg=PANEL,fg=SUBTEXT,font=_tk_font(7),anchor="w"
                  ).pack(fill="x",padx=12)
         tk.Button(hp_hdr,text="Excel出力",bg=DARK2,fg=GOLD,relief="flat",
@@ -1494,11 +1494,13 @@ class TennisApp(tk.Tk):
         self._hp_detail_chart.pack(fill="x",padx=7,pady=5)
         self._hp_detail_chart.bind("<Configure>",lambda e:self.after_idle(self._refresh_hp_detail))
         motion=tk.Frame(parent,bg=PANEL2); motion.pack(fill="x",padx=13,pady=(0,4))
-        tk.Label(motion,text="写真の右方向を正とした横移動距離  (+0.1秒 − -0.1秒)",bg=PANEL2,fg=TEXT,
+        tk.Label(motion,text="XY移動距離  (+0.1秒 − -0.1秒 / X:右＋・Y:下＋)",bg=PANEL2,fg=TEXT,
                  font=_tk_font(9,bold=True),anchor="w").pack(fill="x",padx=7,pady=(4,2))
         self._hp_motion_vars={}
-        for key,title,ki in (("rw","右手首",10),("lw","左手首",9),("rs","右肩",6),
-                             ("ls","左肩",5),("re","右ひじ",8),("le","左ひじ",7)):
+        for key,title,ki in (("rw_x","右手首 X",10),("rw_y","右手首 Y",10),
+                             ("lw_x","左手首 X",9),("lw_y","左手首 Y",9),
+                             ("re_x","右ひじ X",8),("re_y","右ひじ Y",8),
+                             ("le_x","左ひじ X",7),("le_y","左ひじ Y",7)):
             box=tk.Frame(motion,bg=DARK2); box.pack(side="left",fill="x",expand=True,padx=3,pady=(0,5))
             tk.Label(box,text=title,bg=DARK2,fg=KP_COLORS[ki],font=_tk_font(8,bold=True)).pack(pady=(3,0))
             v=tk.StringVar(value="-- cm"); self._hp_motion_vars[key]=v
@@ -2786,14 +2788,14 @@ class TennisApp(tk.Tk):
 
     @staticmethod
     def _compute_hp_motion_cm(samples,video_wh,player_height_cm):
-        """Return six signed horizontal deltas and five-frame ball detection.
+        """Return signed X/Y deltas for wrists/elbows and ball detection.
 
         Coordinates are normalized.  The cm scale follows the existing analyzer
         convention: player height divided by the largest nose-to-ankle span.
-        Positive means movement toward the right side of the displayed image.
+        X positive is image-right; Y positive is image-down.
         """
-        joint_map=(("rw",10),("lw",9),("rs",6),("ls",5),("re",8),("le",7))
-        result={key:None for key,_ in joint_map}
+        joint_map=(("rw",10),("lw",9),("re",8),("le",7))
+        result={f"{key}_{axis}":None for key,_ in joint_map for axis in ("x","y")}
         ball=any((lambda v: bool(v and len(v)>=3 and float(v[2])>=HP_POSE_MIN_VIS))(
                  s.get("kps",{}).get("18")) for s in samples[:5])
         if len(samples)<5:return result,ball
@@ -2813,18 +2815,19 @@ class TennisApp(tk.Tk):
         if not heights:return result,ball
         cm_per_px=float(player_height_cm)/max(heights)
 
-        def x_positions(sample):
+        def positions(sample):
             kps=sample.get("kps",{})
             valid=lambda v: bool(v and len(v)>=3 and float(v[2])>=HP_POSE_MIN_VIS)
             out={}
             for key,ki in joint_map:
                 v=kps.get(str(ki))
-                if valid(v):out[key]=float(v[0])*w
+                if valid(v):out[key]=(float(v[0])*w,float(v[1])*h)
             return out
-        before=x_positions(samples[1]); after=x_positions(samples[3])
+        before=positions(samples[1]); after=positions(samples[3])
         for key,_ in joint_map:
             if key in before and key in after:
-                result[key]=(after[key]-before[key])*cm_per_px
+                result[f"{key}_x"]=(after[key][0]-before[key][0])*cm_per_px
+                result[f"{key}_y"]=(after[key][1]-before[key][1])*cm_per_px
         return result,ball
 
     def _hp_motion_summary(self,peak):
@@ -3034,7 +3037,7 @@ class TennisApp(tk.Tk):
         self._draw_timeline()
 
     def _export_hit_points_xlsx(self):
-        """Export every current HP and its six signed motion values to Excel."""
+        """Export every current HP and four joints' signed X/Y values to Excel."""
         if not self.peaks:
             messagebox.showinfo("Excel出力","出力できるヒットポイントがありません")
             return
@@ -3049,8 +3052,10 @@ class TennisApp(tk.Tk):
         try:
             all_labels=load_all_labels(get_db_path(path),os.path.basename(path))
             rows=[]
-            names=(("右手首_cm","rw"),("左手首_cm","lw"),("右肩_cm","rs"),
-                   ("左肩_cm","ls"),("右ひじ_cm","re"),("左ひじ_cm","le"))
+            names=(("右手首_X_cm","rw_x"),("右手首_Y_cm","rw_y"),
+                   ("左手首_X_cm","lw_x"),("左手首_Y_cm","lw_y"),
+                   ("右ひじ_X_cm","re_x"),("右ひじ_Y_cm","re_y"),
+                   ("左ひじ_X_cm","le_x"),("左ひじ_Y_cm","le_y"))
             for peak in self.peaks:
                 motion,ball=self._hp_motion_summary(peak); rank=peak.get("rank")
                 label=all_labels.get(rank)
@@ -3137,7 +3142,7 @@ class TennisApp(tk.Tk):
                 value=motion.get(key)
                 return "  --" if value is None else f"{value:+4.0f}"
             tag += (" |"+"".join(compact(key) for key in
-                                  ("rw","lw","rs","ls","re","le"))+
+                                  ("rw_x","rw_y","lw_x","lw_y","re_x","re_y","le_x","le_y"))+
                     ("  ●" if ball else "  ─"))
             self.peak_list.insert("end",tag)
             self._list_to_peak_idx.append(i)

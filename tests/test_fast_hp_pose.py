@@ -119,7 +119,8 @@ def test_motion_summary_is_signed_horizontal_cm_delta_and_reports_ball():
     values,ball=TA.TennisApp._compute_hp_motion_cm(samples,(100,100),160)
     assert ball is True
     # Uses -0.1s (x=.62) and +0.1s (x=.68): 6px * 2cm/px = +12cm.
-    assert all(abs(value-12.0)<1e-6 for value in values.values())
+    assert all(abs(values[key]-12.0)<1e-6 for key in ("rw_x","lw_x","re_x","le_x"))
+    assert all(abs(values[key])<1e-6 for key in ("rw_y","lw_y","re_y","le_y"))
 
 
 def test_motion_summary_treats_image_right_as_positive():
@@ -129,4 +130,15 @@ def test_motion_summary_treats_image_right_as_positive():
         return {"kps":kps}
     values,_=TA.TennisApp._compute_hp_motion_cm(
         [sample(.5),sample(.7),sample(.6),sample(.4),sample(.5)],(100,100),160)
-    assert all(abs(value+60.0)<1e-6 for value in values.values())
+    assert all(abs(values[key]+60.0)<1e-6 for key in ("rw_x","lw_x","re_x","le_x"))
+    assert all(abs(values[key])<1e-6 for key in ("rw_y","lw_y","re_y","le_y"))
+
+
+def test_motion_summary_treats_image_down_as_positive_y():
+    def sample(y):
+        kps={"0":[.5,.1,.9],"15":[.5,.9,.9],"16":[.5,.9,.9]}
+        for index in (10,9,8,7):kps[str(index)]=[.5,y,.9]
+        return {"kps":kps}
+    values,_=TA.TennisApp._compute_hp_motion_cm(
+        [sample(.5),sample(.3),sample(.4),sample(.5),sample(.4)],(100,100),160)
+    assert all(abs(values[key]-40.0)<1e-6 for key in ("rw_y","lw_y","re_y","le_y"))
