@@ -317,7 +317,7 @@ BG=     "#0f1117"; PANEL=  "#1a1d27"; PANEL2= "#141720"
 ACCENT= "#e8593c"; ACCENT2="#3b8bd4"; GOLD=   "#ef9f27"
 GREEN=  "#1d9e75"; TEXT=   "#d4d0c8"; SUBTEXT="#888780"
 BORDER= "#2c2e3a"; DARK2=  "#12141e"; RED= "#ff5252"
-APP_VERSION = "v65"; APP_VERSION_DESC = "候補監査・音声拡大"
+APP_VERSION = "v66"; APP_VERSION_DESC = "同一画像KP・閾値表示"
 
 # v63: 音声HP候補を姿勢で検証する高速パラメータ。
 # 最初は候補時刻と前後0.3秒の3枚だけを解析し、打点探索は1フレームずつ行う。
@@ -1742,7 +1742,7 @@ class TennisApp(tk.Tk):
     def _on_wall_mode_changed(self):
         """v19: 壁打ちチェック切替時に既存データがあれば再検出"""
         if self.data is not None and self.peaks:
-            try: self._refresh_peaks()
+            try: self._start_fast_hp_pose_filter()
             except Exception: pass
             mode="ON" if self.wall_mode.get() else "OFF"
             self.status_var.set(f"壁打ちモード {mode}")
@@ -1875,7 +1875,7 @@ class TennisApp(tk.Tk):
     # ══════════════════════════════════════════
     def _open_param_popup(self):
         win=tk.Toplevel(self,bg=PANEL)
-        win.title("検出パラメータ設定"); win.geometry("360x360")
+        win.title("検出パラメータ設定"); win.geometry("380x410")
         win.resizable(False,True); win.transient(self); win.grab_set()
         win.configure(bg=PANEL)
 
@@ -1905,13 +1905,17 @@ class TennisApp(tk.Tk):
                       "  0.05〜0.30秒のペアピーク (壁エコー) を抑制",
                  bg=PANEL,fg=SUBTEXT,font=_tk_font(8),justify="left"
                  ).pack(anchor="w",padx=16,pady=(14,8))
+        tk.Label(win,text="感度・間隔を変更して下のボタンを押すと、\n"
+                          "保存済み音声エネルギーからHP候補と姿勢を再判定します。",
+                 bg=PANEL,fg=GOLD,font=_tk_font(8),justify="left"
+                 ).pack(anchor="w",padx=16,pady=(2,4))
 
         def _apply():
-            if self.data: self._refresh_peaks()
-            self.status_var.set("✓ パラメータ適用済")
+            if self.data: self._start_fast_hp_pose_filter()
+            self.status_var.set("✓ パラメータを適用して再判定中…")
             win.destroy()
 
-        tk.Button(win,text="適用して閉じる",bg=ACCENT,fg="white",relief="flat",
+        tk.Button(win,text="適用してHPを再判定",bg=ACCENT,fg="white",relief="flat",
                   font=_tk_font(11,bold=True),command=_apply
                   ).pack(pady=16,ipadx=20,ipady=5)
 
@@ -2459,6 +2463,7 @@ class TennisApp(tk.Tk):
                                use_frequency_filter=bool(self.audio_filter_enabled.get()))
         candidates=[{"idx":int(i),"time":float(self.data["times"][i])} for i in indices]
         if not candidates:
+            self._hp_candidate_audit=[]
             self._refresh_peaks(refined_candidates=[])
             return
         path=self.video_path.get(); gen=self._gen
@@ -2500,8 +2505,10 @@ class TennisApp(tk.Tk):
                                 lm=lms[mp_i]
                                 kps[str(coco_i)]=[float(lm.x),float(lm.y),
                                                   float(getattr(lm,"visibility",1.0))]
+                    ok_jpg,encoded=cv2.imencode(".jpg",bgr,[cv2.IMWRITE_JPEG_QUALITY,92])
                     result={"time":frame_no/fps,"frame_no":frame_no,
-                            "feat":self._hp_pose_features(lms),"kps":kps}
+                            "feat":self._hp_pose_features(lms),"kps":kps,
+                            "frame_jpeg":encoded.tobytes() if ok_jpg else None}
                     frame_cache[frame_no]=result
                     return result
 
@@ -2551,7 +2558,8 @@ class TennisApp(tk.Tk):
                                 "pose_arm_change":verdict.get("arm_change"),
                                 "pose_samples":[{"time":float(s["time"]),
                                                 "frame_no":int(s.get("frame_no",round(s["time"]*fps))),
-                                                "kps":s.get("kps",{})}
+                                                "kps":s.get("kps",{}),
+                                                "frame_jpeg":s.get("frame_jpeg")}
                                                 for s in coarse]})
                             accepted.append(item)
                         self.after(0,lambda d=n,total=len(candidates),r=rejected:
@@ -2577,16 +2585,20 @@ class TennisApp(tk.Tk):
         canvas.delete("all"); path=self.video_path.get()
         frame=None
         if path and sample:
-            cap=cv2.VideoCapture(path)
-            try:
-                if "frame_no" in sample:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES,int(sample["frame_no"]))
-                else:
-                    fps=cap.get(cv2.CAP_PROP_FPS) or self.video_fps
-                    cap.set(cv2.CAP_PROP_POS_FRAMES,int(round(float(sample.get("time",0))*fps)))
-                ok,frame=cap.read()
-                if not ok: frame=None
-            finally: cap.release()
+            encoded=sample.get("frame_jpeg")
+            if encoded:
+                frame=cv2.imdecode(np.frombuffer(encoded,dtype=np.uint8),cv2.IMREAD_COLOR)
+            if frame is None:
+                cap=cv2.VideoCapture(path)
+                try:
+                    if "frame_no" in sample:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES,int(sample["frame_no"]))
+                    else:
+                        fps=cap.get(cv2.CAP_PROP_FPS) or self.video_fps
+                        cap.set(cv2.CAP_PROP_POS_FRAMES,int(round(float(sample.get("time",0))*fps)))
+                    ok,frame=cap.read()
+                    if not ok: frame=None
+                finally: cap.release()
         if frame is None:
             canvas.create_text(max(canvas.winfo_width()//2,100),max(canvas.winfo_height()//2,80),
                                text="画像なし",fill=SUBTEXT,font=_tk_font(10)); return
@@ -2627,10 +2639,15 @@ class TennisApp(tk.Tk):
         pl,pr,pt,pb=42,14,12,25
         cv.create_line(pl,h-pb,w-pr,h-pb,fill=BORDER); cv.create_line(pl,pt,pl,h-pb,fill=BORDER)
         if len(tx)>1:
-            top=max(float(np.max(ey)),1e-6); coords=[]
+            top=max(float(np.max(energy)),1e-6); coords=[]
             for t,e in zip(tx,ey):
                 coords += [pl+(float(t)-lo)/4*(w-pl-pr),h-pb-float(e)/top*(h-pt-pb)]
             cv.create_line(*coords,fill=ACCENT2,width=2,smooth=True)
+            threshold=top*(1.0-float(self.sensitivity.get()))
+            threshold_y=h-pb-threshold/top*(h-pt-pb)
+            cv.create_line(pl,threshold_y,w-pr,threshold_y,fill=RED,width=1,dash=(5,3))
+            cv.create_text(pl+4,threshold_y-3,text=f"検出閾値 {threshold:.2f}",fill=RED,
+                           font=_tk_font(8,bold=True),anchor="sw")
         for rel in range(-2,3):
             x=pl+(rel+2)/4*(w-pl-pr); cv.create_text(x,h-10,text=f"{rel:+d}s",fill=SUBTEXT,font=_tk_font(8))
         for i,s in enumerate(samples[:3]):
@@ -2638,6 +2655,15 @@ class TennisApp(tk.Tk):
             cv.create_line(x,pt,x,h-pb,fill=color,width=3 if i==1 else 2)
             cv.create_text(x+3,pt+5,text=("候補" if i==1 else f"{float(s['time'])-center:+.1f}s"),
                            fill=color,font=_tk_font(8,bold=True),anchor="nw")
+        for cand in self._hp_candidate_audit:
+            ct=float(cand.get("time",0.0))
+            if not (lo<=ct<=hi) or len(times)==0: continue
+            j=int(np.argmin(np.abs(times-ct)))
+            x=pl+(ct-lo)/4*(w-pl-pr)
+            top=max(float(np.max(energy)),1e-6)
+            y=h-pb-float(energy[j])/top*(h-pt-pb)
+            color="#26c281" if cand.get("selected") else RED
+            cv.create_oval(x-5,y-5,x+5,y+5,fill=color,outline="white",width=1)
 
     def _refresh_hp_detail(self):
         if not hasattr(self,"_hp_detail_canvases") or not self.peaks:return
@@ -3313,6 +3339,12 @@ class TennisApp(tk.Tk):
             pts.extend([x,max(4,y)])
         if len(pts)>=4:
             tl.create_line(pts,fill="#555",width=1)
+        energy_max=max(float(np.max(combined)),1e-6)
+        threshold=energy_max*(1.0-float(self.sensitivity.get()))
+        threshold_y=int(ch-threshold*(ch-14)-4)
+        tl.create_line(0,threshold_y,cw,threshold_y,fill=RED,width=1,dash=(5,3))
+        tl.create_text(5,max(2,threshold_y-2),text=f"閾値 {threshold:.2f}",fill=RED,
+                       font=_tk_font(8,bold=True),anchor="sw")
 
         # 再生位置
         if cur_t is None:
