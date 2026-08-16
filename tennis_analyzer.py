@@ -321,11 +321,10 @@ BG=     "#0f1117"; PANEL=  "#1a1d27"; PANEL2= "#141720"
 ACCENT= "#e8593c"; ACCENT2="#3b8bd4"; GOLD=   "#ef9f27"
 GREEN=  "#1d9e75"; TEXT=   "#d4d0c8"; SUBTEXT="#888780"
 BORDER= "#2c2e3a"; DARK2=  "#12141e"; RED= "#ff5252"
-APP_VERSION = "v67"; APP_VERSION_DESC = "YOLO姿勢・ボール検出"
+APP_VERSION = "v68"; APP_VERSION_DESC = "5点姿勢・XYスパーク"
 
-# v63: 音声HP候補を姿勢で検証する高速パラメータ。
-# 最初は候補時刻と前後0.3秒の3枚だけを解析し、打点探索は1フレームずつ行う。
-HP_POSE_COARSE_SEC = 0.30
+# 音声HP候補を姿勢で検証する高速パラメータ。
+HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
 HP_POSE_MAX_REFINE_SEC = 0.18
 HP_POSE_MIN_VIS = 0.35
 HP_POSE_MIN_WRIST_TRAVEL = 0.12  # 肩幅で正規化した3点間の右手首移動量
@@ -406,7 +405,7 @@ def detect_peaks(data, sensitivity=0.5, min_gap=1.0, wall_mode=False,
     combined=(data["combined"] if use_frequency_filter else
               data.get("broadband",data["combined"]))
     times=data["times"]; sr=data["sr"]
-    raw,_=sp.find_peaks(combined, height=np.max(combined)*(1-sensitivity),
+    raw,_=sp.find_peaks(combined, height=float(sensitivity),
                         distance=max(1,int(min_gap*sr/512)) if not wall_mode else 1)
     filtered,last_t=[],- np.inf
     if wall_mode:
@@ -1463,28 +1462,38 @@ class TennisApp(tk.Tk):
         self._build_label_bar(self._label_bar)
 
     def _build_tab_hp_detail(self,parent):
-        """選択HPの3姿勢フレーム、音声エネルギー、判定結果を表示。"""
+        """選択HPの5姿勢フレーム、音声エネルギー、判定結果を表示。"""
         self._hp_detail_title=tk.StringVar(value="左の一覧からヒットポイントを選択してください")
         tk.Label(parent,textvariable=self._hp_detail_title,bg=PANEL,fg=GOLD,
                  font=_tk_font(13,bold=True),anchor="w").pack(fill="x",padx=12,pady=(8,4),ipady=5)
         photos=tk.Frame(parent,bg=BG); photos.pack(fill="both",expand=True,padx=8,pady=3)
         self._hp_detail_canvases=[]; self._hp_detail_time_vars=[]
-        for label in ("-0.3秒","候補フレーム","+0.3秒"):
+        for label in ("-0.2秒","-0.1秒","候補フレーム","+0.1秒","+0.2秒"):
             col=tk.Frame(photos,bg=PANEL2); col.pack(side="left",fill="both",expand=True,padx=5)
             v=tk.StringVar(value=label); self._hp_detail_time_vars.append(v)
             tk.Label(col,textvariable=v,bg=PANEL2,fg=GOLD if label=="候補フレーム" else TEXT,
                      font=_tk_font(10,bold=True)).pack(fill="x",pady=4)
-            cv=tk.Canvas(col,bg="#0b0d12",height=260,highlightthickness=0)
+            cv=tk.Canvas(col,bg="#0b0d12",height=210,highlightthickness=0)
             cv.pack(fill="both",expand=True,padx=4,pady=(0,4))
             cv.bind("<Configure>",lambda e:self.after_idle(self._refresh_hp_detail))
             self._hp_detail_canvases.append(cv)
-        self._hp_detail_photo_refs=[None,None,None]
+        self._hp_detail_photo_refs=[None]*5
         chartbox=tk.Frame(parent,bg=PANEL2); chartbox.pack(fill="x",padx=13,pady=4)
         tk.Label(chartbox,text="サウンドエネルギー（候補の前後2秒）",bg=PANEL2,fg=TEXT,
                  font=_tk_font(10,bold=True),anchor="w").pack(fill="x",padx=7,pady=(4,0))
         self._hp_detail_chart=tk.Canvas(chartbox,bg="#0b0d12",height=170,highlightthickness=0)
         self._hp_detail_chart.pack(fill="x",padx=7,pady=5)
         self._hp_detail_chart.bind("<Configure>",lambda e:self.after_idle(self._refresh_hp_detail))
+        sparkrow=tk.Frame(parent,bg=BG); sparkrow.pack(fill="x",padx=13,pady=(0,4))
+        self._hp_spark_canvases={}
+        for axis,title in (("x","キーポイント X座標"),("y","キーポイント Y座標")):
+            box=tk.Frame(sparkrow,bg=PANEL2); box.pack(side="left",fill="x",expand=True,padx=4)
+            tk.Label(box,text=title,bg=PANEL2,fg=TEXT,font=_tk_font(9,bold=True),
+                     anchor="w").pack(fill="x",padx=6,pady=(3,0))
+            cv=tk.Canvas(box,bg="#0b0d12",height=115,highlightthickness=0)
+            cv.pack(fill="x",padx=5,pady=4)
+            cv.bind("<Configure>",lambda e:self.after_idle(self._refresh_hp_detail))
+            self._hp_spark_canvases[axis]=cv
         row=tk.Frame(parent,bg=PANEL); row.pack(fill="x",padx=10,pady=(0,8))
         self._hp_detail_result_vars={}
         items=(("serve","サーブ判定"),("stroke","ストローク判定"),
@@ -1898,7 +1907,7 @@ class TennisApp(tk.Tk):
             tk.Label(row,textvariable=var,bg=PANEL,fg=ACCENT,
                      font=("Courier",10),width=5).pack(side="left",padx=4)
 
-        _slider_row("検出感度  (高 → 多く検出)",self.sensitivity,0.1,0.95)
+        _slider_row("音声エネルギー閾値  (低 → 多く検出)",self.sensitivity,0.1,0.95)
         _slider_row("最小間隔 (秒)",             self.min_gap,    0.1,3.0)
         _slider_row("カメラ距離 (m)",            self.camera_dist,1.0,5.0,resolution=0.5)
 
@@ -2090,7 +2099,7 @@ class TennisApp(tk.Tk):
             tk.Radiobutton(kp_frame,text=label,variable=pose_backend_var,value=value,
                            bg=PANEL,fg=TEXT,activebackground=PANEL,selectcolor=DARK2,
                            font=_tk_font(9)).pack(side="left",padx=(0,10))
-        tk.Label(right,text="音声の検出感度:",bg=PANEL,fg=TEXT,
+        tk.Label(right,text="音声の検出感度（エネルギー閾値）:",bg=PANEL,fg=TEXT,
                  font=_tk_font(10,True)).pack(anchor="w",pady=(8,2))
         sensitivity_var=tk.StringVar(value=f"{float(saved_extra.get('sensitivity',0.4)):.1f}")
         ttk.Combobox(right,textvariable=sensitivity_var,
@@ -2453,7 +2462,7 @@ class TennisApp(tk.Tk):
                 "stroke_zone":float(shoulder_c[1])-.20*torso<=float(rw[1])<=float(hip_c[1])+.35*torso}
 
     def _classify_hp_pose_triplet(self, samples):
-        """t-0.1,t,t+0.1の姿勢から明白な非スイング候補を落とす。"""
+        """候補前後の姿勢サンプルから明白な非スイング候補を落とす。"""
         valid=[s for s in samples if s.get("feat") is not None]
         if len(valid) < 2:
             return {"keep":True,"shot":"unknown","confidence":0.0,
@@ -2612,7 +2621,7 @@ class TennisApp(tk.Tk):
                         if self._gen != gen: return
                         t=cand["time"]
                         coarse=[detect_at(det,max(0.0,min(duration,t+d)),need_ball=True)
-                                for d in (-HP_POSE_COARSE_SEC,0.0,HP_POSE_COARSE_SEC)]
+                                for d in HP_POSE_SAMPLE_OFFSETS]
                         verdict=self._classify_hp_pose_triplet(coarse)
                         audit_item={"time":float(t),"idx":int(cand["idx"]),
                                     "selected":bool(verdict["keep"]),
@@ -2633,7 +2642,7 @@ class TennisApp(tk.Tk):
                             best_t=t if best is None else best["time"]
                             # 中央から、粗判定で良かった方向へ1フレームずつ進む。
                             before=self._hp_objective(coarse[0].get("feat"),shot,camera_dir)
-                            after=self._hp_objective(coarse[2].get("feat"),shot,camera_dir)
+                            after=self._hp_objective(coarse[-1].get("feat"),shot,camera_dir)
                             direction=-1 if before is not None and (after is None or before>after) else 1
                             best_score=self._hp_objective(best.get("feat"),shot,camera_dir) if best else None
                             stale=0; max_steps=max(1,int(round(HP_POSE_MAX_REFINE_SEC*fps)))
@@ -2739,17 +2748,17 @@ class TennisApp(tk.Tk):
             for t,e in zip(tx,ey):
                 coords += [pl+(float(t)-lo)/4*(w-pl-pr),h-pb-float(e)/top*(h-pt-pb)]
             cv.create_line(*coords,fill=ACCENT2,width=2,smooth=True)
-            threshold=top*(1.0-float(self.sensitivity.get()))
-            threshold_y=h-pb-threshold/top*(h-pt-pb)
+            threshold=float(self.sensitivity.get())
+            threshold_y=np.clip(h-pb-threshold/top*(h-pt-pb),pt,h-pb)
             cv.create_line(pl,threshold_y,w-pr,threshold_y,fill=RED,width=1,dash=(5,3))
             cv.create_text(pl+4,threshold_y-3,text=f"検出閾値 {threshold:.2f}",fill=RED,
                            font=_tk_font(8,bold=True),anchor="sw")
         for rel in range(-2,3):
             x=pl+(rel+2)/4*(w-pl-pr); cv.create_text(x,h-10,text=f"{rel:+d}s",fill=SUBTEXT,font=_tk_font(8))
-        for i,s in enumerate(samples[:3]):
-            x=pl+(float(s.get("time",center))-lo)/4*(w-pl-pr); color=GOLD if i==1 else "#68a9ff"
-            cv.create_line(x,pt,x,h-pb,fill=color,width=3 if i==1 else 2)
-            cv.create_text(x+3,pt+5,text=("候補" if i==1 else f"{float(s['time'])-center:+.1f}s"),
+        for i,s in enumerate(samples[:5]):
+            x=pl+(float(s.get("time",center))-lo)/4*(w-pl-pr); color=GOLD if i==2 else "#68a9ff"
+            cv.create_line(x,pt,x,h-pb,fill=color,width=3 if i==2 else 2)
+            cv.create_text(x+3,pt+5,text=("候補" if i==2 else f"{float(s['time'])-center:+.1f}s"),
                            fill=color,font=_tk_font(8,bold=True),anchor="nw")
         for cand in self._hp_candidate_audit:
             ct=float(cand.get("time",0.0))
@@ -2761,22 +2770,49 @@ class TennisApp(tk.Tk):
             color="#26c281" if cand.get("selected") else RED
             cv.create_oval(x-5,y-5,x+5,y+5,fill=color,outline="white",width=1)
 
+    def _draw_hp_sparklines(self,samples):
+        joints=((10,"右手首"),(9,"左手首"),(6,"右肩"),(5,"左肩"),(8,"右ひじ"),(7,"左ひじ"))
+        for axis,cv in self._hp_spark_canvases.items():
+            cv.delete("all"); w=max(cv.winfo_width(),420); h=max(cv.winfo_height(),100)
+            left,right,top,bottom=28,10,30,14
+            cv.create_line(left,h-bottom,w-right,h-bottom,fill=BORDER)
+            cv.create_line(left,top,left,h-bottom,fill=BORDER)
+            for n,(ki,name) in enumerate(joints):
+                lx=8+(n%3)*(w/3); ly=5+(n//3)*12
+                _draw_kp_shape_canvas(cv,KP_SHAPES[ki],lx+4,ly+4,3,KP_COLORS[ki],"white",1)
+                cv.create_text(lx+11,ly,text=name,fill=KP_COLORS[ki],font=_tk_font(7),anchor="nw")
+                coords=[]; plotted=[]
+                for i,sample in enumerate(samples[:5]):
+                    value=sample.get("kps",{}).get(str(ki))
+                    if not value or len(value)<3 or float(value[2])<HP_POSE_MIN_VIS:continue
+                    val=float(value[0] if axis=="x" else value[1])
+                    x=left+i/4*max(w-left-right,1)
+                    y=top+np.clip(val,0,1)*(h-top-bottom)
+                    coords.extend((x,y)); plotted.append((x,y))
+                if len(coords)>=4:cv.create_line(*coords,fill=KP_COLORS[ki],width=2)
+                for x,y in plotted:
+                    _draw_kp_shape_canvas(cv,KP_SHAPES[ki],x,y,4,KP_COLORS[ki],"white",1)
+            for i,rel in enumerate(HP_POSE_SAMPLE_OFFSETS):
+                x=left+i/4*max(w-left-right,1)
+                cv.create_text(x,h-2,text=f"{rel:+.1f}",fill=SUBTEXT,font=_tk_font(7),anchor="s")
+
     def _refresh_hp_detail(self):
         if not hasattr(self,"_hp_detail_canvases") or not self.peaks:return
         peak=self.peaks[self.peak_idx]; samples=list(peak.get("pose_samples") or [])
-        while len(samples)<3:
-            i=len(samples); samples.append({"time":max(0,peak["time"]+(-.3,0,.3)[i]),"kps":{}})
+        while len(samples)<5:
+            i=len(samples); samples.append({"time":max(0,peak["time"]+HP_POSE_SAMPLE_OFFSETS[i]),"kps":{}})
         backend="YOLO" if peak.get("pose_backend")=="yolo" else "MediaPipe"
         ball_found=any("18" in s.get("kps",{}) for s in samples)
         ball_text="  ボール検出✓" if ball_found else ""
         self._hp_detail_title.set(f"HP #{peak['rank']}  {backend}{ball_text}  "
                                   f"音声候補 {peak['time']:.3f}秒  "
                                   f"採用フレーム {(peak.get('frame_time') or peak['time']):.3f}秒")
-        for i,(cv,s) in enumerate(zip(self._hp_detail_canvases,samples[:3])):
-            rel=float(s["time"])-float(peak["time"]); title="候補フレーム" if i==1 else f"{rel:+.3f}秒"
+        for i,(cv,s) in enumerate(zip(self._hp_detail_canvases,samples[:5])):
+            rel=float(s["time"])-float(peak["time"]); title="候補フレーム" if i==2 else f"{rel:+.3f}秒"
             self._hp_detail_time_vars[i].set(f"{title}  ({float(s['time']):.3f}秒)")
             self._render_hp_detail_photo(cv,s,i)
         self._draw_hp_detail_energy(peak,samples)
+        self._draw_hp_sparklines(samples)
         shot=peak.get("pose_shot"); reason=peak.get("pose_reason"); conf=peak.get("pose_confidence")
         pct=f" {float(conf):.0%}" if conf is not None else ""
         self._hp_detail_result_vars["serve"].set("✓ サーブ"+pct if shot=="serve" else "─ 条件なし")
@@ -3441,8 +3477,8 @@ class TennisApp(tk.Tk):
         if len(pts)>=4:
             tl.create_line(pts,fill="#555",width=1)
         energy_max=max(float(np.max(combined)),1e-6)
-        threshold=energy_max*(1.0-float(self.sensitivity.get()))
-        threshold_y=int(ch-threshold*(ch-14)-4)
+        threshold=float(self.sensitivity.get())
+        threshold_y=int(np.clip(ch-threshold*(ch-14)-4,4,ch-4))
         tl.create_line(0,threshold_y,cw,threshold_y,fill=RED,width=1,dash=(5,3))
         tl.create_text(5,max(2,threshold_y-2),text=f"閾値 {threshold:.2f}",fill=RED,
                        font=_tk_font(8,bold=True),anchor="sw")

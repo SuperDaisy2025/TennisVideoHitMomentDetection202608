@@ -93,3 +93,16 @@ def test_yolo_coco_keypoints_feed_common_swing_features():
     result = app._coco_pose_features(kps)
     assert result is not None
     assert result["serve_zone"] is True
+
+
+def test_selected_sensitivity_is_direct_energy_threshold():
+    data = {
+        "combined": np.array([0.0, 0.35, 0.0, 0.65, 0.0]),
+        "times": np.arange(5, dtype=float), "sr": 512,
+    }
+    peaks, _ = TA.detect_peaks(data, sensitivity=0.4, min_gap=0.1)
+    assert peaks.tolist() == [3]
+
+
+def test_pose_sampling_uses_five_requested_offsets():
+    assert TA.HP_POSE_SAMPLE_OFFSETS == (-0.2, -0.1, 0.0, 0.1, 0.2)
