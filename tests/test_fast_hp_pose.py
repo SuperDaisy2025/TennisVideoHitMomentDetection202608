@@ -108,7 +108,7 @@ def test_pose_sampling_uses_five_requested_offsets():
     assert TA.HP_POSE_SAMPLE_OFFSETS == (-0.2, -0.1, 0.0, 0.1, 0.2)
 
 
-def test_motion_summary_is_hip_relative_cm_delta_and_reports_ball():
+def test_motion_summary_is_signed_horizontal_cm_delta_and_reports_ball():
     def sample(joint_x, ball=False):
         kps={"0":[0.5,0.1,0.9], "15":[0.45,0.9,0.9], "16":[0.55,0.9,0.9],
              "11":[0.45,0.5,0.9], "12":[0.55,0.5,0.9]}
@@ -118,4 +118,15 @@ def test_motion_summary_is_hip_relative_cm_delta_and_reports_ball():
     samples=[sample(0.6),sample(0.62),sample(0.65,True),sample(0.68),sample(0.7)]
     values,ball=TA.TennisApp._compute_hp_motion_cm(samples,(100,100),160)
     assert ball is True
-    assert all(abs(value-20.0)<1e-6 for value in values.values())
+    # Uses -0.1s (x=.62) and +0.1s (x=.68): 6px * 2cm/px = +12cm.
+    assert all(abs(value-12.0)<1e-6 for value in values.values())
+
+
+def test_motion_summary_treats_image_right_as_positive():
+    def sample(x):
+        kps={"0":[.5,.1,.9],"15":[.5,.9,.9],"16":[.5,.9,.9]}
+        for index in (10,9,6,5,8,7):kps[str(index)]=[x,.4,.9]
+        return {"kps":kps}
+    values,_=TA.TennisApp._compute_hp_motion_cm(
+        [sample(.5),sample(.7),sample(.6),sample(.4),sample(.5)],(100,100),160)
+    assert all(abs(value+60.0)<1e-6 for value in values.values())

@@ -321,7 +321,7 @@ BG=     "#0f1117"; PANEL=  "#1a1d27"; PANEL2= "#141720"
 ACCENT= "#e8593c"; ACCENT2="#3b8bd4"; GOLD=   "#ef9f27"
 GREEN=  "#1d9e75"; TEXT=   "#d4d0c8"; SUBTEXT="#888780"
 BORDER= "#2c2e3a"; DARK2=  "#12141e"; RED= "#ff5252"
-APP_VERSION = "v69"; APP_VERSION_DESC = "5点姿勢・腰基準移動量"
+APP_VERSION = "v70"; APP_VERSION_DESC = "左右移動量・Excel出力"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -1268,6 +1268,9 @@ class TennisApp(tk.Tk):
         tk.Label(p,text="R/L:右/左  W:手首  S:肩  E:ひじ  B:ボール",
                  bg=PANEL,fg=SUBTEXT,font=_tk_font(7),anchor="w"
                  ).pack(fill="x",padx=12)
+        tk.Button(hp_hdr,text="Excel出力",bg=DARK2,fg=GOLD,relief="flat",
+                  font=_tk_font(8,bold=True),command=self._export_hit_points_xlsx,
+                  cursor="hand2").pack(side="right",padx=(0,6),ipadx=4)
         lf=tk.Frame(p,bg=PANEL)
         lf.pack(fill="both",expand=True,padx=12,pady=(0,4))
         sb=tk.Scrollbar(lf,bg=PANEL); sb.pack(side="right",fill="y")
@@ -1491,7 +1494,7 @@ class TennisApp(tk.Tk):
         self._hp_detail_chart.pack(fill="x",padx=7,pady=5)
         self._hp_detail_chart.bind("<Configure>",lambda e:self.after_idle(self._refresh_hp_detail))
         motion=tk.Frame(parent,bg=PANEL2); motion.pack(fill="x",padx=13,pady=(0,4))
-        tk.Label(motion,text="腰中点からの距離変化  (+0.2秒 − -0.2秒)",bg=PANEL2,fg=TEXT,
+        tk.Label(motion,text="写真の右方向を正とした横移動距離  (+0.1秒 − -0.1秒)",bg=PANEL2,fg=TEXT,
                  font=_tk_font(9,bold=True),anchor="w").pack(fill="x",padx=7,pady=(4,2))
         self._hp_motion_vars={}
         for key,title,ki in (("rw","右手首",10),("lw","左手首",9),("rs","右肩",6),
@@ -2783,10 +2786,11 @@ class TennisApp(tk.Tk):
 
     @staticmethod
     def _compute_hp_motion_cm(samples,video_wh,player_height_cm):
-        """Return six hip-relative distance deltas and five-frame ball detection.
+        """Return six signed horizontal deltas and five-frame ball detection.
 
         Coordinates are normalized.  The cm scale follows the existing analyzer
         convention: player height divided by the largest nose-to-ankle span.
+        Positive means movement toward the right side of the displayed image.
         """
         joint_map=(("rw",10),("lw",9),("rs",6),("ls",5),("re",8),("le",7))
         result={key:None for key,_ in joint_map}
@@ -2809,18 +2813,15 @@ class TennisApp(tk.Tk):
         if not heights:return result,ball
         cm_per_px=float(player_height_cm)/max(heights)
 
-        def distances(sample):
-            kps=sample.get("kps",{}); lh=kps.get("11"); rh=kps.get("12")
+        def x_positions(sample):
+            kps=sample.get("kps",{})
             valid=lambda v: bool(v and len(v)>=3 and float(v[2])>=HP_POSE_MIN_VIS)
-            if not (valid(lh) and valid(rh)):return {}
-            hx=(float(lh[0])+float(rh[0]))*.5*w
-            hy=(float(lh[1])+float(rh[1]))*.5*h
             out={}
             for key,ki in joint_map:
                 v=kps.get(str(ki))
-                if valid(v):out[key]=math.hypot(float(v[0])*w-hx,float(v[1])*h-hy)
+                if valid(v):out[key]=float(v[0])*w
             return out
-        before=distances(samples[0]); after=distances(samples[4])
+        before=x_positions(samples[1]); after=x_positions(samples[3])
         for key,_ in joint_map:
             if key in before and key in after:
                 result[key]=(after[key]-before[key])*cm_per_px
@@ -3031,6 +3032,65 @@ class TennisApp(tk.Tk):
         self._update_shot_list()
         self._sync_list_selection()
         self._draw_timeline()
+
+    def _export_hit_points_xlsx(self):
+        """Export every current HP and its six signed motion values to Excel."""
+        if not self.peaks:
+            messagebox.showinfo("Excel出力","出力できるヒットポイントがありません")
+            return
+        path=self.video_path.get()
+        stem=os.path.splitext(os.path.basename(path))[0] or "hit_points"
+        initial_dir=os.path.dirname(path) if path and os.path.isdir(os.path.dirname(path)) else os.getcwd()
+        out_path=filedialog.asksaveasfilename(
+            title="ヒットポイント一覧をExcelへ出力",initialdir=initial_dir,
+            initialfile=f"{stem}_hit_points.xlsx",defaultextension=".xlsx",
+            filetypes=[("Excel workbook","*.xlsx")])
+        if not out_path:return
+        try:
+            all_labels=load_all_labels(get_db_path(path),os.path.basename(path))
+            rows=[]
+            names=(("右手首_cm","rw"),("左手首_cm","lw"),("右肩_cm","rs"),
+                   ("左肩_cm","ls"),("右ひじ_cm","re"),("左ひじ_cm","le"))
+            for peak in self.peaks:
+                motion,ball=self._hp_motion_summary(peak); rank=peak.get("rank")
+                label=all_labels.get(rank)
+                row={"HP番号":rank,"候補時刻_秒":round(float(peak.get("time",0)),3),
+                     "採用フレーム_秒":round(float(peak.get("frame_time") or peak.get("time",0)),3),
+                     "姿勢検出":("YOLO" if peak.get("pose_backend")=="yolo" else "MediaPipe"),
+                     "自動判定":peak.get("pose_shot") or "",
+                     "判定理由":peak.get("pose_reason") or "",
+                     "信頼度":peak.get("pose_confidence"),
+                     "ボール検出":"あり" if ball else "なし"}
+                for title,key in names:
+                    value=motion.get(key); row[title]=None if value is None else round(float(value),2)
+                row["手動ショット分類"]=label[0] if label else ""
+                row["回転分類"]=label[1] if label else ""
+                row["評価"]=label[2] if label else ""
+                rows.append(row)
+            df=pd.DataFrame(rows)
+            with pd.ExcelWriter(out_path,engine="openpyxl") as writer:
+                df.to_excel(writer,index=False,sheet_name="ヒットポイント一覧")
+                ws=writer.book["ヒットポイント一覧"]
+                ws.freeze_panes="A2"; ws.auto_filter.ref=ws.dimensions
+                from openpyxl.styles import Font,PatternFill,Alignment
+                fill=PatternFill("solid",fgColor="E67E22")
+                for cell in ws[1]:
+                    cell.fill=fill; cell.font=Font(color="FFFFFF",bold=True)
+                    cell.alignment=Alignment(horizontal="center")
+                for col in ws.columns:
+                    width=min(max(len(str(c.value or "")) for c in col)+2,24)
+                    ws.column_dimensions[col[0].column_letter].width=max(width,10)
+                for row in ws.iter_rows(min_row=2,min_col=2,max_col=3):
+                    for cell in row:cell.number_format="0.000"
+                for title,_ in names:
+                    col_index=list(df.columns).index(title)+1
+                    for cell in ws.iter_cols(min_col=col_index,max_col=col_index,min_row=2):
+                        for item in cell:item.number_format='0.00;[Red]-0.00'
+                ws.sheet_properties.pageSetUpPr.fitToPage=True
+                ws.page_setup.fitToWidth=1; ws.page_setup.fitToHeight=0
+            messagebox.showinfo("Excel出力",f"書き出しました:\n{out_path}")
+        except Exception as e:
+            messagebox.showerror("Excel出力",f"Excelの書き出しに失敗しました:\n{e}")
 
     def _update_shot_list(self):
         path=self.video_path.get()
