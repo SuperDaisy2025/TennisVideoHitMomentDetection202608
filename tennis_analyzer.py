@@ -321,7 +321,7 @@ BG=     "#0f1117"; PANEL=  "#1a1d27"; PANEL2= "#141720"
 ACCENT= "#e8593c"; ACCENT2="#3b8bd4"; GOLD=   "#ef9f27"
 GREEN=  "#1d9e75"; TEXT=   "#d4d0c8"; SUBTEXT="#888780"
 BORDER= "#2c2e3a"; DARK2=  "#12141e"; RED= "#ff5252"
-APP_VERSION = "v71"; APP_VERSION_DESC = "手首・ひじXY移動量"
+APP_VERSION = "v72"; APP_VERSION_DESC = "正解教師データ蓄積"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -475,6 +475,61 @@ def extract_thumbnails(video_path, peak_times, output_dir, progress_cb=None):
 # ══════════════════════════════════════════════
 def get_db_path(video_path):
     return os.path.join(os.path.dirname(video_path),"tennis_labels.db")
+
+def get_ground_truth_db_path():
+    """Version-independent per-user database for verified hit points."""
+    root=os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"),"AppData","Local")
+    folder=os.path.join(root,"TennisHitMomentDetect")
+    os.makedirs(folder,exist_ok=True)
+    return os.path.join(folder,"hit_point_ground_truth.db")
+
+def init_ground_truth_db(db_path=None):
+    db_path=db_path or get_ground_truth_db_path()
+    con=sqlite3.connect(db_path)
+    con.execute("""CREATE TABLE IF NOT EXISTS verified_hit_points (
+        video_key TEXT NOT NULL, video_path TEXT, video_file TEXT,
+        peak_rank INTEGER, peak_time REAL, frame_time REAL,
+        camera_dir TEXT, video_shots TEXT, shot_type TEXT,
+        rw_x REAL, rw_y REAL, lw_x REAL, lw_y REAL,
+        re_x REAL, re_y REAL, le_x REAL, le_y REAL,
+        ball_detected INTEGER, pose_backend TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY(video_key, peak_rank, peak_time))""")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_verified_video ON verified_hit_points(video_key)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_verified_group ON verified_hit_points(camera_dir,shot_type)")
+    con.commit(); con.close()
+    return db_path
+
+def _ground_truth_video_key(video_path):
+    return os.path.normcase(os.path.abspath(video_path or ""))
+
+def load_ground_truth_keys(video_path,db_path=None):
+    db_path=init_ground_truth_db(db_path)
+    con=sqlite3.connect(db_path)
+    rows=con.execute("SELECT peak_rank,peak_time FROM verified_hit_points WHERE video_key=?",
+                     (_ground_truth_video_key(video_path),)).fetchall()
+    con.close()
+    return {(int(rank),round(float(t),3)) for rank,t in rows}
+
+def save_ground_truth(row,checked=True,db_path=None):
+    db_path=init_ground_truth_db(db_path); key=row["video_key"]
+    con=sqlite3.connect(db_path)
+    if not checked:
+        con.execute("""DELETE FROM verified_hit_points
+                       WHERE video_key=? AND peak_rank=? AND ABS(peak_time-?)<0.001""",
+                    (key,row["peak_rank"],row["peak_time"]))
+    else:
+        cols=("video_key","video_path","video_file","peak_rank","peak_time","frame_time",
+              "camera_dir","video_shots","shot_type","rw_x","rw_y","lw_x","lw_y",
+              "re_x","re_y","le_x","le_y","ball_detected","pose_backend")
+        values=[row.get(c) for c in cols]
+        placeholders=",".join("?" for _ in cols)
+        updates=",".join(f"{c}=excluded.{c}" for c in cols[1:])
+        con.execute(f"""INSERT INTO verified_hit_points ({','.join(cols)}) VALUES ({placeholders})
+                         ON CONFLICT(video_key,peak_rank,peak_time) DO UPDATE SET
+                         {updates},updated_at=CURRENT_TIMESTAMP""",values)
+    con.commit(); con.close()
 
 def init_db(db_path):
     con=sqlite3.connect(db_path)
@@ -1262,7 +1317,7 @@ class TennisApp(tk.Tk):
                        bg=PANEL,fg=SUBTEXT,activebackground=PANEL,selectcolor=DARK2,
                        font=_tk_font(9),command=self._on_classified_filter_changed
                         ).pack(side="right")
-        tk.Label(p,text="時刻・分類 | RWx RWy LWx LWy REx REy LEx LEy  B",
+        tk.Label(p,text="正解  時刻・分類 | RWx RWy LWx LWy REx REy LEx LEy  B",
                  bg=PANEL,fg=SUBTEXT,font=("Courier",8),anchor="w"
                  ).pack(fill="x",padx=12)
         tk.Label(p,text="R/L:右/左  W:手首  E:ひじ  x=右＋  y=下＋  B=ボール (cm)",
@@ -1281,10 +1336,15 @@ class TennisApp(tk.Tk):
         self.peak_list.pack(side="left",fill="both",expand=True)
         sb.config(command=self.peak_list.yview)
         self.peak_list.bind("<<ListboxSelect>>",self._on_list_select)
+        self.peak_list.bind("<Button-1>",self._on_peak_truth_click,add="+")
         # 右クリック / Delキー で削除
         self.peak_list.bind("<Button-3>",self._on_list_right_click)
         self.peak_list.bind("<Delete>",
                              lambda e: (self._delete_current_checkpoint(), "break")[1])
+        try: truth_name=os.path.basename(get_ground_truth_db_path())
+        except Exception: truth_name="hit_point_ground_truth.db"
+        tk.Label(p,text=f"☑ 正解データ: {truth_name}",bg=PANEL,fg=SUBTEXT,
+                 font=_tk_font(7),anchor="w").pack(fill="x",padx=12,pady=(0,2))
 
         # v53: 検出情報（削除/再採番は削除、検出ステータスを表示）
         # v61: 検出情報 3行+ボタン形式
@@ -3036,6 +3096,56 @@ class TennisApp(tk.Tk):
         self._sync_list_selection()
         self._draw_timeline()
 
+    def _ground_truth_row(self,peak):
+        path=self.video_path.get(); rank=int(peak.get("rank",0)); t=float(peak.get("time",0))
+        motion,ball=self._hp_motion_summary(peak)
+        extra=getattr(self,"_video_meta_extra",{}) or {}
+        main_shots=list(extra.get("main_shots") or [])
+        label=load_label(get_db_path(path),os.path.basename(path),rank) if path else None
+        manual=(label or {}).get("shot_type","")
+        popup_shot_codes={"サーブ":"serve","フォアハンド":"forehand",
+                          "バックハンド":"backhand","ボレー":"volley",
+                          "スマッシュ":"smash","リターン":"return"}
+        main_codes=[popup_shot_codes.get(s,s) for s in main_shots]
+        effective_shot=manual if manual not in ("","other","unknown") else \
+                       (main_codes[0] if len(main_codes)==1 else ",".join(main_codes))
+        row={"video_key":_ground_truth_video_key(path),"video_path":os.path.abspath(path),
+             "video_file":os.path.basename(path),"peak_rank":rank,"peak_time":t,
+             "frame_time":float(peak.get("frame_time") or t),
+             "camera_dir":str(extra.get("camera_dir","") or ""),
+             "video_shots":json.dumps(main_shots,ensure_ascii=False),
+             "shot_type":effective_shot,"ball_detected":1 if ball else 0,
+             "pose_backend":str(peak.get("pose_backend","") or "")}
+        for key in ("rw_x","rw_y","lw_x","lw_y","re_x","re_y","le_x","le_y"):
+            row[key]=motion.get(key)
+        return row
+
+    def _on_peak_truth_click(self,event):
+        """Toggle the checkbox only when the leftmost checkbox area is clicked."""
+        if event.x>38 or not self.peaks:return None
+        list_idx=self.peak_list.nearest(event.y)
+        if not (0<=list_idx<self.peak_list.size()):return "break"
+        mapping=getattr(self,"_list_to_peak_idx",[])
+        peak_idx=mapping[list_idx] if mapping and list_idx<len(mapping) else list_idx
+        if not (0<=peak_idx<len(self.peaks)):return "break"
+        peak=self.peaks[peak_idx]; key=(int(peak["rank"]),round(float(peak["time"]),3))
+        try:
+            truth_keys=load_ground_truth_keys(self.video_path.get())
+            checked=key not in truth_keys
+            save_ground_truth(self._ground_truth_row(peak),checked=checked)
+            self.peak_idx=peak_idx; self.frame_offset=0
+            self._update_shot_list()
+            try:
+                new_idx=self._list_to_peak_idx.index(peak_idx)
+                self.peak_list.selection_set(new_idx); self.peak_list.see(new_idx)
+            except (ValueError,AttributeError):pass
+            self.status_var.set("正解として教師DBへ保存しました" if checked else
+                                "正解チェックを外し、教師DBから削除しました")
+            self._update_view()
+        except Exception as e:
+            messagebox.showerror("正解データ",f"正解データを更新できませんでした:\n{e}")
+        return "break"
+
     def _export_hit_points_xlsx(self):
         """Export every current HP and four joints' signed X/Y values to Excel."""
         if not self.peaks:
@@ -3056,10 +3166,13 @@ class TennisApp(tk.Tk):
                    ("左手首_X_cm","lw_x"),("左手首_Y_cm","lw_y"),
                    ("右ひじ_X_cm","re_x"),("右ひじ_Y_cm","re_y"),
                    ("左ひじ_X_cm","le_x"),("左ひじ_Y_cm","le_y"))
+            truth_keys=load_ground_truth_keys(path)
             for peak in self.peaks:
                 motion,ball=self._hp_motion_summary(peak); rank=peak.get("rank")
                 label=all_labels.get(rank)
-                row={"HP番号":rank,"候補時刻_秒":round(float(peak.get("time",0)),3),
+                truth_key=(int(rank),round(float(peak.get("time",0)),3))
+                row={"正解":("✓" if truth_key in truth_keys else ""),
+                     "HP番号":rank,"候補時刻_秒":round(float(peak.get("time",0)),3),
                      "採用フレーム_秒":round(float(peak.get("frame_time") or peak.get("time",0)),3),
                      "姿勢検出":("YOLO" if peak.get("pose_backend")=="yolo" else "MediaPipe"),
                      "自動判定":peak.get("pose_shot") or "",
@@ -3108,6 +3221,8 @@ class TennisApp(tk.Tk):
         self._list_to_peak_idx=[]
         classified_only=(self._show_classified_only.get()
                          if hasattr(self,"_show_classified_only") else False)
+        try: truth_keys=load_ground_truth_keys(path) if path else set()
+        except Exception: truth_keys=set()
         for i,p in enumerate(self.peaks):
             rank=p["rank"]; t=p["time"]
             lbl=all_labels.get(rank,None)
@@ -3126,6 +3241,8 @@ class TennisApp(tk.Tk):
             if self._is_shaky(rank): icons+="⚠"
             icons=f" {icons:<3}" if icons else "    "
             # v24: 評価アイコン (nice/super→👍、miss→👎、それ以外はスペース)
+            checked=(int(rank),round(float(t),3)) in truth_keys
+            checkmark="☑" if checked else "☐"
             if lbl:
                 rating=lbl[2]
                 rating_icon=" 👍" if rating in ("nice","super") else \
@@ -3134,9 +3251,9 @@ class TennisApp(tk.Tk):
                 spin_ja=next((ja for ja,en in SPINS      if en==lbl[1]),"")
                 ft=lbl[3]
                 ft_str=f"{ft:.2f}s" if (ft is not None and ft>0) else f"{t:.2f}s"
-                tag=f"#{rank:2d}{icons}{rating_icon} {ft_str:>7} {shot_ja}/{spin_ja}{cb}"
+                tag=f"{checkmark} #{rank:2d}{icons}{rating_icon} {ft_str:>7} {shot_ja}/{spin_ja}{cb}"
             else:
-                tag=f"#{rank:2d}{icons}    {t:6.2f}s   未{cb}"
+                tag=f"{checkmark} #{rank:2d}{icons}    {t:6.2f}s   未{cb}"
             motion,ball=self._hp_motion_summary(p)
             def compact(key):
                 value=motion.get(key)

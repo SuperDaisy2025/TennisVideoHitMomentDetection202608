@@ -1,4 +1,5 @@
 import importlib.util
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -142,3 +143,19 @@ def test_motion_summary_treats_image_down_as_positive_y():
     values,_=TA.TennisApp._compute_hp_motion_cm(
         [sample(.5),sample(.3),sample(.4),sample(.5),sample(.4)],(100,100),160)
     assert all(abs(values[key]-40.0)<1e-6 for key in ("rw_y","lw_y","re_y","le_y"))
+
+
+def test_verified_hit_point_database_persists_and_unchecks():
+    with tempfile.TemporaryDirectory() as folder:
+        db_path=str(Path(folder)/"truth.db")
+        video=str(Path(folder)/"sample.mp4")
+        row={"video_key":TA._ground_truth_video_key(video),"video_path":video,
+             "video_file":"sample.mp4","peak_rank":2,"peak_time":1.234,
+             "frame_time":1.235,"camera_dir":"正面","video_shots":"[\"バックハンド\"]",
+             "shot_type":"バックハンド","rw_x":2.0,"rw_y":-1.0,"lw_x":1.0,
+             "lw_y":0.0,"re_x":3.0,"re_y":2.0,"le_x":-2.0,"le_y":1.0,
+             "ball_detected":1,"pose_backend":"yolo"}
+        TA.save_ground_truth(row,True,db_path)
+        assert (2,1.234) in TA.load_ground_truth_keys(video,db_path)
+        TA.save_ground_truth(row,False,db_path)
+        assert TA.load_ground_truth_keys(video,db_path)==set()
