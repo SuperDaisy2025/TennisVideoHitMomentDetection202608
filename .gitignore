@@ -8,3 +8,5 @@ managed_videos/
 2_yolo_output/
 *.db
 *.npz
+*.pt
+.ultralytics/

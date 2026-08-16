@@ -225,6 +225,10 @@ import os
 os.environ.setdefault("GLOG_minloglevel", "3")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("MEDIAPIPE_DISABLE_GPU", "1")
+_YOLO_CONFIG_DIR=os.path.join(os.path.dirname(os.path.abspath(__file__)),".ultralytics")
+try: os.makedirs(_YOLO_CONFIG_DIR,exist_ok=True)
+except Exception: pass
+os.environ.setdefault("YOLO_CONFIG_DIR",_YOLO_CONFIG_DIR)
 import json, sqlite3, threading, time, math, copy, sys, warnings
 warnings.filterwarnings("ignore")
 import contextlib
@@ -317,7 +321,7 @@ BG=     "#0f1117"; PANEL=  "#1a1d27"; PANEL2= "#141720"
 ACCENT= "#e8593c"; ACCENT2="#3b8bd4"; GOLD=   "#ef9f27"
 GREEN=  "#1d9e75"; TEXT=   "#d4d0c8"; SUBTEXT="#888780"
 BORDER= "#2c2e3a"; DARK2=  "#12141e"; RED= "#ff5252"
-APP_VERSION = "v66"; APP_VERSION_DESC = "同一画像KP・閾値表示"
+APP_VERSION = "v67"; APP_VERSION_DESC = "YOLO姿勢・ボール検出"
 
 # v63: 音声HP候補を姿勢で検証する高速パラメータ。
 # 最初は候補時刻と前後0.3秒の3枚だけを解析し、打点探索は1フレームずつ行う。
@@ -956,7 +960,7 @@ class TennisApp(tk.Tk):
 
         # 解析データ
         self.video_path   = tk.StringVar()
-        self.sensitivity  = tk.DoubleVar(value=0.5)
+        self.sensitivity  = tk.DoubleVar(value=0.4)
         self.min_gap      = tk.DoubleVar(value=0.35)   # v18: 1.0 → 0.35s
         self.wall_mode    = tk.BooleanVar(value=False) # v18: 壁打ちモード
         self.audio_filter_enabled = tk.BooleanVar(value=True)
@@ -1992,7 +1996,7 @@ class TennisApp(tk.Tk):
         cap.release()
         win = tk.Toplevel(self, bg=PANEL)
         win.title("動画情報")
-        win.geometry("900x420")
+        win.geometry("940x500")
         win.transient(self)
         win.grab_set()
         top = tk.Frame(win, bg=PANEL)
@@ -2077,15 +2081,21 @@ class TennisApp(tk.Tk):
             tk.Radiobutton(ct_frame, text=ct, variable=content_var, value=ct,
                            bg=PANEL, fg=TEXT, activebackground=PANEL,
                            selectcolor=DARK2, font=_tk_font(9)).pack(side="left", padx=2)
-        # v61: MediaPipe自動検出チェック (デフォルトON)
-        tk.Label(right, text="キーポイント検出:", bg=PANEL, fg=TEXT,
+        # v67: HP候補の姿勢エンジン (デフォルトYOLO)
+        tk.Label(right, text="姿勢・ボール検出:", bg=PANEL, fg=TEXT,
                  font=_tk_font(10, True)).pack(anchor="w", pady=(8,2))
         kp_frame = tk.Frame(right, bg=PANEL); kp_frame.pack(anchor="w", padx=8)
-        mp_auto_var = tk.BooleanVar(value=saved_extra.get("mp_auto", True))
-        tk.Checkbutton(kp_frame, text="MediaPipe検出 (解析後に各HPを自動検出)",
-                       variable=mp_auto_var, bg=PANEL, fg=TEXT,
-                       activebackground=PANEL, selectcolor=DARK2,
-                       font=_tk_font(9)).pack(side="left")
+        pose_backend_var=tk.StringVar(value=saved_extra.get("pose_backend","yolo"))
+        for label,value in (("YOLO Nano（姿勢＋ボール）","yolo"),("MediaPipe Pose","mediapipe")):
+            tk.Radiobutton(kp_frame,text=label,variable=pose_backend_var,value=value,
+                           bg=PANEL,fg=TEXT,activebackground=PANEL,selectcolor=DARK2,
+                           font=_tk_font(9)).pack(side="left",padx=(0,10))
+        tk.Label(right,text="音声の検出感度:",bg=PANEL,fg=TEXT,
+                 font=_tk_font(10,True)).pack(anchor="w",pady=(8,2))
+        sensitivity_var=tk.StringVar(value=f"{float(saved_extra.get('sensitivity',0.4)):.1f}")
+        ttk.Combobox(right,textvariable=sensitivity_var,
+                     values=["0.7","0.6","0.5","0.4","0.3"],
+                     state="readonly",width=7,font=_tk_font(9)).pack(anchor="w",padx=8)
         # v40: プロジェクトフォルダ取込
         import_var = tk.BooleanVar(value=True)
         tk.Checkbutton(right, text="プロジェクトフォルダに取込 (動画+解析データを集約管理)",
@@ -2114,16 +2124,19 @@ class TennisApp(tk.Tk):
                 "camera_dir": cam_var.get(),
                 "main_shots": [k for k,v in shot_vars.items() if v.get()],
                 "content_type": content_var.get(),
-                "mp_auto": mp_auto_var.get(),  # v61
+                "pose_backend": pose_backend_var.get(),
+                "sensitivity": float(sensitivity_var.get()),
             }
             win.destroy()
             # v30: 壁打ちフラグをポップアップの選択から設定
             self.wall_mode.set(content_var.get() == "壁打ち")
+            self.sensitivity.set(float(sensitivity_var.get()))
             self._video_meta_extra = {
                 "camera_dir": cam_var.get(),
                 "main_shots": [k for k,v in shot_vars.items() if v.get()],
                 "content_type": content_var.get(),
-                "mp_auto": mp_auto_var.get(),
+                "pose_backend": pose_backend_var.get(),
+                "sensitivity": float(sensitivity_var.get()),
             }
             # v34: 追加メタデータをJSON保存 (次回復元用)
             try:
@@ -2419,6 +2432,26 @@ class TennisApp(tk.Tk):
                 "elbow_angle":elbow_angle,"serve_zone":serve_zone,
                 "stroke_zone":stroke_zone}
 
+    def _coco_pose_features(self,kps):
+        """YOLO COCO17の正規化座標から共通の判定特徴を作る。"""
+        def point(i):
+            value=kps.get(str(i))
+            if not value or len(value)<3 or float(value[2])<HP_POSE_MIN_VIS:return None
+            return np.array([float(value[0]),float(value[1])],dtype=float)
+        nose=point(0); ls=point(5); rs=point(6); re=point(8); rw=point(10)
+        lh=point(11); rh=point(12)
+        if any(x is None for x in (ls,rs,re,rw,lh,rh)):return None
+        shoulder_c=(ls+rs)/2.0; hip_c=(lh+rh)/2.0
+        shoulder_w=max(float(np.linalg.norm(ls-rs)),0.03)
+        torso=max(float(np.linalg.norm(shoulder_c-hip_c)),shoulder_w)
+        body_c=(shoulder_c+hip_c)/2.0
+        head_y=(float(nose[1])-.12*torso) if nose is not None else float(shoulder_c[1])-.65*torso
+        return {"rw":rw,"re":re,"rs":rs,"body_c":body_c,
+                "shoulder_w":shoulder_w,"torso":torso,
+                "elbow_angle":self._hp_angle(rs,re,rw),
+                "serve_zone":float(rw[1])<=head_y+.18*torso,
+                "stroke_zone":float(shoulder_c[1])-.20*torso<=float(rw[1])<=float(hip_c[1])+.35*torso}
+
     def _classify_hp_pose_triplet(self, samples):
         """t-0.1,t,t+0.1の姿勢から明白な非スイング候補を落とす。"""
         valid=[s for s in samples if s.get("feat") is not None]
@@ -2468,62 +2501,123 @@ class TennisApp(tk.Tk):
             return
         path=self.video_path.get(); gen=self._gen
         camera_dir=str(getattr(self,"_video_meta_extra",{}).get("camera_dir",""))
+        backend=str(getattr(self,"_video_meta_extra",{}).get("pose_backend","yolo"))
         self._set_progress(62,f"姿勢で候補確認中… 0/{len(candidates)}")
 
         def _worker():
             cap=None
             try:
-                model_path=self._mp_model_path_or_download()
-                if not model_path: raise RuntimeError("MediaPipeモデルを準備できません")
-                import mediapipe as mp
-                from mediapipe.tasks.python import BaseOptions, vision
                 cap=cv2.VideoCapture(path)
                 fps=cap.get(cv2.CAP_PROP_FPS) or 30.0
                 duration=(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)/fps
-                opts=vision.PoseLandmarkerOptions(
-                    base_options=BaseOptions(model_asset_path=model_path),
-                    running_mode=vision.RunningMode.IMAGE,num_poses=1,
-                    min_pose_detection_confidence=0.30,
-                    min_pose_presence_confidence=0.30)
+                mp=None; detector_cm=contextlib.nullcontext(None)
+                yolo_pose=None; yolo_objects=None
+                if backend=="yolo":
+                    from ultralytics import YOLO
+                    self.after(0,lambda:self.status_var.set("YOLO Nanoモデル準備中…"))
+                    yolo_pose=YOLO("yolov8n-pose.pt")
+                    yolo_objects=YOLO("yolov8n.pt")
+                else:
+                    model_path=self._mp_model_path_or_download()
+                    if not model_path: raise RuntimeError("MediaPipeモデルを準備できません")
+                    import mediapipe as mp
+                    from mediapipe.tasks.python import BaseOptions, vision
+                    opts=vision.PoseLandmarkerOptions(
+                        base_options=BaseOptions(model_asset_path=model_path),
+                        running_mode=vision.RunningMode.IMAGE,num_poses=1,
+                        min_pose_detection_confidence=0.30,
+                        min_pose_presence_confidence=0.30)
+                    with _suppress_stderr():
+                        detector_cm=vision.PoseLandmarker.create_from_options(opts)
                 frame_cache={}
-                def detect_at(det,t):
+                def detect_at(det,t,need_ball=False):
                     frame_no=max(0,int(round(max(0.0,t)*fps)))
-                    if frame_no in frame_cache: return frame_cache[frame_no]
+                    if frame_no in frame_cache:
+                        cached=frame_cache[frame_no]
+                        if need_ball and backend=="yolo" and not cached.get("ball_checked"):
+                            bgr_cached=cv2.imdecode(np.frombuffer(cached["frame_jpeg"],dtype=np.uint8),
+                                                    cv2.IMREAD_COLOR)
+                            h,w=bgr_cached.shape[:2]
+                            obj=yolo_objects.predict(bgr_cached,verbose=False,conf=0.15,classes=[32])[0]
+                            if obj.boxes is not None and len(obj.boxes)>0:
+                                confs=obj.boxes.conf.cpu().numpy(); boxes=obj.boxes.xyxy.cpu().numpy()
+                                wrist=cached["kps"].get("10")
+                                if wrist:
+                                    centers=np.column_stack(((boxes[:,0]+boxes[:,2])*.5/w,
+                                                             (boxes[:,1]+boxes[:,3])*.5/h))
+                                    bi=int(np.argmin(np.linalg.norm(centers-np.array(wrist[:2]),axis=1)-.08*confs))
+                                else: bi=int(np.argmax(confs))
+                                box=boxes[bi]
+                                cached["kps"]["18"]=[float((box[0]+box[2])*.5/w),
+                                                       float((box[1]+box[3])*.5/h),float(confs[bi])]
+                            cached["ball_checked"]=True
+                        return cached
                     cap.set(cv2.CAP_PROP_POS_FRAMES,frame_no)
                     ok,bgr=cap.read()
                     if not ok:
                         result={"time":frame_no/fps,"frame_no":frame_no,"feat":None,"kps":{}}
                         frame_cache[frame_no]=result; return result
-                    rgb=cv2.cvtColor(bgr,cv2.COLOR_BGR2RGB)
-                    img=mp.Image(image_format=mp.ImageFormat.SRGB,data=np.ascontiguousarray(rgb))
-                    with _suppress_stderr(): res=det.detect(img)
-                    lms=res.pose_landmarks[0] if res.pose_landmarks else None
                     kps={}
-                    if lms:
-                        for mp_i,coco_i in self.MP_TO_COCO.items():
-                            if mp_i < len(lms):
-                                lm=lms[mp_i]
-                                kps[str(coco_i)]=[float(lm.x),float(lm.y),
-                                                  float(getattr(lm,"visibility",1.0))]
+                    if backend=="yolo":
+                        h,w=bgr.shape[:2]
+                        pose_result=yolo_pose.predict(bgr,verbose=False,conf=0.25)[0]
+                        best=0
+                        if pose_result.boxes is not None and len(pose_result.boxes)>1:
+                            boxes=pose_result.boxes.xyxy.cpu().numpy()
+                            best=int(np.argmax((boxes[:,2]-boxes[:,0])*(boxes[:,3]-boxes[:,1])))
+                        if pose_result.keypoints is not None and len(pose_result.keypoints.data)>best:
+                            values=pose_result.keypoints.data[best].cpu().numpy()
+                            for coco_i,value in enumerate(values[:17]):
+                                conf=float(value[2]) if len(value)>2 else 1.0
+                                kps[str(coco_i)]=[float(value[0])/w,float(value[1])/h,conf]
+                        if need_ball:
+                            obj_result=yolo_objects.predict(bgr,verbose=False,conf=0.15,classes=[32])[0]
+                            if obj_result.boxes is not None and len(obj_result.boxes)>0:
+                                confs=obj_result.boxes.conf.cpu().numpy()
+                                boxes=obj_result.boxes.xyxy.cpu().numpy()
+                                wrist=kps.get("10")
+                                if wrist:
+                                    centers=np.column_stack(((boxes[:,0]+boxes[:,2])*.5/w,
+                                                             (boxes[:,1]+boxes[:,3])*.5/h))
+                                    distances=np.linalg.norm(centers-np.array(wrist[:2]),axis=1)
+                                    bi=int(np.argmin(distances-.08*confs))
+                                else: bi=int(np.argmax(confs))
+                                box=boxes[bi]
+                                kps["18"]=[float((box[0]+box[2])*.5/w),
+                                           float((box[1]+box[3])*.5/h),float(confs[bi])]
+                        feat=self._coco_pose_features(kps)
+                    else:
+                        rgb=cv2.cvtColor(bgr,cv2.COLOR_BGR2RGB)
+                        img=mp.Image(image_format=mp.ImageFormat.SRGB,data=np.ascontiguousarray(rgb))
+                        with _suppress_stderr(): res=det.detect(img)
+                        lms=res.pose_landmarks[0] if res.pose_landmarks else None
+                        if lms:
+                            for mp_i,coco_i in self.MP_TO_COCO.items():
+                                if mp_i < len(lms):
+                                    lm=lms[mp_i]
+                                    kps[str(coco_i)]=[float(lm.x),float(lm.y),
+                                                      float(getattr(lm,"visibility",1.0))]
+                        feat=self._hp_pose_features(lms)
                     ok_jpg,encoded=cv2.imencode(".jpg",bgr,[cv2.IMWRITE_JPEG_QUALITY,92])
                     result={"time":frame_no/fps,"frame_no":frame_no,
-                            "feat":self._hp_pose_features(lms),"kps":kps,
-                            "frame_jpeg":encoded.tobytes() if ok_jpg else None}
+                            "feat":feat,"kps":kps,
+                            "frame_jpeg":encoded.tobytes() if ok_jpg else None,
+                            "ball_checked":bool(need_ball and backend=="yolo")}
                     frame_cache[frame_no]=result
                     return result
 
                 accepted=[]; rejected=0; audit=[]
-                with _suppress_stderr(): detector_cm=vision.PoseLandmarker.create_from_options(opts)
                 with detector_cm as det:
                     for n,cand in enumerate(candidates,1):
                         if self._gen != gen: return
                         t=cand["time"]
-                        coarse=[detect_at(det,max(0.0,min(duration,t+d)))
+                        coarse=[detect_at(det,max(0.0,min(duration,t+d)),need_ball=True)
                                 for d in (-HP_POSE_COARSE_SEC,0.0,HP_POSE_COARSE_SEC)]
                         verdict=self._classify_hp_pose_triplet(coarse)
                         audit_item={"time":float(t),"idx":int(cand["idx"]),
                                     "selected":bool(verdict["keep"]),
                                     "reason":verdict.get("reason","unknown"),
+                                    "backend":backend,
                                     "shot":verdict.get("shot","unknown"),
                                     "travel":verdict.get("travel"),
                                     "arm_change":verdict.get("arm_change")}
@@ -2554,6 +2648,7 @@ class TennisApp(tk.Tk):
                             item=dict(cand); item.update({"frame_time":float(best_t),
                                 "pose_shot":shot,"pose_confidence":verdict["confidence"],
                                 "pose_reason":verdict["reason"],
+                                "pose_backend":backend,
                                 "pose_travel":verdict.get("travel"),
                                 "pose_arm_change":verdict.get("arm_change"),
                                 "pose_samples":[{"time":float(s["time"]),
@@ -2606,8 +2701,9 @@ class TennisApp(tk.Tk):
         points={}
         for key,val in sample.get("kps",{}).items():
             try:
-                if float(val[2])>=HP_POSE_MIN_VIS:
-                    points[int(key)]=(float(val[0])*iw,float(val[1])*ih)
+                ki=int(key); min_conf=.15 if ki==18 else HP_POSE_MIN_VIS
+                if float(val[2])>=min_conf:
+                    points[ki]=(float(val[0])*iw,float(val[1])*ih)
             except Exception: pass
         if points:
             xs=[v[0] for v in points.values()]; ys=[v[1] for v in points.values()]
@@ -2670,7 +2766,11 @@ class TennisApp(tk.Tk):
         peak=self.peaks[self.peak_idx]; samples=list(peak.get("pose_samples") or [])
         while len(samples)<3:
             i=len(samples); samples.append({"time":max(0,peak["time"]+(-.3,0,.3)[i]),"kps":{}})
-        self._hp_detail_title.set(f"HP #{peak['rank']}  音声候補 {peak['time']:.3f}秒  "
+        backend="YOLO" if peak.get("pose_backend")=="yolo" else "MediaPipe"
+        ball_found=any("18" in s.get("kps",{}) for s in samples)
+        ball_text="  ボール検出✓" if ball_found else ""
+        self._hp_detail_title.set(f"HP #{peak['rank']}  {backend}{ball_text}  "
+                                  f"音声候補 {peak['time']:.3f}秒  "
                                   f"採用フレーム {(peak.get('frame_time') or peak['time']):.3f}秒")
         for i,(cv,s) in enumerate(zip(self._hp_detail_canvases,samples[:3])):
             rel=float(s["time"])-float(peak["time"]); title="候補フレーム" if i==1 else f"{rel:+.3f}秒"
@@ -2756,6 +2856,7 @@ class TennisApp(tk.Tk):
                                "pose_shot":pose_meta.get("pose_shot"),
                                "pose_confidence":pose_meta.get("pose_confidence"),
                                "pose_reason":pose_meta.get("pose_reason"),
+                               "pose_backend":pose_meta.get("pose_backend"),
                                "pose_travel":pose_meta.get("pose_travel"),
                                "pose_arm_change":pose_meta.get("pose_arm_change"),
                                "pose_samples":pose_meta.get("pose_samples",[]),

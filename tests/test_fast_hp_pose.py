@@ -80,3 +80,16 @@ def test_frequency_filter_toggle_changes_peak_source():
                                    use_frequency_filter=False)
     assert filtered.tolist() == [1]
     assert broadband.tolist() == [3]
+
+
+def test_yolo_coco_keypoints_feed_common_swing_features():
+    app = object.__new__(TA.TennisApp)
+    kps = {
+        "0": [0.50, 0.20, 0.9], "5": [0.42, 0.35, 0.9],
+        "6": [0.58, 0.35, 0.9], "8": [0.62, 0.25, 0.9],
+        "10": [0.60, 0.10, 0.9], "11": [0.44, 0.60, 0.9],
+        "12": [0.56, 0.60, 0.9], "18": [0.64, 0.08, 0.8],
+    }
+    result = app._coco_pose_features(kps)
+    assert result is not None
+    assert result["serve_zone"] is True
