@@ -321,7 +321,7 @@ BG=     "#0f1117"; PANEL=  "#1a1d27"; PANEL2= "#141720"
 ACCENT= "#e8593c"; ACCENT2="#3b8bd4"; GOLD=   "#ef9f27"
 GREEN=  "#1d9e75"; TEXT=   "#d4d0c8"; SUBTEXT="#888780"
 BORDER= "#2c2e3a"; DARK2=  "#12141e"; RED= "#ff5252"
-APP_VERSION = "v74"; APP_VERSION_DESC = "教師データ・表示改善"
+APP_VERSION = "v75"; APP_VERSION_DESC = "ピーク高さ・正解DBサマリ"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -490,7 +490,7 @@ def init_ground_truth_db(db_path=None):
         video_key TEXT NOT NULL, video_path TEXT, video_file TEXT,
         peak_rank INTEGER, peak_time REAL, frame_time REAL,
         camera_dir TEXT, content_type TEXT, video_shots TEXT, shot_type TEXT,
-        sensitivity REAL,
+        sensitivity REAL, peak_energy REAL, audio_filter_enabled INTEGER DEFAULT 1,
         rw_x REAL, rw_y REAL, lw_x REAL, lw_y REAL,
         re_x REAL, re_y REAL, le_x REAL, le_y REAL,
         ball_detected INTEGER, pose_backend TEXT NOT NULL DEFAULT 'unknown',
@@ -498,7 +498,8 @@ def init_ground_truth_db(db_path=None):
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY(video_key, peak_rank, peak_time, pose_backend))""")
     # v73: 既存の正解DBを壊さず、解析条件列だけを追加する。
-    for column,sql_type in (("content_type","TEXT"),("sensitivity","REAL")):
+    for column,sql_type in (("content_type","TEXT"),("sensitivity","REAL"),
+                            ("peak_energy","REAL"),("audio_filter_enabled","INTEGER DEFAULT 1")):
         try:con.execute(f"ALTER TABLE verified_hit_points ADD COLUMN {column} {sql_type}")
         except sqlite3.OperationalError:pass
     # v74: 同じ動画・HPでもYOLO/MediaPipeを別々の正解として保持する。
@@ -511,14 +512,15 @@ def init_ground_truth_db(db_path=None):
             video_key TEXT NOT NULL, video_path TEXT, video_file TEXT,
             peak_rank INTEGER, peak_time REAL, frame_time REAL,
             camera_dir TEXT, content_type TEXT, video_shots TEXT, shot_type TEXT,
-            sensitivity REAL, rw_x REAL, rw_y REAL, lw_x REAL, lw_y REAL,
+            sensitivity REAL, peak_energy REAL, audio_filter_enabled INTEGER DEFAULT 1,
+            rw_x REAL, rw_y REAL, lw_x REAL, lw_y REAL,
             re_x REAL, re_y REAL, le_x REAL, le_y REAL,
             ball_detected INTEGER, pose_backend TEXT NOT NULL DEFAULT 'unknown',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(video_key,peak_rank,peak_time,pose_backend))""")
         common=("video_key,video_path,video_file,peak_rank,peak_time,frame_time,"
-                "camera_dir,content_type,video_shots,shot_type,sensitivity,"
+                "camera_dir,content_type,video_shots,shot_type,sensitivity,peak_energy,audio_filter_enabled,"
                 "rw_x,rw_y,lw_x,lw_y,re_x,re_y,le_x,le_y,ball_detected")
         con.execute(f"""INSERT OR REPLACE INTO verified_hit_points
                      ({common},pose_backend,created_at,updated_at)
@@ -551,6 +553,7 @@ def save_ground_truth(row,checked=True,db_path=None):
     else:
         cols=("video_key","video_path","video_file","peak_rank","peak_time","frame_time",
               "camera_dir","content_type","video_shots","shot_type","sensitivity",
+              "peak_energy","audio_filter_enabled",
               "rw_x","rw_y","lw_x","lw_y",
               "re_x","re_y","le_x","le_y","ball_detected","pose_backend")
         values=[row.get(c) for c in cols]
@@ -740,6 +743,32 @@ def load_analysis_cache(cache_path):
         return out
     except Exception as e:
         print("cache load failed:",e); return None
+
+def backfill_ground_truth_peak_energies(db_path=None):
+    """Fill legacy verified rows from each video's existing audio cache."""
+    db_path=init_ground_truth_db(db_path)
+    con=sqlite3.connect(db_path)
+    rows=con.execute("""SELECT video_key,video_path,peak_rank,peak_time,pose_backend,
+                               COALESCE(audio_filter_enabled,1)
+                        FROM verified_hit_points WHERE peak_energy IS NULL""").fetchall()
+    caches={}; updated=0
+    for video_key,path,rank,peak_time,backend,use_filter in rows:
+        cache_path=get_analysis_cache_path(path)
+        if cache_path not in caches:caches[cache_path]=load_analysis_cache(cache_path)
+        data=caches[cache_path]
+        if not data:continue
+        times=np.asarray(data.get("times",[]),dtype=float)
+        energy=np.asarray(data.get("combined",[]) if use_filter else
+                          data.get("broadband",data.get("combined",[])),dtype=float)
+        if len(times)==0 or len(energy)==0:continue
+        j=int(np.argmin(np.abs(times-float(peak_time))))
+        if j>=len(energy):continue
+        con.execute("""UPDATE verified_hit_points SET peak_energy=?,updated_at=CURRENT_TIMESTAMP
+                       WHERE video_key=? AND peak_rank=? AND ABS(peak_time-?)<0.001
+                         AND pose_backend=?""",
+                    (float(energy[j]),video_key,rank,peak_time,backend))
+        updated+=1
+    con.commit(); con.close(); return updated
 
 
 # ── v15: 解析済動画レジストリ (グローバルJSON) ──
@@ -1337,24 +1366,24 @@ class TennisApp(tk.Tk):
         hp_hdr=tk.Frame(p,bg=PANEL); hp_hdr.pack(fill="x",padx=12,pady=(2,2))
         # v61: ★凡例
         tk.Label(p,text="★=KP検出済  ◆=クロップ設定済  △=手ぶれ",
-                 bg=PANEL,fg=SUBTEXT,font=_tk_font(9),anchor="w"
+                 bg=PANEL,fg=SUBTEXT,font=_tk_font(11),anchor="w"
                  ).pack(fill="x",padx=12)
         tk.Label(hp_hdr,text="ヒットポイント",bg=PANEL,fg=ACCENT2,
-                 font=_tk_font(11,bold=True)).pack(side="left")
+                 font=_tk_font(13,bold=True)).pack(side="left")
         # v24: 「分類済」チェックボックス — 未分類 HP を非表示
         self._show_classified_only=tk.BooleanVar(value=False)
         tk.Checkbutton(hp_hdr,text="分類済",variable=self._show_classified_only,
                        bg=PANEL,fg=SUBTEXT,activebackground=PANEL,selectcolor=DARK2,
-                       font=_tk_font(9),command=self._on_classified_filter_changed
+                       font=_tk_font(11),command=self._on_classified_filter_changed
                         ).pack(side="right")
         tk.Label(p,text="正解  時刻・分類 | RWx RWy LWx LWy REx REy LEx LEy  B",
-                 bg=PANEL,fg=SUBTEXT,font=("Courier",10,"bold"),anchor="w"
+                 bg=PANEL,fg=SUBTEXT,font=("Courier",12,"bold"),anchor="w"
                  ).pack(fill="x",padx=12)
         tk.Label(p,text="R/L:右/左  W:手首  E:ひじ  x=右＋  y=下＋  B=ボール (cm)",
-                 bg=PANEL,fg=SUBTEXT,font=_tk_font(9),anchor="w"
+                 bg=PANEL,fg=SUBTEXT,font=_tk_font(11),anchor="w"
                  ).pack(fill="x",padx=12)
         tk.Button(hp_hdr,text="Excel出力",bg=DARK2,fg=GOLD,relief="flat",
-                  font=_tk_font(8,bold=True),command=self._export_hit_points_xlsx,
+                  font=_tk_font(10,bold=True),command=self._export_hit_points_xlsx,
                   cursor="hand2").pack(side="right",padx=(0,6),ipadx=4)
         lf=tk.Frame(p,bg=PANEL)
         lf.pack(fill="both",expand=True,padx=12,pady=(0,4))
@@ -1362,7 +1391,7 @@ class TennisApp(tk.Tk):
         hsb=tk.Scrollbar(lf,bg=PANEL,orient="horizontal"); hsb.pack(side="bottom",fill="x")
         self.peak_list=tk.Listbox(lf,bg=DARK2,fg=TEXT,selectbackground=GOLD,
                                    selectforeground="#111111",exportselection=False,
-                                   relief="flat",font=("Courier",11),
+                                   relief="flat",font=("Courier",13),
                                    yscrollcommand=sb.set,xscrollcommand=hsb.set,
                                    activestyle="none")
         self.peak_list.pack(side="left",fill="both",expand=True)
@@ -1377,7 +1406,7 @@ class TennisApp(tk.Tk):
         try: truth_name=os.path.basename(get_ground_truth_db_path())
         except Exception: truth_name="hit_point_ground_truth.db"
         tk.Label(p,text=f"☑ 正解データ: {truth_name}",bg=PANEL,fg=SUBTEXT,
-                 font=_tk_font(9),anchor="w").pack(fill="x",padx=12,pady=(0,2))
+                 font=_tk_font(11),anchor="w").pack(fill="x",padx=12,pady=(0,2))
 
         # v53: 検出情報（削除/再採番は削除、検出ステータスを表示）
         # v61: 検出情報 3行+ボタン形式
@@ -1436,12 +1465,15 @@ class TennisApp(tk.Tk):
 
         self.tab_main    = tk.Frame(self.tabs,bg=BG)
         self.tab_hp_detail = tk.Frame(self.tabs,bg=BG)
+        self.tab_truth_summary = tk.Frame(self.tabs,bg=BG)
         self.tabs.add(self.tab_main,   text="ヒットポイント一覧")
         self.tabs.add(self.tab_hp_detail, text="ヒットポイント詳細")
+        self.tabs.add(self.tab_truth_summary, text="正解DBサマリ")
         self.tabs.bind("<<NotebookTabChanged>>",self._on_tab_changed)
 
         self._build_tab_main(self.tab_main)
         self._build_tab_hp_detail(self.tab_hp_detail)
+        self._build_tab_truth_summary(self.tab_truth_summary)
         # v63: 今回の画面はヒットポイント検出に限定する。
         self.refiner = None
 
@@ -1614,6 +1646,34 @@ class TennisApp(tk.Tk):
             v=tk.StringVar(value="─"); self._hp_detail_result_vars[key]=v
             tk.Label(box,textvariable=v,bg=DARK2,fg=TEXT,font=_tk_font(9,bold=True),
                      wraplength=210).pack(padx=5,pady=(0,6))
+
+    def _build_tab_truth_summary(self,parent):
+        head=tk.Frame(parent,bg=PANEL); head.pack(fill="x",padx=12,pady=(10,6))
+        tk.Label(head,text="検証済みヒットポイント教師データ",bg=PANEL,fg=ACCENT2,
+                 font=_tk_font(15,bold=True)).pack(side="left",padx=8,pady=7)
+        tk.Button(head,text="更新",bg=DARK2,fg=GOLD,relief="flat",cursor="hand2",
+                  font=_tk_font(10,bold=True),command=self._refresh_truth_summary
+                  ).pack(side="right",padx=8,ipadx=10,ipady=3)
+        self._truth_summary_info=tk.StringVar(value="正解DBを読み込みます")
+        tk.Label(parent,textvariable=self._truth_summary_info,bg=BG,fg=TEXT,
+                 font=_tk_font(11,bold=True),anchor="w").pack(fill="x",padx=20,pady=(0,7))
+        columns=("camera","content","shot","total","s03","s04","pass05","pass06")
+        box=tk.Frame(parent,bg=BG); box.pack(fill="both",expand=True,padx=16,pady=(0,14))
+        self._truth_summary_tree=ttk.Treeview(box,columns=columns,show="headings",height=16)
+        labels=("撮影方向","内容","ショット","正解総数","元0.3","元0.4",
+                "0.5でも検出","0.6でも検出")
+        widths=(100,100,120,90,80,80,120,120)
+        for col,label,width in zip(columns,labels,widths):
+            self._truth_summary_tree.heading(col,text=label)
+            self._truth_summary_tree.column(col,width=width,anchor="center",stretch=True)
+        style=ttk.Style(); style.configure("Truth.Treeview",font=_tk_font(11),rowheight=31)
+        style.configure("Truth.Treeview.Heading",font=_tk_font(11,bold=True))
+        self._truth_summary_tree.configure(style="Truth.Treeview")
+        ysb=ttk.Scrollbar(box,orient="vertical",command=self._truth_summary_tree.yview)
+        self._truth_summary_tree.configure(yscrollcommand=ysb.set)
+        ysb.pack(side="right",fill="y"); self._truth_summary_tree.pack(fill="both",expand=True)
+        tk.Label(parent,text="0.5／0.6列は、正解HPの保存済みピーク高さと閾値を比較した累積件数です。",
+                 bg=BG,fg=SUBTEXT,font=_tk_font(10),anchor="w").pack(fill="x",padx=20,pady=(0,10))
 
     def _build_label_bar(self,parent):
         # ショット
@@ -2824,9 +2884,23 @@ class TennisApp(tk.Tk):
                     points[ki]=(float(val[0])*iw,float(val[1])*ih)
             except Exception: pass
         if points:
-            xs=[v[0] for v in points.values()]; ys=[v[1] for v in points.values()]
+            bounds_points=list(points.values())
+            peak=self.peaks[self.peak_idx] if self.peaks and self.peak_idx<len(self.peaks) else {}
+            is_serve=peak.get("pose_shot")=="serve"
+            if not is_serve and peak:
+                try:
+                    label=load_label(get_db_path(path),os.path.basename(path),int(peak.get("rank",0)))
+                    is_serve=bool(label and label.get("shot_type")=="serve")
+                except Exception:pass
+            if is_serve and 10 in points and 8 in points:
+                # ラケット自体は姿勢モデルの対象外。右ひじ→右手首方向を延長し、
+                # 推定ラケット先端までクロップ範囲へ含める。
+                wx,wy=points[10]; ex,ey=points[8]
+                bounds_points.append((wx+(wx-ex)*1.8,wy+(wy-ey)*1.8))
+            xs=[v[0] for v in bounds_points]; ys=[v[1] for v in bounds_points]
             sx=max(max(xs)-min(xs),iw*.08); sy=max(max(ys)-min(ys),ih*.12)
-            px=max(iw*.035,sx*.24); py=max(ih*.035,sy*.18)
+            pad_x=.34 if is_serve else .24; pad_y=.28 if is_serve else .18
+            px=max(iw*.035,sx*pad_x); py=max(ih*.035,sy*pad_y)
             x1=max(0,int(min(xs)-px)); y1=max(0,int(min(ys)-py))
             x2=min(iw,int(max(xs)+px)); y2=min(ih,int(max(ys)+py))
             if x2>x1 and y2>y1:
@@ -3171,6 +3245,7 @@ class TennisApp(tk.Tk):
                        (main_codes[0] if len(main_codes)==1 else ",".join(main_codes))
         try:sensitivity=float(peak.get("detection_sensitivity",self.sensitivity.get()))
         except Exception:sensitivity=float(extra.get("sensitivity",0.4))
+        use_filter=bool(self.audio_filter_enabled.get())
         row={"video_key":_ground_truth_video_key(path),"video_path":os.path.abspath(path),
              "video_file":os.path.basename(path),"peak_rank":rank,"peak_time":t,
              "frame_time":float(peak.get("frame_time") or t),
@@ -3178,11 +3253,25 @@ class TennisApp(tk.Tk):
              "content_type":str(extra.get("content_type","") or ""),
              "video_shots":json.dumps(main_shots,ensure_ascii=False),
              "shot_type":effective_shot,"sensitivity":sensitivity,
+             "peak_energy":self._peak_energy_at(t,use_filter),
+             "audio_filter_enabled":1 if use_filter else 0,
              "ball_detected":1 if ball else 0,
              "pose_backend":self._hp_backend(peak)}
         for key in ("rw_x","rw_y","lw_x","lw_y","re_x","re_y","le_x","le_y"):
             row[key]=motion.get(key)
         return row
+
+    def _peak_energy_at(self,time_sec,use_filter=True):
+        data=self.data
+        if data is None:
+            data=load_analysis_cache(get_analysis_cache_path(self.video_path.get()))
+        if not data:return None
+        times=np.asarray(data.get("times",[]),dtype=float)
+        energy=np.asarray(data.get("combined",[]) if use_filter else
+                          data.get("broadband",data.get("combined",[])),dtype=float)
+        if len(times)==0 or len(energy)==0:return None
+        j=int(np.argmin(np.abs(times-float(time_sec))))
+        return float(energy[j]) if j<len(energy) else None
 
     def _hp_backend(self,peak):
         return str(peak.get("pose_backend") or
@@ -3248,6 +3337,8 @@ class TennisApp(tk.Tk):
                      "内容":extra.get("content_type",""),
                      "動画の主ショット":",".join(extra.get("main_shots") or []),
                      "検出感度":float(peak.get("detection_sensitivity",export_sensitivity)),
+                     "実ピーク高さ":self._peak_energy_at(float(peak.get("time",0)),
+                                                      bool(self.audio_filter_enabled.get())),
                      "採用フレーム_秒":round(float(peak.get("frame_time") or peak.get("time",0)),3),
                      "姿勢検出":("YOLO" if peak.get("pose_backend")=="yolo" else "MediaPipe"),
                      "自動判定":peak.get("pose_shot") or "",
@@ -4785,15 +4876,49 @@ class TennisApp(tk.Tk):
     def _on_tab_changed(self,event=None):
         self._refresh_active_tab()
 
+    def _refresh_truth_summary(self):
+        if not hasattr(self,"_truth_summary_tree"):return
+        tree=self._truth_summary_tree
+        for item in tree.get_children():tree.delete(item)
+        try:
+            backfill_ground_truth_peak_energies()
+            db_path=init_ground_truth_db(); con=sqlite3.connect(db_path)
+            rows=con.execute("""SELECT camera_dir,content_type,shot_type,
+                        COUNT(*) total,
+                        SUM(CASE WHEN ABS(sensitivity-0.3)<0.0001 THEN 1 ELSE 0 END) s03,
+                        SUM(CASE WHEN ABS(sensitivity-0.4)<0.0001 THEN 1 ELSE 0 END) s04,
+                        SUM(CASE WHEN peak_energy>=0.5 THEN 1 ELSE 0 END) p05,
+                        SUM(CASE WHEN peak_energy>=0.6 THEN 1 ELSE 0 END) p06
+                    FROM verified_hit_points
+                    GROUP BY camera_dir,content_type,shot_type
+                    ORDER BY total DESC,camera_dir,shot_type""").fetchall()
+            total=con.execute("SELECT COUNT(*) FROM verified_hit_points").fetchone()[0]
+            videos=con.execute("SELECT COUNT(DISTINCT video_key) FROM verified_hit_points").fetchone()[0]
+            energies=con.execute("SELECT COUNT(peak_energy) FROM verified_hit_points").fetchone()[0]
+            con.close()
+            shot_ja={en:ja for ja,en in SHOT_TYPES}
+            totals=[0,0,0,0,0]
+            for camera,content,shot,n,s03,s04,p05,p06 in rows:
+                values=(camera or "未設定",content or "未設定",shot_ja.get(shot,shot or "未設定"),
+                        n,s03 or 0,s04 or 0,p05 or 0,p06 or 0)
+                tree.insert("","end",values=values)
+                for i,v in enumerate((n,s03 or 0,s04 or 0,p05 or 0,p06 or 0)):totals[i]+=v
+            if rows:
+                tree.insert("","end",values=("合計","","",*totals),tags=("total",))
+                tree.tag_configure("total",background="#25314a",foreground="white")
+            self._truth_summary_info.set(
+                f"正解 {total}件　動画 {videos}本　ピーク高さ保存済み {energies}/{total}件　"
+                f"DB: {os.path.basename(db_path)}")
+        except Exception as e:
+            self._truth_summary_info.set(f"正解DBを読み込めませんでした: {e}")
+
     def _refresh_active_tab(self):
         try: idx=self.tabs.index(self.tabs.select())
         except Exception: return
         if idx==1:
             self._refresh_hp_detail()
         elif idx==2:
-            if not self.peaks: return
-            self._update_c1_dropdowns()
-            if hasattr(self,"_c1_regen"): self._c1_regen()
+            self._refresh_truth_summary()
         elif idx==3:
             # v18: クロス比較を統合したので同タイミング比較は idx 3 に繰上
             if not self.peaks: return

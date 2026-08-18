@@ -193,6 +193,25 @@ def test_verified_yolo_and_mediapipe_are_stored_separately():
         assert keys == {(1,2.5,"yolo"),(1,2.5,"mediapipe")}
 
 
+def test_legacy_verified_peak_energy_is_backfilled_from_audio_cache():
+    with tempfile.TemporaryDirectory() as folder:
+        db_path=str(Path(folder)/"truth.db"); video=str(Path(folder)/"sample.mp4")
+        row={"video_key":TA._ground_truth_video_key(video),"video_path":video,
+             "video_file":"sample.mp4","peak_rank":1,"peak_time":1.0,"frame_time":1.0,
+             "camera_dir":"正面","content_type":"壁打ち","video_shots":"[]",
+             "shot_type":"forehand","sensitivity":0.3,"peak_energy":None,
+             "audio_filter_enabled":1,"ball_detected":0,"pose_backend":"yolo"}
+        TA.save_ground_truth(row,True,db_path)
+        cache_path=TA.get_analysis_cache_path(video)
+        np.savez_compressed(cache_path,times=np.array([0.,1.,2.]),
+                            combined=np.array([.1,.65,.2]),broadband=np.array([.1,.4,.2]),sr=44100)
+        assert TA.backfill_ground_truth_peak_energies(db_path)==1
+        con=sqlite3.connect(db_path)
+        energy=con.execute("SELECT peak_energy FROM verified_hit_points").fetchone()[0]
+        con.close()
+        assert abs(energy-.65)<1e-9
+
+
 def test_verified_database_migrates_existing_schema_for_sensitivity():
     with tempfile.TemporaryDirectory() as folder:
         db_path=str(Path(folder)/"old_truth.db")
@@ -210,5 +229,5 @@ def test_verified_database_migrates_existing_schema_for_sensitivity():
         columns={row[1] for row in con.execute("PRAGMA table_info(verified_hit_points)")}
         pk={row[1] for row in con.execute("PRAGMA table_info(verified_hit_points)") if row[5]>0}
         con.close()
-        assert {"content_type","sensitivity"}.issubset(columns)
+        assert {"content_type","sensitivity","peak_energy","audio_filter_enabled"}.issubset(columns)
         assert "pose_backend" in pk
