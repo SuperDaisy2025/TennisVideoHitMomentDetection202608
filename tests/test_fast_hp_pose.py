@@ -146,6 +146,17 @@ def test_motion_summary_treats_image_down_as_positive_y():
     assert all(abs(values[key]-40.0)<1e-6 for key in ("rw_y","lw_y","re_y","le_y"))
 
 
+def test_motion_summary_uses_torso_scale_when_ankles_are_missing():
+    def sample(x):
+        kps={"5":[.4,.3,.9],"6":[.6,.3,.9],"11":[.45,.6,.9],"12":[.55,.6,.9]}
+        for index in (10,9,8,7):kps[str(index)]=[x,.4,.9]
+        return {"kps":kps}
+    values,_=TA.TennisApp._compute_hp_motion_cm(
+        [sample(.4),sample(.4),sample(.5),sample(.5),sample(.5)],(100,100),180)
+    assert all(values[key] is not None for key in values)
+    assert all(values[key]>0 for key in ("rw_x","lw_x","re_x","le_x"))
+
+
 def test_verified_hit_point_database_persists_and_unchecks():
     with tempfile.TemporaryDirectory() as folder:
         db_path=str(Path(folder)/"truth.db")
@@ -158,7 +169,7 @@ def test_verified_hit_point_database_persists_and_unchecks():
              "lw_y":0.0,"re_x":3.0,"re_y":2.0,"le_x":-2.0,"le_y":1.0,
              "ball_detected":1,"pose_backend":"yolo"}
         TA.save_ground_truth(row,True,db_path)
-        assert (2,1.234) in TA.load_ground_truth_keys(video,db_path)
+        assert (2,1.234,"yolo") in TA.load_ground_truth_keys(video,db_path)
         con=sqlite3.connect(db_path)
         saved=con.execute("SELECT camera_dir,content_type,shot_type,sensitivity "
                           "FROM verified_hit_points").fetchone()
@@ -168,16 +179,36 @@ def test_verified_hit_point_database_persists_and_unchecks():
         assert TA.load_ground_truth_keys(video,db_path)==set()
 
 
+def test_verified_yolo_and_mediapipe_are_stored_separately():
+    with tempfile.TemporaryDirectory() as folder:
+        db_path=str(Path(folder)/"truth.db"); video=str(Path(folder)/"sample.mp4")
+        base={"video_key":TA._ground_truth_video_key(video),"video_path":video,
+              "video_file":"sample.mp4","peak_rank":1,"peak_time":2.5,"frame_time":2.5,
+              "camera_dir":"正面","content_type":"壁打ち","video_shots":"[]",
+              "shot_type":"backhand","sensitivity":0.3,"ball_detected":0}
+        for backend,value in (("yolo",4.0),("mediapipe",7.0)):
+            row=dict(base,pose_backend=backend,rw_x=value)
+            TA.save_ground_truth(row,True,db_path)
+        keys=TA.load_ground_truth_keys(video,db_path)
+        assert keys == {(1,2.5,"yolo"),(1,2.5,"mediapipe")}
+
+
 def test_verified_database_migrates_existing_schema_for_sensitivity():
     with tempfile.TemporaryDirectory() as folder:
         db_path=str(Path(folder)/"old_truth.db")
         con=sqlite3.connect(db_path)
-        con.execute("CREATE TABLE verified_hit_points (video_key TEXT, peak_rank INTEGER, "
-                    "peak_time REAL, camera_dir TEXT, shot_type TEXT, "
-                    "PRIMARY KEY(video_key,peak_rank,peak_time))")
+        con.execute("""CREATE TABLE verified_hit_points (
+            video_key TEXT,video_path TEXT,video_file TEXT,peak_rank INTEGER,peak_time REAL,
+            frame_time REAL,camera_dir TEXT,content_type TEXT,video_shots TEXT,shot_type TEXT,
+            sensitivity REAL,rw_x REAL,rw_y REAL,lw_x REAL,lw_y REAL,re_x REAL,re_y REAL,
+            le_x REAL,le_y REAL,ball_detected INTEGER,pose_backend TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(video_key,peak_rank,peak_time))""")
         con.commit(); con.close()
         TA.init_ground_truth_db(db_path)
         con=sqlite3.connect(db_path)
         columns={row[1] for row in con.execute("PRAGMA table_info(verified_hit_points)")}
+        pk={row[1] for row in con.execute("PRAGMA table_info(verified_hit_points)") if row[5]>0}
         con.close()
         assert {"content_type","sensitivity"}.issubset(columns)
+        assert "pose_backend" in pk

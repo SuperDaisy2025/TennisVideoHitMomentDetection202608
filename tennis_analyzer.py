@@ -321,7 +321,7 @@ BG=     "#0f1117"; PANEL=  "#1a1d27"; PANEL2= "#141720"
 ACCENT= "#e8593c"; ACCENT2="#3b8bd4"; GOLD=   "#ef9f27"
 GREEN=  "#1d9e75"; TEXT=   "#d4d0c8"; SUBTEXT="#888780"
 BORDER= "#2c2e3a"; DARK2=  "#12141e"; RED= "#ff5252"
-APP_VERSION = "v73"; APP_VERSION_DESC = "感度付き正解教師データ"
+APP_VERSION = "v74"; APP_VERSION_DESC = "教師データ・表示改善"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -493,16 +493,39 @@ def init_ground_truth_db(db_path=None):
         sensitivity REAL,
         rw_x REAL, rw_y REAL, lw_x REAL, lw_y REAL,
         re_x REAL, re_y REAL, le_x REAL, le_y REAL,
-        ball_detected INTEGER, pose_backend TEXT,
+        ball_detected INTEGER, pose_backend TEXT NOT NULL DEFAULT 'unknown',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY(video_key, peak_rank, peak_time))""")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_verified_video ON verified_hit_points(video_key)")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_verified_group ON verified_hit_points(camera_dir,shot_type)")
+        PRIMARY KEY(video_key, peak_rank, peak_time, pose_backend))""")
     # v73: 既存の正解DBを壊さず、解析条件列だけを追加する。
     for column,sql_type in (("content_type","TEXT"),("sensitivity","REAL")):
         try:con.execute(f"ALTER TABLE verified_hit_points ADD COLUMN {column} {sql_type}")
         except sqlite3.OperationalError:pass
+    # v74: 同じ動画・HPでもYOLO/MediaPipeを別々の正解として保持する。
+    pk_cols=[r[1] for r in con.execute("PRAGMA table_info(verified_hit_points)") if r[5]>0]
+    if "pose_backend" not in pk_cols:
+        con.execute("DROP INDEX IF EXISTS idx_verified_video")
+        con.execute("DROP INDEX IF EXISTS idx_verified_group")
+        con.execute("ALTER TABLE verified_hit_points RENAME TO verified_hit_points_v73_backup")
+        con.execute("""CREATE TABLE verified_hit_points (
+            video_key TEXT NOT NULL, video_path TEXT, video_file TEXT,
+            peak_rank INTEGER, peak_time REAL, frame_time REAL,
+            camera_dir TEXT, content_type TEXT, video_shots TEXT, shot_type TEXT,
+            sensitivity REAL, rw_x REAL, rw_y REAL, lw_x REAL, lw_y REAL,
+            re_x REAL, re_y REAL, le_x REAL, le_y REAL,
+            ball_detected INTEGER, pose_backend TEXT NOT NULL DEFAULT 'unknown',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(video_key,peak_rank,peak_time,pose_backend))""")
+        common=("video_key,video_path,video_file,peak_rank,peak_time,frame_time,"
+                "camera_dir,content_type,video_shots,shot_type,sensitivity,"
+                "rw_x,rw_y,lw_x,lw_y,re_x,re_y,le_x,le_y,ball_detected")
+        con.execute(f"""INSERT OR REPLACE INTO verified_hit_points
+                     ({common},pose_backend,created_at,updated_at)
+                     SELECT {common},COALESCE(NULLIF(pose_backend,''),'unknown'),created_at,updated_at
+                     FROM verified_hit_points_v73_backup""")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_verified_video ON verified_hit_points(video_key)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_verified_group ON verified_hit_points(camera_dir,shot_type)")
     con.commit(); con.close()
     return db_path
 
@@ -512,18 +535,19 @@ def _ground_truth_video_key(video_path):
 def load_ground_truth_keys(video_path,db_path=None):
     db_path=init_ground_truth_db(db_path)
     con=sqlite3.connect(db_path)
-    rows=con.execute("SELECT peak_rank,peak_time FROM verified_hit_points WHERE video_key=?",
+    rows=con.execute("SELECT peak_rank,peak_time,pose_backend FROM verified_hit_points WHERE video_key=?",
                      (_ground_truth_video_key(video_path),)).fetchall()
     con.close()
-    return {(int(rank),round(float(t),3)) for rank,t in rows}
+    return {(int(rank),round(float(t),3),str(backend or "unknown")) for rank,t,backend in rows}
 
 def save_ground_truth(row,checked=True,db_path=None):
     db_path=init_ground_truth_db(db_path); key=row["video_key"]
     con=sqlite3.connect(db_path)
     if not checked:
         con.execute("""DELETE FROM verified_hit_points
-                       WHERE video_key=? AND peak_rank=? AND ABS(peak_time-?)<0.001""",
-                    (key,row["peak_rank"],row["peak_time"]))
+                       WHERE video_key=? AND peak_rank=? AND ABS(peak_time-?)<0.001
+                         AND pose_backend=?""",
+                    (key,row["peak_rank"],row["peak_time"],row.get("pose_backend") or "unknown"))
     else:
         cols=("video_key","video_path","video_file","peak_rank","peak_time","frame_time",
               "camera_dir","content_type","video_shots","shot_type","sensitivity",
@@ -533,7 +557,7 @@ def save_ground_truth(row,checked=True,db_path=None):
         placeholders=",".join("?" for _ in cols)
         updates=",".join(f"{c}=excluded.{c}" for c in cols[1:])
         con.execute(f"""INSERT INTO verified_hit_points ({','.join(cols)}) VALUES ({placeholders})
-                         ON CONFLICT(video_key,peak_rank,peak_time) DO UPDATE SET
+                         ON CONFLICT(video_key,peak_rank,peak_time,pose_backend) DO UPDATE SET
                          {updates},updated_at=CURRENT_TIMESTAMP""",values)
     con.commit(); con.close()
 
@@ -1313,7 +1337,7 @@ class TennisApp(tk.Tk):
         hp_hdr=tk.Frame(p,bg=PANEL); hp_hdr.pack(fill="x",padx=12,pady=(2,2))
         # v61: ★凡例
         tk.Label(p,text="★=KP検出済  ◆=クロップ設定済  △=手ぶれ",
-                 bg=PANEL,fg=SUBTEXT,font=_tk_font(7),anchor="w"
+                 bg=PANEL,fg=SUBTEXT,font=_tk_font(9),anchor="w"
                  ).pack(fill="x",padx=12)
         tk.Label(hp_hdr,text="ヒットポイント",bg=PANEL,fg=ACCENT2,
                  font=_tk_font(11,bold=True)).pack(side="left")
@@ -1324,10 +1348,10 @@ class TennisApp(tk.Tk):
                        font=_tk_font(9),command=self._on_classified_filter_changed
                         ).pack(side="right")
         tk.Label(p,text="正解  時刻・分類 | RWx RWy LWx LWy REx REy LEx LEy  B",
-                 bg=PANEL,fg=SUBTEXT,font=("Courier",8),anchor="w"
+                 bg=PANEL,fg=SUBTEXT,font=("Courier",10,"bold"),anchor="w"
                  ).pack(fill="x",padx=12)
         tk.Label(p,text="R/L:右/左  W:手首  E:ひじ  x=右＋  y=下＋  B=ボール (cm)",
-                 bg=PANEL,fg=SUBTEXT,font=_tk_font(7),anchor="w"
+                 bg=PANEL,fg=SUBTEXT,font=_tk_font(9),anchor="w"
                  ).pack(fill="x",padx=12)
         tk.Button(hp_hdr,text="Excel出力",bg=DARK2,fg=GOLD,relief="flat",
                   font=_tk_font(8,bold=True),command=self._export_hit_points_xlsx,
@@ -1335,12 +1359,15 @@ class TennisApp(tk.Tk):
         lf=tk.Frame(p,bg=PANEL)
         lf.pack(fill="both",expand=True,padx=12,pady=(0,4))
         sb=tk.Scrollbar(lf,bg=PANEL); sb.pack(side="right",fill="y")
+        hsb=tk.Scrollbar(lf,bg=PANEL,orient="horizontal"); hsb.pack(side="bottom",fill="x")
         self.peak_list=tk.Listbox(lf,bg=DARK2,fg=TEXT,selectbackground=GOLD,
                                    selectforeground="#111111",exportselection=False,
-                                   relief="flat",font=("Courier",10),
-                                   yscrollcommand=sb.set,activestyle="none")
+                                   relief="flat",font=("Courier",11),
+                                   yscrollcommand=sb.set,xscrollcommand=hsb.set,
+                                   activestyle="none")
         self.peak_list.pack(side="left",fill="both",expand=True)
         sb.config(command=self.peak_list.yview)
+        hsb.config(command=self.peak_list.xview)
         self.peak_list.bind("<<ListboxSelect>>",self._on_list_select)
         self.peak_list.bind("<Button-1>",self._on_peak_truth_click,add="+")
         # 右クリック / Delキー で削除
@@ -1350,7 +1377,7 @@ class TennisApp(tk.Tk):
         try: truth_name=os.path.basename(get_ground_truth_db_path())
         except Exception: truth_name="hit_point_ground_truth.db"
         tk.Label(p,text=f"☑ 正解データ: {truth_name}",bg=PANEL,fg=SUBTEXT,
-                 font=_tk_font(7),anchor="w").pack(fill="x",padx=12,pady=(0,2))
+                 font=_tk_font(9),anchor="w").pack(fill="x",padx=12,pady=(0,2))
 
         # v53: 検出情報（削除/再採番は削除、検出ステータスを表示）
         # v61: 検出情報 3行+ボタン形式
@@ -1541,15 +1568,15 @@ class TennisApp(tk.Tk):
         self._hp_detail_title=tk.StringVar(value="左の一覧からヒットポイントを選択してください")
         tk.Label(parent,textvariable=self._hp_detail_title,bg=PANEL,fg=GOLD,
                  font=_tk_font(13,bold=True),anchor="w").pack(fill="x",padx=12,pady=(8,4),ipady=5)
-        photos=tk.Frame(parent,bg=BG); photos.pack(fill="both",expand=True,padx=8,pady=3)
+        photos=tk.Frame(parent,bg=BG); photos.pack(fill="both",expand=True,padx=4,pady=2)
         self._hp_detail_canvases=[]; self._hp_detail_time_vars=[]
         for label in ("-0.2秒","-0.1秒","候補フレーム","+0.1秒","+0.2秒"):
-            col=tk.Frame(photos,bg=PANEL2); col.pack(side="left",fill="both",expand=True,padx=5)
+            col=tk.Frame(photos,bg=PANEL2,width=120); col.pack(side="left",fill="both",expand=True,padx=2)
             v=tk.StringVar(value=label); self._hp_detail_time_vars.append(v)
             tk.Label(col,textvariable=v,bg=PANEL2,fg=GOLD if label=="候補フレーム" else TEXT,
                      font=_tk_font(10,bold=True)).pack(fill="x",pady=4)
-            cv=tk.Canvas(col,bg="#0b0d12",height=210,highlightthickness=0)
-            cv.pack(fill="both",expand=True,padx=4,pady=(0,4))
+            cv=tk.Canvas(col,bg="#0b0d12",width=110,height=175,highlightthickness=0)
+            cv.pack(fill="both",expand=True,padx=2,pady=(0,3))
             cv.bind("<Configure>",lambda e:self.after_idle(self._refresh_hp_detail))
             self._hp_detail_canvases.append(cv)
         self._hp_detail_photo_refs=[None]*5
@@ -2878,8 +2905,32 @@ class TennisApp(tk.Tk):
                 ankle_y=sum(float(v[1]) for v in ankles)/len(ankles)
                 ph=abs(ankle_y-float(nose[1]))*h
                 if ph>10:heights.append(ph)
-        if not heights:return result,ball
-        cm_per_px=float(player_height_cm)/max(heights)
+        if heights:
+            cm_per_px=float(player_height_cm)/max(heights)
+        else:
+            # クロップ動画や一時的な足首未検出でも、胴体長→肩幅の順で換算する。
+            torso_lengths=[]; shoulder_widths=[]
+            for sample in samples[:5]:
+                kps=sample.get("kps",{}); ls=kps.get("5"); rs=kps.get("6")
+                lh=kps.get("11"); rh=kps.get("12")
+                valid=lambda v: bool(v and len(v)>=3 and float(v[2])>=HP_POSE_MIN_VIS)
+                if valid(ls) and valid(rs):
+                    sx=(float(ls[0])+float(rs[0]))*.5*w
+                    sy=(float(ls[1])+float(rs[1]))*.5*h
+                    sw=math.hypot((float(ls[0])-float(rs[0]))*w,
+                                  (float(ls[1])-float(rs[1]))*h)
+                    if sw>5:shoulder_widths.append(sw)
+                    if valid(lh) and valid(rh):
+                        hx=(float(lh[0])+float(rh[0]))*.5*w
+                        hy=(float(lh[1])+float(rh[1]))*.5*h
+                        torso=math.hypot(hx-sx,hy-sy)
+                        if torso>5:torso_lengths.append(torso)
+            if torso_lengths:
+                cm_per_px=float(player_height_cm)*0.30/max(torso_lengths)
+            elif shoulder_widths:
+                cm_per_px=float(player_height_cm)*0.23/max(shoulder_widths)
+            else:
+                return result,ball
 
         def positions(sample):
             kps=sample.get("kps",{})
@@ -3128,10 +3179,14 @@ class TennisApp(tk.Tk):
              "video_shots":json.dumps(main_shots,ensure_ascii=False),
              "shot_type":effective_shot,"sensitivity":sensitivity,
              "ball_detected":1 if ball else 0,
-             "pose_backend":str(peak.get("pose_backend","") or "")}
+             "pose_backend":self._hp_backend(peak)}
         for key in ("rw_x","rw_y","lw_x","lw_y","re_x","re_y","le_x","le_y"):
             row[key]=motion.get(key)
         return row
+
+    def _hp_backend(self,peak):
+        return str(peak.get("pose_backend") or
+                   (getattr(self,"_video_meta_extra",{}) or {}).get("pose_backend") or "unknown")
 
     def _on_peak_truth_click(self,event):
         """Toggle the checkbox only when the leftmost checkbox area is clicked."""
@@ -3141,7 +3196,8 @@ class TennisApp(tk.Tk):
         mapping=getattr(self,"_list_to_peak_idx",[])
         peak_idx=mapping[list_idx] if mapping and list_idx<len(mapping) else list_idx
         if not (0<=peak_idx<len(self.peaks)):return "break"
-        peak=self.peaks[peak_idx]; key=(int(peak["rank"]),round(float(peak["time"]),3))
+        peak=self.peaks[peak_idx]
+        key=(int(peak["rank"]),round(float(peak["time"]),3),self._hp_backend(peak))
         try:
             truth_keys=load_ground_truth_keys(self.video_path.get())
             checked=key not in truth_keys
@@ -3185,7 +3241,7 @@ class TennisApp(tk.Tk):
             for peak in self.peaks:
                 motion,ball=self._hp_motion_summary(peak); rank=peak.get("rank")
                 label=all_labels.get(rank)
-                truth_key=(int(rank),round(float(peak.get("time",0)),3))
+                truth_key=(int(rank),round(float(peak.get("time",0)),3),self._hp_backend(peak))
                 row={"正解":("✓" if truth_key in truth_keys else ""),
                      "HP番号":rank,"候補時刻_秒":round(float(peak.get("time",0)),3),
                      "撮影方向":extra.get("camera_dir",""),
@@ -3258,21 +3314,21 @@ class TennisApp(tk.Tk):
             elif has_y: icons+="★"
             # v24: 手ぶれ判定結果
             if self._is_shaky(rank): icons+="⚠"
-            icons=f" {icons:<3}" if icons else "    "
+            icons=icons
             # v24: 評価アイコン (nice/super→👍、miss→👎、それ以外はスペース)
-            checked=(int(rank),round(float(t),3)) in truth_keys
+            checked=(int(rank),round(float(t),3),self._hp_backend(p)) in truth_keys
             checkmark="☑" if checked else "☐"
             if lbl:
                 rating=lbl[2]
-                rating_icon=" 👍" if rating in ("nice","super") else \
-                            " 👎" if rating=="miss" else "   "
+                rating_icon="👍" if rating in ("nice","super") else \
+                            "👎" if rating=="miss" else ""
                 shot_ja=next((ja for ja,en in SHOT_TYPES if en==lbl[0]),"?")
                 spin_ja=next((ja for ja,en in SPINS      if en==lbl[1]),"")
                 ft=lbl[3]
                 ft_str=f"{ft:.2f}s" if (ft is not None and ft>0) else f"{t:.2f}s"
-                tag=f"{checkmark} #{rank:2d}{icons}{rating_icon} {ft_str:>7} {shot_ja}/{spin_ja}{cb}"
+                tag=f"{checkmark} #{rank:02d}{icons}{rating_icon} {ft_str} {shot_ja}/{spin_ja}{cb}"
             else:
-                tag=f"{checkmark} #{rank:2d}{icons}    {t:6.2f}s   未{cb}"
+                tag=f"{checkmark} #{rank:02d}{icons} {t:.2f}s 未{cb}"
             motion,ball=self._hp_motion_summary(p)
             def compact(key):
                 value=motion.get(key)
