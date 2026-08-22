@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v76"; APP_VERSION_DESC = "Hit Moment・1分解析・ノイズ表示"
+APP_VERSION = "v77"; APP_VERSION_DESC = "撮影方向推定・段階表示"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -409,6 +409,78 @@ def estimate_noise_metrics(data):
            2 if events_per_min>=30 else 1 if events_per_min>=15 else 0)
     level="高" if score>=3 else "中" if score>=1 else "低"
     return {"floor":floor,"events_per_min":events_per_min,"level":level}
+
+def classify_camera_direction_features(face_rate,convergence,vp_x,oblique_ratio):
+    """Fast, conservative mapping of visual cues to the popup camera choices."""
+    if face_rate>=.28:
+        return "正面",min(.92,.60+face_rate*.45),"顔が複数フレームで確認できました"
+    if convergence>=.18 and vp_x is not None:
+        if .32<=vp_x<=.68:
+            return "後ろ",min(.90,.55+convergence*.9),"コート線が画面中央上方へ収束しています"
+        if vp_x<.32:
+            return "横(フォア側)",min(.78,.48+convergence*.7),"コート線の消失点が左側です"
+        return "横(バック側)",min(.78,.48+convergence*.7),"コート線の消失点が右側です"
+    if oblique_ratio>=.45:
+        return "後ろ",.46,"斜めのコート線はありますが確信度が低めです"
+    return "不明・複数",.25,"十分なコート線・顔情報を取得できませんでした"
+
+def estimate_camera_direction_fast(video_path,max_samples=5):
+    """Estimate direction from a few 640px frames using court lines and face cues."""
+    cap=cv2.VideoCapture(video_path)
+    fps=cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frames=int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    duration=frames/fps if fps>0 else 0
+    sample_end=max(0,min(duration,60.0)-.05)
+    times=np.linspace(0,sample_end,max_samples) if sample_end>0 else [0.0]
+    face_hits=0; valid_frames=0; oblique_total=0; line_total=0; intersections=[]
+    try:
+        cascade_path=os.path.join(cv2.data.haarcascades,"haarcascade_frontalface_default.xml")
+        face_detector=cv2.CascadeClassifier(cascade_path)
+        for t in times:
+            cap.set(cv2.CAP_PROP_POS_FRAMES,int(round(float(t)*fps)))
+            ok,frame=cap.read()
+            if not ok:continue
+            valid_frames+=1; h0,w0=frame.shape[:2]
+            scale=min(1.0,640.0/max(w0,1)); frame=cv2.resize(frame,None,fx=scale,fy=scale)
+            gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY); h,w=gray.shape
+            if not face_detector.empty():
+                faces=face_detector.detectMultiScale(gray,scaleFactor=1.12,minNeighbors=4,
+                                                      minSize=(max(24,w//24),max(24,h//24)))
+                if len(faces)>0:face_hits+=1
+            blur=cv2.GaussianBlur(gray,(5,5),0)
+            edges=cv2.Canny(blur,55,150)
+            edges[:int(h*.18),:]=0
+            lines=cv2.HoughLinesP(edges,1,np.pi/180,threshold=max(35,w//14),
+                                  minLineLength=max(45,w//9),maxLineGap=max(12,w//40))
+            if lines is None:continue
+            pos=[]; neg=[]
+            for x1,y1,x2,y2 in lines[:,0]:
+                dx=float(x2-x1); dy=float(y2-y1)
+                length=math.hypot(dx,dy)
+                if length<45 or abs(dx)<2:continue
+                slope=dy/dx; angle=abs(math.degrees(math.atan2(dy,dx)))
+                angle=min(angle,180-angle); line_total+=1
+                if 15<=angle<=75:
+                    oblique_total+=1
+                    (pos if slope>0 else neg).append((x1,y1,slope))
+            for a in pos[:12]:
+                for b in neg[:12]:
+                    den=a[2]-b[2]
+                    if abs(den)<.08:continue
+                    ix=(b[1]-a[1]+a[2]*a[0]-b[2]*b[0])/den
+                    iy=a[1]+a[2]*(ix-a[0])
+                    if -.4*w<=ix<=1.4*w and -.5*h<=iy<=.75*h:
+                        intersections.append(ix/w)
+    finally:cap.release()
+    face_rate=face_hits/max(valid_frames,1)
+    oblique_ratio=oblique_total/max(line_total,1)
+    convergence=min(1.0,len(intersections)/max(valid_frames*12,1))
+    vp_x=float(np.median(intersections)) if intersections else None
+    direction,confidence,reason=classify_camera_direction_features(
+        face_rate,convergence,vp_x,oblique_ratio)
+    return {"direction":direction,"confidence":float(confidence),"reason":reason,
+            "sample_count":valid_frames,"face_rate":face_rate,
+            "convergence":convergence,"vp_x":vp_x}
 
 def detect_peaks(data, sensitivity=0.5, min_gap=1.0, wall_mode=False,
                  use_frequency_filter=True):
@@ -2183,10 +2255,22 @@ class TennisApp(tk.Tk):
         # v22: 同じ動画への再選択は無視 (state リセットでフリッカ防止)
         if path == self._cached_video_path:
             return
-        # v25: 動画情報ポップアップを表示してから解析開始
-        self._show_video_info_popup(path)
+        # v77: 設定画面より先に、数枚だけで撮影方向を高速推定する。
+        token=time.time(); self._direction_estimate_token=token
+        if hasattr(self,"status_var"): self.status_var.set("撮影方向を高速推定中…")
+        def _worker():
+            try: estimate=estimate_camera_direction_fast(path)
+            except Exception as e:
+                estimate={"direction":"不明・複数","confidence":0.0,
+                          "reason":f"推定できませんでした: {e}","samples":0}
+            def _done():
+                if (getattr(self,"_direction_estimate_token",None)==token and
+                        self.video_path.get().strip()==path):
+                    self._show_video_info_popup(path,estimate)
+            self.after(0,_done)
+        threading.Thread(target=_worker,daemon=True).start()
 
-    def _show_video_info_popup(self, path):
+    def _show_video_info_popup(self, path, direction_estimate=None):
         """v25: 動画選択時に動画情報を表示・設定するポップアップ"""
         cap = cv2.VideoCapture(path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
@@ -2199,7 +2283,7 @@ class TennisApp(tk.Tk):
         cap.release()
         win = tk.Toplevel(self, bg=PANEL)
         win.title("動画情報")
-        win.geometry("940x500")
+        win.geometry("940x545")
         win.transient(self)
         win.grab_set()
         top = tk.Frame(win, bg=PANEL)
@@ -2252,11 +2336,22 @@ class TennisApp(tk.Tk):
                 with open(extra_path, "r", encoding="utf-8") as f:
                     saved_extra = json.load(f)
         except Exception: pass
-        # カメラ方向
+        # カメラ方向: 自動推定を初期値にし、ラジオボタンで訂正可能。
+        direction_estimate=direction_estimate or {"direction":"不明・複数",
+                                                   "confidence":0.0,"reason":"推定なし"}
+        estimated_dir=str(direction_estimate.get("direction","不明・複数"))
+        saved_dir=saved_extra.get("camera_dir")
+        confidence=float(direction_estimate.get("confidence",0.0))
+        estimate_text=(f"自動推定: {estimated_dir}（信頼度 {confidence:.0%}）  "
+                       f"{direction_estimate.get('reason','')}")
+        if saved_dir: estimate_text += "  ※保存済みの選択を優先"
+        tk.Label(right,text=estimate_text,bg="#cbe6d1",fg=ACCENT2,
+                 font=_tk_font(9,True),justify="left",wraplength=500,
+                 padx=7,pady=5).pack(anchor="w",fill="x",pady=(2,4))
         tk.Label(right, text="カメラ方向:", bg=PANEL, fg=TEXT,
                  font=_tk_font(10, True)).pack(anchor="w", pady=(4,2))
-        cam_var = tk.StringVar(value=saved_extra.get("camera_dir",
-                    (meta.get("camera_dirs",["不明・複数"])+["不明・複数"])[0]))
+        prior_meta=(meta.get("camera_dirs",[])+[None])[0]
+        cam_var = tk.StringVar(value=saved_dir or prior_meta or estimated_dir)
         cam_frame = tk.Frame(right, bg=PANEL); cam_frame.pack(anchor="w", padx=8)
         for cd in ["後ろ","横(フォア側)","横(バック側)","正面","不明・複数"]:
             tk.Radiobutton(cam_frame, text=cd, variable=cam_var, value=cd,
@@ -2335,6 +2430,10 @@ class TennisApp(tk.Tk):
                 "pose_backend": pose_backend_var.get(),
                 "sensitivity": float(sensitivity_var.get()),
                 "first_minute_only": bool(first_minute_var.get()),
+                "camera_estimate": estimated_dir,
+                "camera_estimate_confidence": confidence,
+                "camera_estimate_reason": direction_estimate.get("reason",""),
+                "camera_direction_corrected": cam_var.get()!=estimated_dir,
             }
             win.destroy()
             # v30: 壁打ちフラグをポップアップの選択から設定
@@ -2348,6 +2447,10 @@ class TennisApp(tk.Tk):
                 "pose_backend": pose_backend_var.get(),
                 "sensitivity": float(sensitivity_var.get()),
                 "first_minute_only": bool(first_minute_var.get()),
+                "camera_estimate": estimated_dir,
+                "camera_estimate_confidence": confidence,
+                "camera_estimate_reason": direction_estimate.get("reason",""),
+                "camera_direction_corrected": cam_var.get()!=estimated_dir,
             }
             # v34: 追加メタデータをJSON保存 (次回復元用)
             try:
@@ -2599,9 +2702,47 @@ class TennisApp(tk.Tk):
 
     def _finish_analysis(self):
         self._update_noise_summary()
-        # v63: 音声候補をMediaPipeの3点解析で検証してから一覧を作る。
-        # 姿勢解析はワーカーで行い、GUIスレッドを停止させない。
-        self._start_fast_hp_pose_filter()
+        # v77: 音声解析が終わった時点で波形と仮候補を即表示する。
+        candidates=self._current_audio_candidates()
+        self._show_provisional_audio_candidates(candidates)
+        self._start_fast_hp_pose_filter(candidates)
+
+    def _current_audio_candidates(self):
+        if self.data is None:return []
+        gap=.12 if bool(self.wall_mode.get()) else self.min_gap.get()
+        indices,_=detect_peaks(self.data,self.sensitivity.get(),gap,wall_mode=False,
+                               use_frequency_filter=bool(self.audio_filter_enabled.get()))
+        return [{"idx":int(i),"time":float(self.data["times"][i])} for i in indices]
+
+    def _show_provisional_audio_candidates(self,candidates):
+        backend=str(getattr(self,"_video_meta_extra",{}).get("pose_backend","yolo"))
+        self.peaks=[]; self._hp_candidate_audit=[]
+        for rank,cand in enumerate(candidates,1):
+            self.peaks.append({**cand,"rank":rank,"frame_time":None,
+                               "pose_shot":None,"pose_confidence":None,
+                               "pose_reason":"pending","pose_backend":backend,
+                               "pose_samples":[]})
+            self._hp_candidate_audit.append({**cand,"selected":None,
+                                             "reason":"pending","backend":backend})
+        self.peak_idx=min(self.peak_idx,max(0,len(self.peaks)-1))
+        self._update_shot_list(); self._draw_timeline()
+        self.status_var.set(f"音声候補 {len(candidates)}件を仮表示しました。姿勢確認中…")
+
+    def _update_provisional_pose_result(self,cand,audit_item,item,done,total,rejected):
+        """姿勢判定1件ごとに、仮線・左一覧を採用結果へ更新する。"""
+        target=float(cand["time"])
+        match=next((p for p in self.peaks if abs(float(p["time"])-target)<1e-6),None)
+        if match is not None:
+            if item is None:self.peaks.remove(match)
+            else:
+                rank=match["rank"]; match.clear(); match.update(item); match["rank"]=rank
+        for i,a in enumerate(self._hp_candidate_audit):
+            if abs(float(a.get("time",-1))-target)<1e-6:
+                self._hp_candidate_audit[i]=dict(audit_item); break
+        self.peak_idx=min(self.peak_idx,max(0,len(self.peaks)-1))
+        self._update_shot_list(); self._draw_timeline()
+        self._set_progress(62+7*done/max(1,total),
+                           f"姿勢で候補確認中… {done}/{total}  除外 {rejected}")
 
     def _update_noise_summary(self):
         metrics=estimate_noise_metrics(self.data or {})
@@ -2708,16 +2849,12 @@ class TennisApp(tk.Tk):
         side=("横" in camera_dir or camera_dir in ("deuce","ad"))
         return -dist if side else dist
 
-    def _start_fast_hp_pose_filter(self):
+    def _start_fast_hp_pose_filter(self,candidates=None):
         """音声候補を3枚のMediaPipe Poseで絞り、打点だけ局所探索する。"""
         if self.data is None: return
         # 壁打ちはラケット音と壁音を両方候補に残し、姿勢一致で後者を落とす。
         # find_peaksのdistanceで先に片方を消さないよう、この段階だけ間隔を短くする。
-        candidate_gap=0.12 if bool(self.wall_mode.get()) else self.min_gap.get()
-        indices,_=detect_peaks(self.data,self.sensitivity.get(),candidate_gap,
-                               wall_mode=False,
-                               use_frequency_filter=bool(self.audio_filter_enabled.get()))
-        candidates=[{"idx":int(i),"time":float(self.data["times"][i])} for i in indices]
+        candidates=self._current_audio_candidates() if candidates is None else list(candidates)
         if not candidates:
             self._hp_candidate_audit=[]
             self._refresh_peaks(refined_candidates=[])
@@ -2845,6 +2982,7 @@ class TennisApp(tk.Tk):
                                     "travel":verdict.get("travel"),
                                     "arm_change":verdict.get("arm_change")}
                         audit.append(audit_item)
+                        item=None
                         if not verdict["keep"]:
                             rejected+=1
                         else:
@@ -2880,9 +3018,9 @@ class TennisApp(tk.Tk):
                                                 "frame_jpeg":s.get("frame_jpeg")}
                                                 for s in coarse]})
                             accepted.append(item)
-                        self.after(0,lambda d=n,total=len(candidates),r=rejected:
-                            self._set_progress(62+7*d/max(1,total),
-                                f"姿勢で候補確認中… {d}/{total}  除外 {r}"))
+                        self.after(0,lambda c=dict(cand),a=dict(audit_item),it=item,
+                                   d=n,total=len(candidates),r=rejected:
+                            self._update_provisional_pose_result(c,a,it,d,total,r))
                 if self._gen==gen:
                     self.after(0,lambda a=accepted,r=rejected,au=audit:
                         self._finish_fast_hp_pose_filter(a,r,au))
@@ -2995,7 +3133,8 @@ class TennisApp(tk.Tk):
             x=pl+(ct-lo)/4*(w-pl-pr)
             top=max(float(np.max(energy)),1e-6)
             y=h-pb-float(energy[j])/top*(h-pt-pb)
-            color="#26c281" if cand.get("selected") else RED
+            selected=cand.get("selected")
+            color="#8a958e" if selected is None else ("#26c281" if selected else RED)
             cv.create_oval(x-5,y-5,x+5,y+5,fill=color,outline="white",width=1)
 
     @staticmethod
@@ -3465,7 +3604,8 @@ class TennisApp(tk.Tk):
                 ft_str=f"{ft:.2f}s" if (ft is not None and ft>0) else f"{t:.2f}s"
                 tag=f"{checkmark} #{rank:02d}{icons}{rating_icon} {ft_str} {shot_ja}/{spin_ja}{cb}"
             else:
-                tag=f"{checkmark} #{rank:02d}{icons} {t:.2f}s 未{cb}"
+                state="確認中" if p.get("pose_reason")=="pending" else "未"
+                tag=f"{checkmark} #{rank:02d}{icons} {t:.2f}s {state}{cb}"
             motion,ball=self._hp_motion_summary(p)
             def compact(key):
                 value=motion.get(key)
@@ -3949,9 +4089,10 @@ class TennisApp(tk.Tk):
             if disp_t<view_lo or disp_t>view_hi: continue
             x=int((disp_t-view_lo)/view_span*cw)
             is_sel=(i==self.peak_idx)
-            color=GOLD if is_sel else ACCENT2
+            pending=p.get("pose_reason")=="pending"
+            color="#7b8c82" if pending else (GOLD if is_sel else ACCENT2)
             lw=3 if is_sel else 1
-            tl.create_line(x,12,x,ch,fill=color,width=lw)
+            tl.create_line(x,12,x,ch,fill=color,width=lw,dash=(4,3) if pending else ())
             tl.create_text(x,4,anchor="n",text=str(p["rank"]),fill=color,
                            font=("Helvetica",8,"bold" if is_sel else "normal"))
             if p["rank"] in badges:
@@ -3973,7 +4114,8 @@ class TennisApp(tk.Tk):
                 j=int(np.argmin(np.abs(np.asarray(times)-ct))) if len(times) else 0
                 level=float(combined[j]) if len(combined)>j else 0.5
                 y=max(13,min(ch-10,ch-level*(ch-22)-5))
-                color="#26c281" if cand.get("selected") else "#ff5252"
+                selected=cand.get("selected")
+                color="#8a958e" if selected is None else ("#26c281" if selected else "#ff5252")
                 tl.create_oval(x-6,y-6,x+6,y+6,fill=color,outline="white",width=1)
                 self._timeline_candidate_markers.append({"x":x,"y":y,"candidate":cand})
 

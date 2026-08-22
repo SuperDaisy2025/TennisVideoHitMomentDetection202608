@@ -26,6 +26,21 @@ def feat(x, y, serve=False, stroke=False, angle=120.0):
     }
 
 
+def test_camera_direction_prefers_visible_face_as_front():
+    direction,confidence,_=TA.classify_camera_direction_features(.7,.3,.5,.6)
+    assert direction=="正面" and confidence>.7
+
+
+def test_camera_direction_uses_center_vanishing_point_as_rear():
+    direction,_,_=TA.classify_camera_direction_features(0,.4,.5,.6)
+    assert direction=="後ろ"
+
+
+def test_camera_direction_keeps_uncertain_evidence_unknown():
+    direction,confidence,_=TA.classify_camera_direction_features(0,.02,None,.1)
+    assert direction=="不明・複数" and confidence<.5
+
+
 def classify(features):
     app = object.__new__(TA.TennisApp)
     return app._classify_hp_pose_triplet(
