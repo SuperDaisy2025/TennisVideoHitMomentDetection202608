@@ -106,6 +106,20 @@ def test_selected_sensitivity_is_direct_energy_threshold():
     assert peaks.tolist() == [3]
 
 
+def test_first_minute_cache_is_separate_from_full_analysis():
+    video=str(Path("sample.mp4"))
+    assert TA.get_analysis_cache_path(video,True).endswith("sample_first60_analysis.npz")
+    assert TA.get_analysis_cache_path(video,False).endswith("sample_analysis.npz")
+
+
+def test_noise_metrics_report_dense_background_as_high():
+    energy=np.full(120,.15,dtype=float)
+    energy[::3]=.8
+    metrics=TA.estimate_noise_metrics({"broadband":energy,"duration":60,"sr":1024})
+    assert metrics["floor"]>=.15
+    assert metrics["level"]=="高"
+
+
 def test_pose_sampling_uses_five_requested_offsets():
     assert TA.HP_POSE_SAMPLE_OFFSETS == (-0.2, -0.1, 0.0, 0.1, 0.2)
 

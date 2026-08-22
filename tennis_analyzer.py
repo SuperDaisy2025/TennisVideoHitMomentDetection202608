@@ -317,11 +317,11 @@ def _tk_font(size, bold=False):
     return (tk_candidates[0], size, weight)
 
 # ── カラー ────────────────────────────────────
-BG=     "#0f1117"; PANEL=  "#1a1d27"; PANEL2= "#141720"
-ACCENT= "#e8593c"; ACCENT2="#3b8bd4"; GOLD=   "#ef9f27"
-GREEN=  "#1d9e75"; TEXT=   "#d4d0c8"; SUBTEXT="#888780"
-BORDER= "#2c2e3a"; DARK2=  "#12141e"; RED= "#ff5252"
-APP_VERSION = "v75"; APP_VERSION_DESC = "ピーク高さ・正解DBサマリ"
+BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
+ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
+GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
+BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
+APP_VERSION = "v76"; APP_VERSION_DESC = "Hit Moment・1分解析・ノイズ表示"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -370,10 +370,11 @@ SOUND_SPEED  = 340.0
 # ══════════════════════════════════════════════
 #  音声解析
 # ══════════════════════════════════════════════
-def extract_audio(video_path, audio_path):
+def extract_audio(video_path, audio_path, max_duration=None):
     if not os.path.exists(audio_path):
-        ffmpeg.input(video_path).output(
-            audio_path, format="mp3", loglevel="quiet").run(overwrite_output=True)
+        options={"format":"mp3","loglevel":"quiet"}
+        if max_duration:options["t"]=float(max_duration)
+        ffmpeg.input(video_path).output(audio_path,**options).run(overwrite_output=True)
 
 def analyze_audio(audio_path):
     y, sr    = librosa.load(audio_path, sr=None, mono=True)
@@ -394,6 +395,20 @@ def analyze_audio(audio_path):
     return {"y":y,"sr":sr,"duration":duration,"times":times,
             "impact":impact_n,"wall":wall_n,"broadband":broadband_n,
             "combined":0.65*impact_n+0.35*wall_n}
+
+def estimate_noise_metrics(data):
+    """Estimate background floor and dense competing-impact activity."""
+    energy=np.asarray(data.get("broadband",data.get("combined",[])),dtype=float)
+    duration=max(float(data.get("duration",0) or 0),1e-6)
+    if len(energy)==0:return {"floor":0.0,"events_per_min":0.0,"level":"不明"}
+    floor=float(np.percentile(energy,50))
+    sr=float(data.get("sr",44100)); distance=max(1,int(.15*sr/512))
+    peaks,_=sp.find_peaks(energy,height=.30,distance=distance)
+    events_per_min=float(len(peaks))*60.0/duration
+    score=(2 if floor>=.12 else 1 if floor>=.05 else 0)+(
+           2 if events_per_min>=30 else 1 if events_per_min>=15 else 0)
+    level="高" if score>=3 else "中" if score>=1 else "低"
+    return {"floor":floor,"events_per_min":events_per_min,"level":level}
 
 def detect_peaks(data, sensitivity=0.5, min_gap=1.0, wall_mode=False,
                  use_frequency_filter=True):
@@ -718,11 +733,12 @@ def load_deleted_peaks(db_path, video_file):
 
 
 # ── v15: 解析結果キャッシュ ────────────────
-def get_analysis_cache_path(video_path):
+def get_analysis_cache_path(video_path, first_minute_only=False):
     audio_dir=os.path.join(os.path.dirname(video_path),"audio")
     os.makedirs(audio_dir,exist_ok=True)
     stem=os.path.splitext(os.path.basename(video_path))[0]
-    return os.path.join(audio_dir,f"{stem}_analysis.npz")
+    suffix="_first60_analysis.npz" if first_minute_only else "_analysis.npz"
+    return os.path.join(audio_dir,f"{stem}{suffix}")
 
 def save_analysis_cache(cache_path,data):
     try:
@@ -1064,7 +1080,7 @@ def get_video_info(video_path):
 class TennisApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(f"Tennis Form Analyzer  {APP_VERSION}")
+        self.title(f"Hit Moment Analyzer  {APP_VERSION}")
         self.configure(bg=BG)
         self.geometry("1440x900"); self.minsize(1100,700)
         # v53: 起動時に最大化
@@ -1077,6 +1093,7 @@ class TennisApp(tk.Tk):
         self.min_gap      = tk.DoubleVar(value=0.35)   # v18: 1.0 → 0.35s
         self.wall_mode    = tk.BooleanVar(value=False) # v18: 壁打ちモード
         self.audio_filter_enabled = tk.BooleanVar(value=True)
+        self._analysis_first_minute = False
         self.camera_dist  = tk.DoubleVar(value=3.0)
         # v23: プレイヤー身長 (cm)
         self.player_height = tk.IntVar(value=DEFAULT_PLAYER_HEIGHT_CM)
@@ -1088,6 +1105,8 @@ class TennisApp(tk.Tk):
         self._hp_candidate_audit = []
         self._timeline_zoomed = False
         self._timeline_candidate_markers = []
+        try:self.noise_summary_var.set("音響混雑度: 解析中…")
+        except Exception:pass
 
         # 現在の選択状態
         self.peak_idx     = 0        # self.peaks 内のインデックス(表示位置)
@@ -1166,6 +1185,8 @@ class TennisApp(tk.Tk):
         self._hp_candidate_audit = []
         self._timeline_zoomed = False
         self._timeline_candidate_markers = []
+        try:self.noise_summary_var.set("音響混雑度: 解析中…")
+        except Exception:pass
         try:
             self.timeline.configure(height=60)
             self.btn_timeline_zoom.configure(text="拡大",bg=DARK2)
@@ -1316,7 +1337,7 @@ class TennisApp(tk.Tk):
     def _build_left(self):
         p=self.left
 
-        tk.Label(p,text="Tennis Analyzer",bg=PANEL,fg=ACCENT,
+        tk.Label(p,text="Hit Moment Analyzer",bg=PANEL,fg=ACCENT2,
                  font=_tk_font(13,bold=True)).pack(pady=(14,2))
         tk.Label(p,text=f"{APP_VERSION}  {APP_VERSION_DESC}",bg=PANEL,fg=SUBTEXT,
                  font=_tk_font(10)).pack(pady=(0,6))
@@ -1447,6 +1468,10 @@ class TennisApp(tk.Tk):
         tk.Label(p,textvariable=self.status_var,bg=PANEL,fg=SUBTEXT,
                  font=_tk_font(9),wraplength=236,justify="left"
                  ).pack(padx=12,pady=(0,8),anchor="w")
+        self.noise_summary_var=tk.StringVar(value="音響混雑度: 未解析")
+        tk.Label(p,textvariable=self.noise_summary_var,bg=PANEL,fg=ACCENT2,
+                 font=_tk_font(10,bold=True),wraplength=500,justify="left"
+                 ).pack(fill="x",padx=12,pady=(0,8),anchor="w")
 
     # ── メインエリア ──────────────────────────
     def _build_main(self):
@@ -1607,7 +1632,7 @@ class TennisApp(tk.Tk):
             v=tk.StringVar(value=label); self._hp_detail_time_vars.append(v)
             tk.Label(col,textvariable=v,bg=PANEL2,fg=GOLD if label=="候補フレーム" else TEXT,
                      font=_tk_font(10,bold=True)).pack(fill="x",pady=4)
-            cv=tk.Canvas(col,bg="#0b0d12",width=110,height=175,highlightthickness=0)
+            cv=tk.Canvas(col,bg="#16392b",width=110,height=175,highlightthickness=0)
             cv.pack(fill="both",expand=True,padx=2,pady=(0,3))
             cv.bind("<Configure>",lambda e:self.after_idle(self._refresh_hp_detail))
             self._hp_detail_canvases.append(cv)
@@ -1615,7 +1640,7 @@ class TennisApp(tk.Tk):
         chartbox=tk.Frame(parent,bg=PANEL2); chartbox.pack(fill="x",padx=13,pady=4)
         tk.Label(chartbox,text="サウンドエネルギー（候補の前後2秒）",bg=PANEL2,fg=TEXT,
                  font=_tk_font(10,bold=True),anchor="w").pack(fill="x",padx=7,pady=(4,0))
-        self._hp_detail_chart=tk.Canvas(chartbox,bg="#0b0d12",height=170,highlightthickness=0)
+        self._hp_detail_chart=tk.Canvas(chartbox,bg=DARK2,height=170,highlightthickness=0)
         self._hp_detail_chart.pack(fill="x",padx=7,pady=5)
         self._hp_detail_chart.bind("<Configure>",lambda e:self.after_idle(self._refresh_hp_detail))
         motion=tk.Frame(parent,bg=PANEL2); motion.pack(fill="x",padx=13,pady=(0,4))
@@ -1935,10 +1960,10 @@ class TennisApp(tk.Tk):
         a=get_video_alias(path) if path else ""
         if a:
             self.alias_var.set(f"タイトル:  {a}")
-            self.title(f"Tennis Form Analyzer  {APP_VERSION}  -  {a}")
+            self.title(f"Hit Moment Analyzer  {APP_VERSION}  -  {a}")
         else:
             self.alias_var.set("")
-            self.title(f"Tennis Form Analyzer  {APP_VERSION}")
+            self.title(f"Hit Moment Analyzer  {APP_VERSION}")
 
     def _cs_pick_cp(self):
         """v24: 連続写真タブ用 CP サムネピッカー (オフセット0のサムネを一覧)"""
@@ -2274,6 +2299,11 @@ class TennisApp(tk.Tk):
         ttk.Combobox(right,textvariable=sensitivity_var,
                      values=["0.7","0.6","0.5","0.4","0.3"],
                      state="readonly",width=7,font=_tk_font(9)).pack(anchor="w",padx=8)
+        first_minute_var=tk.BooleanVar(value=bool(saved_extra.get("first_minute_only",False)))
+        tk.Checkbutton(right,text="最初の1分間のみ解析（高速確認用）",
+                       variable=first_minute_var,bg=PANEL,fg=ACCENT2,
+                       activebackground=PANEL,selectcolor=DARK2,
+                       font=_tk_font(10,bold=True)).pack(anchor="w",pady=(8,0),padx=8)
         # v40: プロジェクトフォルダ取込
         import_var = tk.BooleanVar(value=True)
         tk.Checkbutton(right, text="プロジェクトフォルダに取込 (動画+解析データを集約管理)",
@@ -2304,17 +2334,20 @@ class TennisApp(tk.Tk):
                 "content_type": content_var.get(),
                 "pose_backend": pose_backend_var.get(),
                 "sensitivity": float(sensitivity_var.get()),
+                "first_minute_only": bool(first_minute_var.get()),
             }
             win.destroy()
             # v30: 壁打ちフラグをポップアップの選択から設定
             self.wall_mode.set(content_var.get() == "壁打ち")
             self.sensitivity.set(float(sensitivity_var.get()))
+            self._analysis_first_minute=bool(first_minute_var.get())
             self._video_meta_extra = {
                 "camera_dir": cam_var.get(),
                 "main_shots": [k for k,v in shot_vars.items() if v.get()],
                 "content_type": content_var.get(),
                 "pose_backend": pose_backend_var.get(),
                 "sensitivity": float(sensitivity_var.get()),
+                "first_minute_only": bool(first_minute_var.get()),
             }
             # v34: 追加メタデータをJSON保存 (次回復元用)
             try:
@@ -2426,6 +2459,7 @@ class TennisApp(tk.Tk):
         frame_count=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self._video_wh=(w,h)
         self._video_duration=frame_count/self.video_fps if self.video_fps>0 else 0
+        self._analysis_duration=min(self._video_duration,60.0) if self._analysis_first_minute else self._video_duration
         cap.release()
         db_path=get_db_path(path); init_db(db_path)
         vf=os.path.basename(path)
@@ -2463,7 +2497,8 @@ class TennisApp(tk.Tk):
         # 長さ表示
         d=self._video_duration
         dur_str=f"{int(d//60)}分{d%60:04.1f}秒" if d>=60 else f"{d:.1f}秒"
-        self.status_var.set(f"{vf}  ({dur_str})  解析準備中…")
+        limit_text=" / 先頭1分のみ" if self._analysis_first_minute and d>60 else ""
+        self.status_var.set(f"{vf}  ({dur_str}{limit_text})  解析準備中…")
 
         self._run_analysis()
 
@@ -2480,7 +2515,7 @@ class TennisApp(tk.Tk):
         """進捗バー (0-100) と状態テキストを更新。v34: メイン画像中央に表示"""
         try:
             self.progress.configure(mode="determinate",maximum=100,value=max(0,min(100,pct)))
-            d=getattr(self,"_video_duration",0)
+            d=getattr(self,"_analysis_duration",getattr(self,"_video_duration",0))
             dur_str=f"{int(d//60)}分{d%60:04.1f}秒" if d>=60 else f"{d:.1f}秒"
             msg = f"{label}   ({dur_str})"
             self.status_var.set(msg)
@@ -2531,7 +2566,8 @@ class TennisApp(tk.Tk):
         self._set_progress(0,"解析開始…")
 
         # キャッシュ確認 (.npz が存在すれば再解析せず即ロード)
-        cache_path=get_analysis_cache_path(path)
+        first_minute=bool(getattr(self,"_analysis_first_minute",False))
+        cache_path=get_analysis_cache_path(path,first_minute)
         cached=load_analysis_cache(cache_path)
         # v65: 旧キャッシュには周波数フィルターOFF用の広帯域エネルギーがない。
         if cached is not None and "broadband" not in cached:
@@ -2546,9 +2582,9 @@ class TennisApp(tk.Tk):
             try:
                 base=os.path.dirname(path); stem=os.path.splitext(os.path.basename(path))[0]
                 audio_dir=os.path.join(base,"audio"); os.makedirs(audio_dir,exist_ok=True)
-                audio_path=os.path.join(audio_dir,f"{stem}.mp3")
+                audio_path=os.path.join(audio_dir,f"{stem}_first60.mp3" if first_minute else f"{stem}.mp3")
                 self.after(0,lambda: self._set_progress(5,"音声抽出中…"))
-                extract_audio(path,audio_path)
+                extract_audio(path,audio_path,60.0 if first_minute else None)
                 self.after(0,lambda: self._set_progress(15,"音声解析中…"))
                 self.data=analyze_audio(audio_path)
                 # キャッシュ保存 (次回はスキップ可能)
@@ -2562,9 +2598,18 @@ class TennisApp(tk.Tk):
         threading.Thread(target=_worker,daemon=True).start()
 
     def _finish_analysis(self):
+        self._update_noise_summary()
         # v63: 音声候補をMediaPipeの3点解析で検証してから一覧を作る。
         # 姿勢解析はワーカーで行い、GUIスレッドを停止させない。
         self._start_fast_hp_pose_filter()
+
+    def _update_noise_summary(self):
+        metrics=estimate_noise_metrics(self.data or {})
+        level=metrics["level"]
+        note="（隣コート音などの影響候補）" if level=="高" else ""
+        self.noise_summary_var.set(
+            f"音響混雑度: {level}  背景床 {metrics['floor']:.3f} / "
+            f"強音 {metrics['events_per_min']:.1f}回/分 {note}")
 
     @staticmethod
     def _hp_point(lms, index, min_vis=HP_POSE_MIN_VIS):
@@ -2874,7 +2919,7 @@ class TennisApp(tk.Tk):
                 finally: cap.release()
         if frame is None:
             canvas.create_text(max(canvas.winfo_width()//2,100),max(canvas.winfo_height()//2,80),
-                               text="画像なし",fill=SUBTEXT,font=_tk_font(10)); return
+                               text="画像なし",fill="#dbeee1",font=_tk_font(10)); return
         img=Image.fromarray(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)); iw,ih=img.size
         points={}
         for key,val in sample.get("kps",{}).items():
@@ -3264,7 +3309,8 @@ class TennisApp(tk.Tk):
     def _peak_energy_at(self,time_sec,use_filter=True):
         data=self.data
         if data is None:
-            data=load_analysis_cache(get_analysis_cache_path(self.video_path.get()))
+            data=load_analysis_cache(get_analysis_cache_path(
+                self.video_path.get(),bool(getattr(self,"_analysis_first_minute",False))))
         if not data:return None
         times=np.asarray(data.get("times",[]),dtype=float)
         energy=np.asarray(data.get("combined",[]) if use_filter else
@@ -9254,7 +9300,7 @@ class RefinerFrame(tk.Frame):
     #  ファイル読込
     # ════════════════════════════════════════
     def _tennis_analyzer_registry_path(self):
-        """v2.3: Tennis Analyzer のレジストリ analyzed_videos.json を探す"""
+        """v2.3: Hit Moment Analyzer のレジストリ analyzed_videos.json を探す"""
         # 候補1: 本 GUI と同じディレクトリ
         cand = [os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "analyzed_videos.json")]
@@ -9269,12 +9315,12 @@ class RefinerFrame(tk.Frame):
         return None
 
     def _pick_from_history(self):
-        """v2.3: Tennis Analyzer の履歴からサムネ付きで動画を選択"""
+        """v2.3: Hit Moment Analyzer の履歴からサムネ付きで動画を選択"""
         reg_path = self._tennis_analyzer_registry_path()
         if not reg_path:
             messagebox.showinfo("履歴",
-                "Tennis Analyzer のレジストリ analyzed_videos.json が見つかりません。\n"
-                "本ファイルを Tennis Analyzer と同じフォルダに置いてください。"); return
+                "Hit Moment Analyzer のレジストリ analyzed_videos.json が見つかりません。\n"
+                "本ファイルを Hit Moment Analyzer と同じフォルダに置いてください。"); return
         try:
             with open(reg_path, "r", encoding="utf-8") as f:
                 reg = json.load(f)
@@ -9356,7 +9402,7 @@ class RefinerFrame(tk.Frame):
                 if n_ref > 0: stat_text += f"  refined: {n_ref}"
                 stat_fg = SUBTEXT
             else:
-                stat_text = "未検出 (要 Tennis Analyzer)"
+                stat_text = "未検出 (要 Hit Moment Analyzer)"
                 stat_fg = RED
             tk.Label(cell, text=stat_text, bg=cell_bg, fg=stat_fg,
                      font=_font(8)).pack(padx=4, pady=(0, 4))
@@ -9366,7 +9412,7 @@ class RefinerFrame(tk.Frame):
                 if not det:
                     messagebox.showinfo("未検出",
                         "この動画はまだキーポイント検出されていません。\n"
-                        "Tennis Analyzer で「キーポイント検出」を実行してください。")
+                        "Hit Moment Analyzer で「キーポイント検出」を実行してください。")
                     return
                 try: canv.unbind_all("<MouseWheel>")
                 except Exception: pass
@@ -9434,7 +9480,7 @@ class RefinerFrame(tk.Frame):
             # ファイルパスから推測
             try: video_path = self.cp_files[0]
             except Exception: video_path = None
-        # サムネディレクトリ (Tennis Analyzer の出力規約)
+        # サムネディレクトリ (Hit Moment Analyzer の出力規約)
         video_dir = (os.path.dirname(video_path) if video_path and not video_path.endswith(".json")
                      else os.path.dirname(os.path.dirname(self.cp_files[0])))
         # JSONから動画ファイル名を取り、サムネディレクトリを構築
@@ -12370,7 +12416,7 @@ class RefinerFrame(tk.Frame):
             reg_path = self._tennis_analyzer_registry_path()
             if not reg_path:
                 messagebox.showinfo("インポート",
-                    "Tennis Analyzer のレジストリが見つかりません"); return
+                    "Hit Moment Analyzer のレジストリが見つかりません"); return
             try:
                 with open(reg_path, "r", encoding="utf-8") as f:
                     reg = json.load(f)
