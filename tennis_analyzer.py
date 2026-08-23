@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v88"; APP_VERSION_DESC = "コート範囲・段階別線分診断"
+APP_VERSION = "v89"; APP_VERSION_DESC = "途切れ線統合・コート色3段階"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -460,6 +460,53 @@ def dedupe_line_segments(lines,rho_bin=14,angle_bin=6):
         key=(int(round(angle/angle_bin)),int(round(rho/rho_bin)))
         if key not in best or length>best[key][0]:best[key]=(length,(x1,y1,x2,y2))
     return [value[1] for value in best.values()]
+
+def merge_collinear_fragments(lines,rho_tol=22,angle_tol=9,max_gap=90):
+    """Join separated but collinear fragments, preserving how many formed each line."""
+    groups=[]
+    for row in lines:
+        x1,y1,x2,y2=map(float,row); dx=x2-x1; dy=y2-y1; length=math.hypot(dx,dy)
+        if length<1:continue
+        angle=(math.degrees(math.atan2(dy,dx))+180)%180
+        theta=math.radians(angle); nx=-math.sin(theta); ny=math.cos(theta)
+        rho=((x1+x2)*.5)*nx+((y1+y2)*.5)*ny
+        def angle_diff(a,b):
+            d=abs(a-b)%180; return min(d,180-d)
+        group=next((g for g in groups if angle_diff(angle,np.median(g["angles"]))<=angle_tol and
+                    abs(rho-np.median(g["rhos"]))<=rho_tol),None)
+        if group is None:
+            group={"rows":[],"angles":[],"rhos":[]}; groups.append(group)
+        group["rows"].append((row,length)); group["angles"].append(angle); group["rhos"].append(rho)
+    merged=[]
+    for group in groups:
+        angle=float(np.average(group["angles"],weights=[v[1] for v in group["rows"]]))
+        theta=math.radians(angle); ux=math.cos(theta); uy=math.sin(theta); nx=-uy; ny=ux
+        rho=float(np.median(group["rhos"])); intervals=[]
+        for row,_length in group["rows"]:
+            x1,y1,x2,y2=map(float,row); p=sorted((x1*ux+y1*uy,x2*ux+y2*uy))
+            intervals.append((p[0],p[1]))
+        intervals.sort(); clusters=[]
+        for lo,hi in intervals:
+            if clusters and lo<=clusters[-1][1]+max_gap:
+                clusters[-1]=(clusters[-1][0],max(clusters[-1][1],hi),clusters[-1][2]+1)
+            else:clusters.append((lo,hi,1))
+        for lo,hi,count in clusters:
+            line=[int(round(lo*ux+rho*nx)),int(round(lo*uy+rho*ny)),
+                  int(round(hi*ux+rho*nx)),int(round(hi*uy+rho*ny))]
+            merged.append({"line":line,"merged_count":count})
+    return merged
+
+def merged_support_for_line(line,merged_items,rho_tol=34,angle_tol=11):
+    """Return merged-fragment support for a later-stage line on the same axis."""
+    x1,y1,x2,y2=map(float,line); angle=(math.degrees(math.atan2(y2-y1,x2-x1))+180)%180
+    theta=math.radians(angle); rho=((x1+x2)*.5)*(-math.sin(theta))+((y1+y2)*.5)*math.cos(theta)
+    support=1
+    for item in merged_items:
+        a,b,c,d=map(float,item["line"]); other=(math.degrees(math.atan2(d-b,c-a))+180)%180
+        diff=min(abs(angle-other),180-abs(angle-other))
+        ot=math.radians(other); other_rho=((a+c)*.5)*(-math.sin(ot))+((b+d)*.5)*math.cos(ot)
+        if diff<=angle_tol and abs(rho-other_rho)<=rho_tol:support=max(support,int(item.get("merged_count",1)))
+    return support
 
 def merge_line_bands(lines,image_shape,rho_bin=28,angle_bin=7):
     """Merge parallel Hough edges and fragments into full-length center bands."""
@@ -620,10 +667,13 @@ def draw_direction_court_lines(frame,line_items,show_confidence=False,top_five=F
 def draw_all_edge_segments(frame,segments):
     """Draw every pre-filter Hough edge segment as a thin red diagnostic line."""
     output=frame.copy()
-    for row in segments or []:
+    for item in segments or []:
+        row=item.get("line",[]) if isinstance(item,dict) else item
         if len(row)!=4:continue
         x1,y1,x2,y2=map(int,row)
-        cv2.line(output,(x1,y1),(x2,y2),(35,35,245),1,cv2.LINE_AA)
+        merged=int(item.get("merged_count",1)) if isinstance(item,dict) else 1
+        color=(210,55,245) if merged>=2 else (35,35,245)
+        cv2.line(output,(x1,y1),(x2,y2),color,2 if merged>=2 else 1,cv2.LINE_AA)
     return output
 
 def clip_segment_below_y(row,cutoff_y):
@@ -645,13 +695,13 @@ def segment_white_ratio(hsv,row,samples=17):
         if int(pixel[1])<=80 and int(pixel[2])>=165:hits+=1
     return hits/max(valid,1)
 
-def draw_court_color_area(frame,court_sample,foot,cutoff_y,alpha=.18):
+def draw_court_color_area(frame,court_sample,foot,cutoff_y,alpha=.18,color_distance=30):
     """Tint the foot-connected, similarly colored court area translucent light blue."""
     if frame is None or not court_sample or not court_sample.get("lab"):return frame.copy()
     lab=cv2.cvtColor(frame,cv2.COLOR_BGR2LAB).astype(np.float32)
     target=np.asarray(court_sample["lab"],dtype=np.float32)
     distance=np.linalg.norm(lab-target,axis=2)
-    mask=(distance<=30).astype(np.uint8)*255
+    mask=(distance<=float(color_distance)).astype(np.uint8)*255
     mask[:int(np.clip(cutoff_y,0,frame.shape[0])),:]=0
     mask=cv2.morphologyEx(mask,cv2.MORPH_OPEN,np.ones((3,3),np.uint8))
     mask=cv2.morphologyEx(mask,cv2.MORPH_CLOSE,np.ones((9,9),np.uint8))
@@ -805,8 +855,8 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             stage2=[clipped for row in stage1 if (clipped:=clip_segment_below_y(row,court_cutoff))]
             hsv=cv2.cvtColor(frame,cv2.COLOR_BGR2HSV)
             stage3=[row for row in stage2 if segment_white_ratio(hsv,row)>=.25]
-            stage4=[list(map(int,row)) for row in dedupe_line_segments(
-                stage3,rho_bin=max(18,int(w*.035)),angle_bin=7)]
+            stage4=merge_collinear_fragments(stage3,rho_tol=max(22,int(w*.04)),
+                                              angle_tol=10,max_gap=max(70,int(w*.18)))
             overlay=frame.copy()
             for x1p,y1p,x2p,y2p in people:
                 cv2.rectangle(overlay,(x1p,y1p),(x2p,y2p),(255,170,40),2)
@@ -930,8 +980,13 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             item["court_line_items"]=line_items; item["court_lines"]=len(line_items)
             item["baselines"]=sum(bool(x.get("baseline")) for x in line_items)
             stages=item.setdefault("line_filter_stages",{})
-            stages["5"]=[list(map(int,r["line"])) for r in geometry_regions]
-            stages["6"]=[list(map(int,r["line"])) for r in common_regions]
+            merged_stage4=stages.get("4",[])
+            stages["5"]=[{"line":list(map(int,r["line"])),
+                          "merged_count":merged_support_for_line(r["line"],merged_stage4)}
+                         for r in geometry_regions]
+            stages["6"]=[{"line":list(map(int,r["line"])),
+                          "merged_count":merged_support_for_line(r["line"],merged_stage4)}
+                         for r in common_regions]
     face_rate=face_hits/max(valid_frames,1)
     oblique_ratio=oblique_total/max(line_total,1)
     convergence=min(1.0,len(intersections)/max(valid_frames*12,1))
@@ -2819,7 +2874,7 @@ class TennisApp(tk.Tk):
         toolbar=tk.Frame(zoom,bg=PANEL); toolbar.pack(fill="x")
         show_conf=tk.BooleanVar(value=False); top_five=tk.BooleanVar(value=False)
         show_all_edges=tk.BooleanVar(value=False)
-        show_court_area=tk.BooleanVar(value=False)
+        court_area_level=tk.StringVar(value="オフ")
         stage_var=tk.StringVar(value="6: 足元色後（最終）")
         image_label=tk.Label(zoom,bg="#17231c"); image_label.pack(fill="both",expand=True,padx=10,pady=10)
         info=tk.StringVar(); tk.Label(toolbar,textvariable=info,bg=PANEL,fg=TEXT,
@@ -2836,11 +2891,15 @@ class TennisApp(tk.Tk):
             shown=sorted(line_items,key=lambda x:x.get("confidence",0),reverse=True)
             if top_five.get():shown=shown[:5]
             rendered=bgr.copy()
-            if show_court_area.get():
+            if court_area_level.get()!="オフ":
+                level=int(court_area_level.get()); thresholds={1:42,2:30,3:18}
                 rendered=draw_court_color_area(rendered,item.get("court_color"),item.get("foot"),
-                                               item.get("court_cutoff",int(bgr.shape[0]*.42)))
+                                               item.get("court_cutoff",int(bgr.shape[0]*.42)),
+                                               color_distance=thresholds[level])
             if stage_key=="6":
                 rendered=draw_direction_court_lines(rendered,line_items,show_conf.get(),top_five.get())
+                merged_only=[x for x in stage_segments if isinstance(x,dict) and x.get("merged_count",1)>=2]
+                rendered=draw_all_edge_segments(rendered,merged_only)
             else:
                 rendered=draw_all_edge_segments(rendered,stage_segments)
             if show_all_edges.get() and stage_key!="1":rendered=draw_all_edge_segments(rendered,all_edges)
@@ -2861,7 +2920,10 @@ class TennisApp(tk.Tk):
                            font=_tk_font(10,True)).pack(side="right",padx=8,pady=7)
         add_toggle("Confidence表示",show_conf); add_toggle("Confidence上位5本のみ",top_five)
         add_toggle("全線分",show_all_edges)
-        add_toggle("コート範囲",show_court_area)
+        tk.Label(toolbar,text="コート範囲",bg=PANEL,fg=TEXT,font=_tk_font(10,True)).pack(side="right",padx=(10,3))
+        court_box=ttk.Combobox(toolbar,textvariable=court_area_level,
+                              values=("オフ","1","2","3"),state="readonly",width=5)
+        court_box.pack(side="right",padx=3,pady=7); court_box.bind("<<ComboboxSelected>>",lambda _e:render())
         stages=("1: Canny＋Hough全線分","2: 足首基準より下","3: 白線らしさ",
                 "4: 重複線統合","5: 5枚共通＋形状","6: 足元色後（最終）")
         tk.Label(toolbar,text="絞り込み",bg=PANEL,fg=TEXT,font=_tk_font(10,True)).pack(side="right",padx=(12,3))

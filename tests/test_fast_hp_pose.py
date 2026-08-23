@@ -160,6 +160,31 @@ def test_court_color_area_is_tinted_but_remains_visible():
     assert np.all(rendered[45,40]>0)
 
 
+def test_collinear_fragments_are_extended_into_one_supported_line():
+    merged=TA.merge_collinear_fragments([[5,30,35,30],[50,31,90,31]],rho_tol=4,
+                                        angle_tol=3,max_gap=20)
+    assert len(merged)==1 and merged[0]["merged_count"]==2
+    assert abs(merged[0]["line"][2]-merged[0]["line"][0])>=84
+
+
+def test_merged_diagnostic_line_is_pink():
+    frame=np.zeros((50,100,3),dtype=np.uint8)
+    rendered=TA.draw_all_edge_segments(frame,[{"line":[5,25,95,25],"merged_count":2}])
+    b,g,r=map(int,rendered[25,50])
+    assert r>200 and b>150 and g<100
+
+
+def test_strict_court_color_level_covers_less_area():
+    frame=np.full((60,80,3),(65,135,75),dtype=np.uint8)
+    frame[:,40:]=(80,145,90)
+    lab=TA.cv2.cvtColor(np.array([[[65,135,75]]],dtype=np.uint8),TA.cv2.COLOR_BGR2LAB)[0,0]
+    sample={"lab":lab.tolist(),"sample_rect":[10,45,20,55]}
+    loose=TA.draw_court_color_area(frame,sample,(15,45),30,color_distance=42)
+    strict=TA.draw_court_color_area(frame,sample,(15,45),30,color_distance=18)
+    loose_changed=np.any(loose!=frame,axis=2).sum(); strict_changed=np.any(strict!=frame,axis=2).sum()
+    assert strict_changed<=loose_changed
+
+
 def test_yolo_face_direction_uses_nose_between_eyes():
     kps=np.zeros((17,3),dtype=float)
     kps[0]=[50,40,.9]; kps[1]=[45,35,.9]; kps[2]=[55,35,.9]
