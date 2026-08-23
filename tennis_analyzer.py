@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v85"; APP_VERSION_DESC = "足元コート色による白線検証"
+APP_VERSION = "v86"; APP_VERSION_DESC = "安定白線面積・足元色安全フィルター"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -497,32 +497,26 @@ def detect_common_court_regions(frames,court_top=None):
     h,w=frames[0].shape[:2]; masks=[]
     for frame in frames:
         hsv=cv2.cvtColor(frame,cv2.COLOR_BGR2HSV)
-        lab=cv2.cvtColor(frame,cv2.COLOR_BGR2LAB); light=lab[:,:,0]
-        background=cv2.GaussianBlur(light,(0,0),7.0)
-        local_bright=cv2.subtract(light,background)
-        # 絶対的な白さに加え、暗色コート上で周囲より明るい細線を拾う。
-        mask=(((hsv[:,:,1]<78)&(hsv[:,:,2]>175)) |
-              ((hsv[:,:,1]<90)&(hsv[:,:,2]>120)&(local_bright>18))).astype(np.uint8)*255
+        # v83で安定していた絶対的な白さだけの面積検出へ戻す。
+        mask=cv2.inRange(hsv,np.array([0,0,175],np.uint8),np.array([180,72,255],np.uint8))
         mask[:int(court_top if court_top is not None else h*.42),:]=0
-        masks.append(mask)
-    votes=np.sum(np.stack([m>0 for m in masks]),axis=0)
+        masks.append(mask>0)
+    votes=np.sum(np.stack(masks),axis=0)
     common=(votes>=max(2,int(math.ceil(len(masks)*.4)))).astype(np.uint8)*255
-    # 細線をopeningで消さず、小さな圧縮切れだけを接続する。
-    common=cv2.morphologyEx(common,cv2.MORPH_CLOSE,np.ones((3,3),np.uint8))
+    common=cv2.morphologyEx(common,cv2.MORPH_OPEN,np.ones((3,3),np.uint8))
+    common=cv2.morphologyEx(common,cv2.MORPH_CLOSE,np.ones((7,7),np.uint8))
     count,labels,stats,centroids=cv2.connectedComponentsWithStats(common,8)
-    median_frame=np.median(np.stack(frames),axis=0).astype(np.uint8); regions=[]
+    regions=[]
     for label in range(1,count):
         area=int(stats[label,cv2.CC_STAT_AREA])
-        if area<max(28,int(w*h*.00006)):continue
+        if area<max(40,int(w*h*.00012)):continue
         ys,xs=np.where(labels==label)
         if len(xs)<2:continue
         points=np.column_stack((xs,ys)).astype(np.float32)
         mean,eigenvectors,eigenvalues=cv2.PCACompute2(points,mean=None)
         ux,uy=map(float,eigenvectors[0]); projections=(points-mean[0])@eigenvectors[0]
         length=float(np.max(projections)-np.min(projections)); width=float(area/max(length,1))
-        eigen_ratio=float(eigenvalues[0,0]/max(float(eigenvalues[1,0]),1e-6))
-        if (length<w*.10 or width>max(36,w*.065) or
-                length/max(width,1)<2.5 or eigen_ratio<4.0):continue
+        if length<w*.07 or length/max(width,1)<2.0:continue
         p1=mean[0]+eigenvectors[0]*np.min(projections); p2=mean[0]+eigenvectors[0]*np.max(projections)
         component=(labels==label).astype(np.uint8)*255
         contours,_=cv2.findContours(component,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
@@ -530,39 +524,12 @@ def detect_common_court_regions(frames,court_top=None):
         polygon=cv2.approxPolyDP(contour,1.5,True).reshape(-1,2).tolist()
         ok_mask,mask_encoded=cv2.imencode(".png",component)
         stability=float(np.mean(votes[labels==label])/max(len(frames),1))
-        confidence=float(np.clip(.38*stability+.34*min(1,length/(w*.45))+
-                                 .18*min(1,eigen_ratio/18)+.10*min(1,length/max(width*8,1)),0,1))
+        confidence=float(np.clip(.42*stability+.33*min(1,length/(w*.45))+
+                                 .25*min(1,length/max(width*8,1)),0,1))
         regions.append({"polygon":polygon,"line":[float(p1[0]),float(p1[1]),float(p2[0]),float(p2[1])],
                         "width":width,"area":area,"centroid":list(map(float,centroids[label])),
                         "confidence":confidence,"support":int(round(stability*len(frames))),
-                        "eigen_ratio":eigen_ratio,
                         "mask_png":mask_encoded.tobytes() if ok_mask else None})
-    # 時間投票で点線状になった細いサイドラインは、同じ白画素マスク上の
-    # 共線断片を細長い面積へ再構成して補完する。
-    raw=cv2.HoughLinesP(common,1,np.pi/360,threshold=max(18,w//32),
-                        minLineLength=max(35,w//12),maxLineGap=max(18,w//18))
-    bands=merge_line_bands(normalize_hough_lines(raw),common.shape,
-                           rho_bin=max(10,int(w*.025)),angle_bin=5)
-    for band in bands:
-        x1,y1,x2,y2=map(float,band["line"]); length=math.hypot(x2-x1,y2-y1)
-        if length<w*.14:continue
-        samples=[(x1+(x2-x1)*t,y1+(y2-y1)*t) for t in np.linspace(.1,.9,7)]
-        overlap=False
-        for region in regions:
-            contour=np.asarray(region["polygon"],dtype=np.float32)
-            if sum(cv2.pointPolygonTest(contour,p,False)>=0 for p in samples)>=3:
-                overlap=True; break
-        if overlap:continue
-        dx=(x2-x1)/max(length,1); dy=(y2-y1)/max(length,1); nx=-dy; ny=dx
-        half=max(1.8,min(5.0,float(band.get("width",4))*.28))
-        polygon=[[x1+nx*half,y1+ny*half],[x2+nx*half,y2+ny*half],
-                 [x2-nx*half,y2-ny*half],[x1-nx*half,y1-ny*half]]
-        confidence=float(np.clip(.35+.30*min(1,length/(w*.5))+
-                                 .08*min(5,band.get("support",1)),0,1))
-        regions.append({"polygon":polygon,"line":[x1,y1,x2,y2],"width":half*2,
-                        "area":int(length*half*2),"centroid":[(x1+x2)*.5,(y1+y2)*.5],
-                        "confidence":confidence,"support":band.get("support",1),
-                        "eigen_ratio":99.0,"reconstructed":True})
     return sorted(regions,key=lambda x:x["confidence"],reverse=True)
 
 def court_line_confidence(frame,line):
@@ -681,8 +648,8 @@ def sample_foot_court_color(frame,foot,player_height):
     return {"bgr":list(map(int,bgr)),"lab":list(map(float,lab)),
             "sample_rect":[x1,y1,x2,y2]}
 
-def court_region_color_match(frame,region,target_lab,threshold=34.0):
-    """Require at least one side of a line area to match the foot court color."""
+def court_region_color_match(frame,region,target_lab,threshold=55.0):
+    """Reject only when both sides differ markedly from the foot court color."""
     if frame is None or target_lab is None:return True,float("inf"),float("inf")
     h,w=frame.shape[:2]; lab_frame=cv2.cvtColor(frame,cv2.COLOR_BGR2LAB)
     x1,y1,x2,y2=map(float,region.get("line",(0,0,0,0)))
@@ -873,28 +840,10 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
     if inspections and court_reference_frames:
         median_frame=np.median(np.stack(court_reference_frames),axis=0).astype(np.uint8)
         feet=[i.get("foot") for i in inspections if i.get("foot")]
-        heights=[i.get("player_height") for i in inspections if i.get("player_height")]
-        court_top=None
-        if feet and heights:
-            median_foot=tuple(np.median(np.asarray(feet,dtype=float),axis=0))
-            court_top=max(median_frame.shape[0]*.42,
-                          median_foot[1]-float(np.median(heights))*.32)
-        common_regions=detect_common_court_regions(court_reference_frames,court_top)
+        common_regions=detect_common_court_regions(court_reference_frames)
         court_labs=[i["court_color"]["lab"] for i in inspections if i.get("court_color")]
         target_court_lab=(np.median(np.asarray(court_labs,dtype=float),axis=0).tolist()
                           if court_labs else None)
-        if feet:
-            median_foot=tuple(np.median(np.asarray(feet,dtype=float),axis=0))
-            mw=median_frame.shape[1]
-            common_regions=[r for r in common_regions
-                            if math.hypot(float(r["line"][2])-float(r["line"][0]),
-                                          float(r["line"][3])-float(r["line"][1]))>=mw*.30
-                            or point_court_region_distance(median_foot,r)<=mw*.38]
-            common_regions=[r for r in common_regions if not (
-                float(r.get("centroid",[0,0])[0])>mw*.78 and
-                float(r.get("width",0))>mw*.02 and
-                math.hypot(float(r["line"][2])-float(r["line"][0]),
-                           float(r["line"][3])-float(r["line"][1]))<mw*.45)]
         if target_court_lab is not None:
             color_verified=[]
             for region in common_regions:

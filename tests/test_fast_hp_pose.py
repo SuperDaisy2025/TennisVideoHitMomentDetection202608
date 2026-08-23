@@ -113,16 +113,6 @@ def test_body_front_majority_makes_coarse_side_view():
     assert direction=="横(側不明)" and confidence>.7
 
 
-def test_local_contrast_detects_worn_line_on_dark_court():
-    frames=[]
-    for _ in range(5):
-        frame=np.full((120,220,3),70,dtype=np.uint8)
-        TA.cv2.line(frame,(10,95),(210,90),(155,155,155),3)
-        frames.append(frame)
-    regions=TA.detect_common_court_regions(frames,court_top=50)
-    assert regions and max(r["line"][2]-r["line"][0] for r in regions)>150
-
-
 def test_foot_color_sampling_ignores_white_paint():
     frame=np.full((120,200,3),(60,130,70),dtype=np.uint8)
     TA.cv2.line(frame,(100,80),(100,119),(255,255,255),5)
@@ -138,6 +128,15 @@ def test_line_is_kept_when_either_side_matches_foot_court_color():
     region={"line":[105,10,105,110],"width":4}
     matched,_,_=TA.court_region_color_match(frame,region,foot["lab"])
     assert matched
+
+
+def test_line_is_rejected_only_when_both_sides_are_far_from_foot_color():
+    frame=np.full((120,200,3),(20,20,170),dtype=np.uint8)
+    target_bgr=np.array([70,130,60],dtype=np.uint8).reshape(1,1,3)
+    target_lab=TA.cv2.cvtColor(target_bgr,TA.cv2.COLOR_BGR2LAB)[0,0]
+    region={"line":[100,10,100,110],"width":4}
+    matched,d1,d2=TA.court_region_color_match(frame,region,target_lab)
+    assert not matched and d1>55 and d2>55
 
 
 def test_yolo_face_direction_uses_nose_between_eyes():
