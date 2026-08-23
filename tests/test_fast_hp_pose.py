@@ -93,6 +93,26 @@ def test_yolo_body_direction_uses_anatomical_left_right_order():
     assert TA.yolo_body_direction(kps)=="背面"
 
 
+def test_common_court_detection_returns_one_area_not_two_edges():
+    frames=[]
+    for _ in range(5):
+        frame=np.zeros((120,200,3),dtype=np.uint8)
+        cv2=TA.cv2
+        cv2.rectangle(frame,(92,50),(108,119),(255,255,255),-1)
+        frames.append(frame)
+    regions=TA.detect_common_court_regions(frames)
+    assert len(regions)==1
+    assert regions[0]["area"]>900 and len(regions[0]["polygon"])>=4
+
+
+def test_body_front_majority_makes_coarse_side_view():
+    inspections=[{"body_directions":["正面（おへそ側）"]} for _ in range(4)]+[
+                 {"body_directions":["背面"]}]
+    direction,confidence,_=TA.classify_camera_coarse(
+        inspections,[],(100,200,3),("不明・複数",.25,"線不足"))
+    assert direction=="横(側不明)" and confidence>.7
+
+
 def test_yolo_face_direction_uses_nose_between_eyes():
     kps=np.zeros((17,3),dtype=float)
     kps[0]=[50,40,.9]; kps[1]=[45,35,.9]; kps[2]=[55,35,.9]

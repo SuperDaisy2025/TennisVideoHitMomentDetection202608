@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v82"; APP_VERSION_DESC = "5枚共通コート面積・身体向き"
+APP_VERSION = "v83"; APP_VERSION_DESC = "白線面積投票・サイド粗判定"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -491,6 +491,44 @@ def merge_line_bands(lines,image_shape,rho_bin=28,angle_bin=7):
         bands.append({"line":(*p1,*p2),"width":width,"support":len(values)})
     return bands
 
+def detect_common_court_regions(frames):
+    """Detect stable white court *areas* by pixel voting across fixed-camera frames."""
+    if not frames:return []
+    h,w=frames[0].shape[:2]; masks=[]
+    for frame in frames:
+        hsv=cv2.cvtColor(frame,cv2.COLOR_BGR2HSV)
+        mask=cv2.inRange(hsv,np.array([0,0,175],np.uint8),np.array([180,72,255],np.uint8))
+        mask[:int(h*.42),:]=0
+        masks.append(mask>0)
+    votes=np.sum(np.stack(masks),axis=0)
+    common=(votes>=max(2,int(math.ceil(len(masks)*.4)))).astype(np.uint8)*255
+    common=cv2.morphologyEx(common,cv2.MORPH_OPEN,np.ones((3,3),np.uint8))
+    common=cv2.morphologyEx(common,cv2.MORPH_CLOSE,np.ones((7,7),np.uint8))
+    count,labels,stats,centroids=cv2.connectedComponentsWithStats(common,8)
+    median_frame=np.median(np.stack(frames),axis=0).astype(np.uint8); regions=[]
+    for label in range(1,count):
+        area=int(stats[label,cv2.CC_STAT_AREA])
+        if area<max(40,int(w*h*.00012)):continue
+        ys,xs=np.where(labels==label)
+        if len(xs)<2:continue
+        points=np.column_stack((xs,ys)).astype(np.float32)
+        mean,eigenvectors,eigenvalues=cv2.PCACompute2(points,mean=None)
+        ux,uy=map(float,eigenvectors[0]); projections=(points-mean[0])@eigenvectors[0]
+        length=float(np.max(projections)-np.min(projections)); width=float(area/max(length,1))
+        if length<w*.07 or length/max(width,1)<2.0:continue
+        p1=mean[0]+eigenvectors[0]*np.min(projections); p2=mean[0]+eigenvectors[0]*np.max(projections)
+        component=(labels==label).astype(np.uint8)*255
+        contours,_=cv2.findContours(component,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+        contour=max(contours,key=cv2.contourArea)
+        polygon=cv2.approxPolyDP(contour,1.5,True).reshape(-1,2).tolist()
+        stability=float(np.mean(votes[labels==label])/max(len(frames),1))
+        confidence=float(np.clip(.42*stability+.33*min(1,length/(w*.45))+
+                                 .25*min(1,length/max(width*8,1)),0,1))
+        regions.append({"polygon":polygon,"line":[float(p1[0]),float(p1[1]),float(p2[0]),float(p2[1])],
+                        "width":width,"area":area,"centroid":list(map(float,centroids[label])),
+                        "confidence":confidence,"support":int(round(stability*len(frames)))})
+    return sorted(regions,key=lambda x:x["confidence"],reverse=True)
+
 def court_line_confidence(frame,line):
     """Heuristic confidence from whiteness, length and court-side location."""
     x1,y1,x2,y2=map(float,line); h,w=frame.shape[:2]
@@ -520,24 +558,55 @@ def camera_direction_explanation(estimate):
             "コート線は5枚の検出を統合した共通結果です。線情報が弱い場合は無理に正面・後ろと"
             "決めず『不明・複数』にします。")
 
+def classify_camera_coarse(inspections,regions,image_shape,fallback):
+    """First decide side view vs end view using body fronts and receding court areas."""
+    front_count=sum(any(str(v).startswith("正面") for v in i.get("body_directions",[]))
+                    for i in inspections)
+    h,w=image_shape[:2]
+    receding=[]
+    for region in regions:
+        x1,y1,x2,y2=map(float,region.get("line",(0,0,0,0)))
+        dx=abs(x2-x1); dy=abs(y2-y1)
+        if dy>dx*1.25 and max(y1,y2)>h*.78 and dy>h*.20:receding.append(region)
+    if front_count>=3 or receding:
+        confidence=.88 if front_count>=3 and receding else .74
+        reasons=[]
+        if front_count>=3:reasons.append(f"5枚中{front_count}枚で身体の正面（おへそ側）を検出")
+        if receding:reasons.append(f"手前から奥へ伸びる白線面を{len(receding)}本検出")
+        return "横(側不明)",confidence,"、".join(reasons)+"したため、まずサイド撮影と判定しました"
+    return fallback
+
 def draw_direction_court_lines(frame,line_items,show_confidence=False,top_five=False):
     """Draw translucent yellow lines and baseline labels without hiding the source."""
     output=frame.copy(); items=sorted(line_items,key=lambda x:x.get("confidence",0),reverse=True)
     if top_five:items=items[:5]
     layer=output.copy()
     for item in items:
-        x1,y1,x2,y2=map(int,item["line"])
-        cv2.line(layer,(x1,y1),(x2,y2),(0,235,255),
-                 max(5,int(round(item.get("width",6)))),cv2.LINE_AA)
+        polygon=item.get("polygon")
+        if polygon:
+            cv2.fillPoly(layer,[np.asarray(polygon,dtype=np.int32)],(0,235,255),cv2.LINE_AA)
+        else:
+            x1,y1,x2,y2=map(int,item["line"])
+            cv2.line(layer,(x1,y1),(x2,y2),(0,235,255),
+                     max(5,int(round(item.get("width",6)))),cv2.LINE_AA)
     output=cv2.addWeighted(layer,.34,output,.66,0)
+    occupied=[]
     for item in items:
-        x1,y1,x2,y2=map(int,item["line"]); mx,my=(x1+x2)//2,(y1+y2)//2
+        x1,y1,x2,y2=map(int,item["line"])
+        center=item.get("centroid"); mx,my=(map(int,center) if center else ((x1+x2)//2,(y1+y2)//2))
         if item.get("baseline"):
             cv2.putText(output,"B",(mx-8,my+8),cv2.FONT_HERSHEY_SIMPLEX,.8,
                         (255,70,20),2,cv2.LINE_AA)
         if show_confidence:
-            cv2.putText(output,f"{float(item.get('confidence',0)):.2f}",(mx+6,my-7),
-                        cv2.FONT_HERSHEY_SIMPLEX,.48,(20,60,230),2,cv2.LINE_AA)
+            label=f"{float(item.get('confidence',0)):.2f}"; tx,ty=mx+8,my-8
+            tw,th=cv2.getTextSize(label,cv2.FONT_HERSHEY_SIMPLEX,.48,2)[0]
+            for _ in range(12):
+                box=(tx-2,ty-th-3,tx+tw+3,ty+4)
+                if not any(not (box[2]<b[0] or box[0]>b[2] or box[3]<b[1] or box[1]>b[3]) for b in occupied):break
+                ty+=th+8
+            occupied.append(box)
+            cv2.rectangle(output,(box[0],box[1]),(box[2],box[3]),(245,245,225),-1)
+            cv2.putText(output,label,(tx,ty),cv2.FONT_HERSHEY_SIMPLEX,.48,(20,60,230),2,cv2.LINE_AA)
     return output
 
 def point_segment_distance(point,line):
@@ -545,6 +614,14 @@ def point_segment_distance(point,line):
     vx=x2-x1; vy=y2-y1; den=vx*vx+vy*vy
     t=0 if den<=1e-9 else np.clip(((px-x1)*vx+(py-y1)*vy)/den,0,1)
     return math.hypot(px-(x1+t*vx),py-(y1+t*vy))
+
+def point_court_region_distance(point,region):
+    polygon=region.get("polygon")
+    if polygon:
+        signed=cv2.pointPolygonTest(np.asarray(polygon,dtype=np.float32),
+                                    tuple(map(float,point)),True)
+        return 0.0 if signed>=0 else abs(float(signed))
+    return point_segment_distance(point,region["line"])
 
 def yolo_face_direction(kps,min_conf=.18):
     """Infer visible face and 2D direction from YOLO Pose nose/eye/ear points."""
@@ -705,24 +782,20 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
                 "intersections":int(len(frame_intersections)),"vp_x":frame_vp,
                 "direction":local_dir,"confidence":float(local_conf),"reason":local_reason})
     finally:cap.release()
-    # 5枚は同じ固定コートなので、全フレームの線片を一度に統合し、共通の
-    # 中心線・幅・全長を全画像へ適用する。人物による一時的な遮蔽も補完される。
+    # 5枚の白画素を投票し、線ではなく共通の連結「面積」を抽出する。
+    common_regions=[]; median_frame=None
     if inspections and court_reference_frames:
         median_frame=np.median(np.stack(court_reference_frames),axis=0).astype(np.uint8)
-        common_bands=[b for b in merge_line_bands(all_court_candidates,median_frame.shape,
-                                                   rho_bin=max(28,int(median_frame.shape[1]*.05)))
-                      if b.get("support",0)>=2]
-        for band in common_bands:
-            band["confidence"]=court_line_confidence(median_frame,band["line"])
+        common_regions=detect_common_court_regions(court_reference_frames)
         for item in inspections:
             encoded=item.get("base_jpeg"); base=(cv2.imdecode(
                 np.frombuffer(encoded,dtype=np.uint8),cv2.IMREAD_COLOR) if encoded else None)
             if base is None:continue
-            line_items=[dict(b,baseline=False) for b in common_bands]
+            line_items=[dict(region,baseline=False) for region in common_regions]
             foot=item.get("foot"); player_h=item.get("player_height")
             if foot and player_h:
-                nearest=min(line_items,key=lambda x:point_segment_distance(foot,x["line"]),default=None)
-                if nearest and point_segment_distance(foot,nearest["line"])<=max(24,float(player_h)*.20):
+                nearest=min(line_items,key=lambda x:point_court_region_distance(foot,x),default=None)
+                if nearest and point_court_region_distance(foot,nearest)<=max(28,float(player_h)*.25):
                     nearest["baseline"]=True
             rendered=draw_direction_court_lines(base,line_items)
             ok_jpg,encoded=cv2.imencode(".jpg",rendered,[cv2.IMWRITE_JPEG_QUALITY,88])
@@ -735,6 +808,9 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
     vp_x=float(np.median(intersections)) if intersections else None
     direction,confidence,reason=classify_camera_direction_features(
         face_rate,convergence,vp_x,oblique_ratio)
+    if median_frame is not None:
+        direction,confidence,reason=classify_camera_coarse(
+            inspections,common_regions,median_frame.shape,(direction,confidence,reason))
     result={"direction":direction,"confidence":float(confidence),"reason":reason,
             "sample_count":valid_frames,"face_rate":face_rate,
             "convergence":convergence,"vp_x":vp_x,"inspections":inspections}
@@ -2723,7 +2799,7 @@ class TennisApp(tk.Tk):
         prior_meta=(meta.get("camera_dirs",[])+[None])[0]
         cam_var = tk.StringVar(value=saved_dir or prior_meta or estimated_dir)
         cam_frame = tk.Frame(right, bg=PANEL); cam_frame.pack(anchor="w", padx=8)
-        for cd in ["後ろ","横(フォア側)","横(バック側)","正面","不明・複数"]:
+        for cd in ["後ろ","横(側不明)","横(フォア側)","横(バック側)","正面","不明・複数"]:
             tk.Radiobutton(cam_frame, text=cd, variable=cam_var, value=cd,
                            bg=PANEL, fg=TEXT, activebackground=PANEL,
                            selectcolor=DARK2, font=_tk_font(9)).pack(side="left", padx=2)
