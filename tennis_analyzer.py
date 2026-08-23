@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v86"; APP_VERSION_DESC = "安定白線面積・足元色安全フィルター"
+APP_VERSION = "v87"; APP_VERSION_DESC = "全エッジ線分診断"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -617,6 +617,15 @@ def draw_direction_court_lines(frame,line_items,show_confidence=False,top_five=F
             cv2.putText(output,label,(tx,ty),cv2.FONT_HERSHEY_SIMPLEX,.48,(20,60,230),2,cv2.LINE_AA)
     return output
 
+def draw_all_edge_segments(frame,segments):
+    """Draw every pre-filter Hough edge segment as a thin red diagnostic line."""
+    output=frame.copy()
+    for row in segments or []:
+        if len(row)!=4:continue
+        x1,y1,x2,y2=map(int,row)
+        cv2.line(output,(x1,y1),(x2,y2),(35,35,245),1,cv2.LINE_AA)
+    return output
+
 def point_segment_distance(point,line):
     px,py=map(float,point); x1,y1,x2,y2=map(float,line)
     vx=x2-x1; vy=y2-y1; den=vx*vx+vy*vy
@@ -826,6 +835,7 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             ok_jpg,encoded=cv2.imencode(".jpg",rendered,[cv2.IMWRITE_JPEG_QUALITY,88])
             inspections.append({"time":float(t),"frame_jpeg":encoded.tobytes() if ok_jpg else None,
                 "base_jpeg":base_encoded.tobytes() if ok_base else None,"court_line_items":line_items,
+                "all_edge_segments":[list(map(int,row)) for row in line_rows],
                 "faces":int(len(face_directions)),"face_directions":face_directions,
                 "body_directions":body_directions,
                 "people":int(len(people)),"face_detector":bool(yolo_pose),"lines":int(frame_lines),
@@ -2753,6 +2763,7 @@ class TennisApp(tk.Tk):
             except Exception:pass
         toolbar=tk.Frame(zoom,bg=PANEL); toolbar.pack(fill="x")
         show_conf=tk.BooleanVar(value=False); top_five=tk.BooleanVar(value=False)
+        show_all_edges=tk.BooleanVar(value=False)
         image_label=tk.Label(zoom,bg="#17231c"); image_label.pack(fill="both",expand=True,padx=10,pady=10)
         info=tk.StringVar(); tk.Label(toolbar,textvariable=info,bg=PANEL,fg=TEXT,
                                      font=_tk_font(10,True)).pack(side="left",padx=12,pady=8)
@@ -2761,9 +2772,11 @@ class TennisApp(tk.Tk):
             bgr=cv2.imdecode(np.frombuffer(encoded,dtype=np.uint8),cv2.IMREAD_COLOR) if encoded else None
             if bgr is None:return
             line_items=item.get("court_line_items",[])
+            all_edges=item.get("all_edge_segments",[])
             shown=sorted(line_items,key=lambda x:x.get("confidence",0),reverse=True)
             if top_five.get():shown=shown[:5]
             rendered=draw_direction_court_lines(bgr,line_items,show_conf.get(),top_five.get())
+            if show_all_edges.get():rendered=draw_all_edge_segments(rendered,all_edges)
             image=Image.fromarray(cv2.cvtColor(rendered,cv2.COLOR_BGR2RGB))
             max_w=max(900,image_label.winfo_width()-16)
             max_h=max(600,image_label.winfo_height()-16)
@@ -2772,12 +2785,14 @@ class TennisApp(tk.Tk):
                                Image.LANCZOS)
             photo=ImageTk.PhotoImage(image)
             image_label.configure(image=photo); image_label.image=photo
-            info.set(f"{float(item.get('time',0)):.1f}秒　表示 {len(shown)}/{len(line_items)}本")
+            edge_text=f"　一般エッジ {len(all_edges)}本" if show_all_edges.get() else ""
+            info.set(f"{float(item.get('time',0)):.1f}秒　コート線 {len(shown)}/{len(line_items)}本{edge_text}")
         def add_toggle(text,var):
             tk.Checkbutton(toolbar,text=text,variable=var,command=render,bg=PANEL,fg=TEXT,
                            activebackground=PANEL,selectcolor=DARK2,
                            font=_tk_font(10,True)).pack(side="right",padx=8,pady=7)
         add_toggle("Confidence表示",show_conf); add_toggle("Confidence上位5本のみ",top_five)
+        add_toggle("全線分",show_all_edges)
         resize_job=[None]
         def resized(_event=None):
             if resize_job[0]:zoom.after_cancel(resize_job[0])

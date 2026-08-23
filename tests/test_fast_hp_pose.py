@@ -139,6 +139,13 @@ def test_line_is_rejected_only_when_both_sides_are_far_from_foot_color():
     assert not matched and d1>55 and d2>55
 
 
+def test_all_edge_segments_are_drawn_as_thin_red_lines():
+    frame=np.zeros((60,80,3),dtype=np.uint8)
+    rendered=TA.draw_all_edge_segments(frame,[[5,10,70,10],[20,5,20,50]])
+    assert rendered[10,30,2]>200 and rendered[10,30,0]<80
+    assert rendered[30,20,2]>200 and rendered[30,20,0]<80
+
+
 def test_yolo_face_direction_uses_nose_between_eyes():
     kps=np.zeros((17,3),dtype=float)
     kps[0]=[50,40,.9]; kps[1]=[45,35,.9]; kps[2]=[55,35,.9]
