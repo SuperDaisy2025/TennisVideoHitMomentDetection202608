@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v81"; APP_VERSION_DESC = "線Confidence・拡大診断"
+APP_VERSION = "v82"; APP_VERSION_DESC = "5枚共通コート面積・身体向き"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -461,6 +461,36 @@ def dedupe_line_segments(lines,rho_bin=14,angle_bin=6):
         if key not in best or length>best[key][0]:best[key]=(length,(x1,y1,x2,y2))
     return [value[1] for value in best.values()]
 
+def merge_line_bands(lines,image_shape,rho_bin=28,angle_bin=7):
+    """Merge parallel Hough edges and fragments into full-length center bands."""
+    h,w=image_shape[:2]; groups=[]
+    for line in lines:
+        x1,y1,x2,y2=map(float,line); dx=x2-x1; dy=y2-y1; length=math.hypot(dx,dy)
+        if length<1:continue
+        angle=(math.degrees(math.atan2(dy,dx))+180)%180
+        theta=math.radians(angle); ux=math.cos(theta); uy=math.sin(theta); nx=-uy; ny=ux
+        rho=((x1+x2)*.5)*nx+((y1+y2)*.5)*ny
+        group=next((g for g in groups if abs(angle-float(np.mean(g["angles"])))<=angle_bin and
+                    abs(rho-float(np.mean(g["rhos"])))<=rho_bin),None)
+        if group is None:
+            group={"values":[],"angles":[],"rhos":[]}; groups.append(group)
+        group["values"].append((line,length,angle)); group["angles"].append(angle); group["rhos"].append(rho)
+    bands=[]
+    for group in groups:
+        values=group["values"]
+        weight=sum(v[1] for v in values); angle=sum(v[2]*v[1] for v in values)/weight
+        theta=math.radians(angle); ux=math.cos(theta); uy=math.sin(theta); nx=-uy; ny=ux
+        rhos=[]; projections=[]
+        for (x1,y1,x2,y2),_,_ in values:
+            rhos.extend((x1*nx+y1*ny,x2*nx+y2*ny))
+            projections.extend((x1*ux+y1*uy,x2*ux+y2*uy))
+        rho=float(np.median(rhos)); lo=float(min(projections)); hi=float(max(projections))
+        p1=(int(np.clip(round(lo*ux+rho*nx),0,w-1)),int(np.clip(round(lo*uy+rho*ny),0,h-1)))
+        p2=(int(np.clip(round(hi*ux+rho*nx),0,w-1)),int(np.clip(round(hi*uy+rho*ny),0,h-1)))
+        width=float(max(6,min(40,np.percentile(rhos,90)-np.percentile(rhos,10)+4)))
+        bands.append({"line":(*p1,*p2),"width":width,"support":len(values)})
+    return bands
+
 def court_line_confidence(frame,line):
     """Heuristic confidence from whiteness, length and court-side location."""
     x1,y1,x2,y2=map(float,line); h,w=frame.shape[:2]
@@ -487,7 +517,8 @@ def camera_direction_explanation(estimate):
             f"YOLO顔は{faces}枚で確認しました。ただし選手はプレー中に向きを変えるため、顔向きは"
             f"撮影方向の決定には使っていません。白いコート線候補は延べ{lines}本、斜線の収束度は"
             f"{conv:.2f}、代表消失点は{vp_text}です。{estimate.get('reason','')}。"
-            "線情報が弱い場合は無理に正面・後ろと決めず『不明・複数』にします。")
+            "コート線は5枚の検出を統合した共通結果です。線情報が弱い場合は無理に正面・後ろと"
+            "決めず『不明・複数』にします。")
 
 def draw_direction_court_lines(frame,line_items,show_confidence=False,top_five=False):
     """Draw translucent yellow lines and baseline labels without hiding the source."""
@@ -496,7 +527,8 @@ def draw_direction_court_lines(frame,line_items,show_confidence=False,top_five=F
     layer=output.copy()
     for item in items:
         x1,y1,x2,y2=map(int,item["line"])
-        cv2.line(layer,(x1,y1),(x2,y2),(0,235,255),6,cv2.LINE_AA)
+        cv2.line(layer,(x1,y1),(x2,y2),(0,235,255),
+                 max(5,int(round(item.get("width",6)))),cv2.LINE_AA)
     output=cv2.addWeighted(layer,.34,output,.66,0)
     for item in items:
         x1,y1,x2,y2=map(int,item["line"]); mx,my=(x1+x2)//2,(y1+y2)//2
@@ -529,6 +561,20 @@ def yolo_face_direction(kps,min_conf=.18):
     if visible(2):return True,"斜め・画面左向きの可能性"
     return True,"顔位置のみ（向き不明）"
 
+def yolo_body_direction(kps,min_conf=.20):
+    """Infer navel-side/back/side from anatomical shoulder and hip ordering."""
+    if kps is None or len(kps)<13:return "検出なし"
+    visible=lambda i:len(kps[i])>=3 and float(kps[i][2])>=min_conf
+    deltas=[float(kps[l][0])-float(kps[r][0]) for l,r in ((5,6),(11,12))
+            if visible(l) and visible(r)]
+    if not deltas:return "身体向き不明"
+    torso_h=0.0
+    if all(visible(i) for i in (5,6,11,12)):
+        shoulder_y=(float(kps[5][1])+float(kps[6][1]))*.5
+        hip_y=(float(kps[11][1])+float(kps[12][1]))*.5; torso_h=abs(hip_y-shoulder_y)
+    if torso_h>1 and float(np.mean(np.abs(deltas)))/torso_h<.28:return "横向き"
+    return "正面（おへそ側）" if float(np.mean(deltas))>0 else "背面"
+
 def estimate_camera_direction_fast(video_path,max_samples=5):
     """Estimate direction from a few 640px frames using court lines and face cues."""
     cap=cv2.VideoCapture(video_path)
@@ -538,6 +584,7 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
     sample_end=min(duration,60.0)
     times=camera_sample_times(sample_end,max_samples)
     face_hits=0; valid_frames=0; oblique_total=0; line_total=0; intersections=[]; inspections=[]
+    all_court_candidates=[]; court_reference_frames=[]
     try:
         hog=cv2.HOGDescriptor(); hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
         yolo_pose=None
@@ -554,7 +601,7 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             valid_frames+=1; h0,w0=frame.shape[:2]
             scale=min(1.0,640.0/max(w0,1)); frame=cv2.resize(frame,None,fx=scale,fy=scale)
             gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY); h,w=gray.shape
-            people=[]; pose_keypoints=[]; face_directions=[]
+            people=[]; pose_keypoints=[]; face_directions=[]; body_directions=[]
             if yolo_pose is not None:
                 try:
                     detected=yolo_pose.predict(frame,verbose=False,conf=.25)[0]
@@ -569,6 +616,7 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             for kps in pose_keypoints:
                 found,face_dir=yolo_face_direction(kps)
                 if found:face_directions.append(face_dir)
+                body_directions.append(yolo_body_direction(kps))
             if face_directions:face_hits+=1
             blur=cv2.GaussianBlur(gray,(5,5),0)
             edges=cv2.Canny(blur,55,150)
@@ -621,6 +669,7 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
                 if length<max(55,w*.12):continue
                 line=(int(cx1),int(cy1),int(cx2),int(cy2))
                 court_candidates.append(line)
+            all_court_candidates.extend(court_candidates); court_reference_frames.append(frame.copy())
             # 太い白線の両縁を別々に数えないよう、角度・位置を広めに統合する。
             court_lines=dedupe_line_segments(court_candidates,rho_bin=max(26,int(w*.045)),angle_bin=8)
             primary=max(people,key=lambda b:max(0,b[2]-b[0])*max(0,b[3]-b[1]),default=None)
@@ -648,12 +697,38 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             inspections.append({"time":float(t),"frame_jpeg":encoded.tobytes() if ok_jpg else None,
                 "base_jpeg":base_encoded.tobytes() if ok_base else None,"court_line_items":line_items,
                 "faces":int(len(face_directions)),"face_directions":face_directions,
+                "body_directions":body_directions,
                 "people":int(len(people)),"face_detector":bool(yolo_pose),"lines":int(frame_lines),
                 "oblique":int(frame_oblique),"court_lines":int(len(court_lines)),
                 "baselines":int(len(baselines)),
+                "foot":foot,"player_height":((primary[3]-primary[1]) if primary else None),
                 "intersections":int(len(frame_intersections)),"vp_x":frame_vp,
                 "direction":local_dir,"confidence":float(local_conf),"reason":local_reason})
     finally:cap.release()
+    # 5枚は同じ固定コートなので、全フレームの線片を一度に統合し、共通の
+    # 中心線・幅・全長を全画像へ適用する。人物による一時的な遮蔽も補完される。
+    if inspections and court_reference_frames:
+        median_frame=np.median(np.stack(court_reference_frames),axis=0).astype(np.uint8)
+        common_bands=[b for b in merge_line_bands(all_court_candidates,median_frame.shape,
+                                                   rho_bin=max(28,int(median_frame.shape[1]*.05)))
+                      if b.get("support",0)>=2]
+        for band in common_bands:
+            band["confidence"]=court_line_confidence(median_frame,band["line"])
+        for item in inspections:
+            encoded=item.get("base_jpeg"); base=(cv2.imdecode(
+                np.frombuffer(encoded,dtype=np.uint8),cv2.IMREAD_COLOR) if encoded else None)
+            if base is None:continue
+            line_items=[dict(b,baseline=False) for b in common_bands]
+            foot=item.get("foot"); player_h=item.get("player_height")
+            if foot and player_h:
+                nearest=min(line_items,key=lambda x:point_segment_distance(foot,x["line"]),default=None)
+                if nearest and point_segment_distance(foot,nearest["line"])<=max(24,float(player_h)*.20):
+                    nearest["baseline"]=True
+            rendered=draw_direction_court_lines(base,line_items)
+            ok_jpg,encoded=cv2.imencode(".jpg",rendered,[cv2.IMWRITE_JPEG_QUALITY,88])
+            if ok_jpg:item["frame_jpeg"]=encoded.tobytes()
+            item["court_line_items"]=line_items; item["court_lines"]=len(line_items)
+            item["baselines"]=sum(bool(x.get("baseline")) for x in line_items)
     face_rate=face_hits/max(valid_frames,1)
     oblique_ratio=oblique_total/max(line_total,1)
     convergence=min(1.0,len(intersections)/max(valid_frames*12,1))
@@ -2488,9 +2563,11 @@ class TennisApp(tk.Tk):
                 vp="なし" if item.get("vp_x") is None else f"{float(item['vp_x']):.2f}"
                 face_note="" if item.get("face_detector") else "（YOLO Poseなし）"
                 face_dirs="、".join(item.get("face_directions",[])) or "検出なし"
+                body_dirs="、".join(item.get("body_directions",[])) or "検出なし"
                 report=(f"#{i+1}  {float(item.get('time',0)):.1f}秒\n"
                         f"人物: {item.get('people',0)}人 / 顔: {item.get('faces',0)}人{face_note}\n"
                         f"顔向き: {face_dirs}\n"
+                        f"身体向き: {body_dirs}\n"
                         f"白いコート線: {item.get('court_lines',0)}本  "
                         f"ベースライン候補: {item.get('baselines',0)}本 B\n"
                         f"線: {item.get('lines',0)}本（斜線 {item.get('oblique',0)}本）\n"
@@ -2524,6 +2601,10 @@ class TennisApp(tk.Tk):
         """Large evidence viewer with confidence and top-five toggles."""
         zoom=tk.Toplevel(self,bg=BG); zoom.title("コート線の拡大確認")
         zoom.geometry("1180x780"); zoom.transient(parent); zoom.grab_set()
+        try:zoom.state("zoomed")
+        except Exception:
+            try:zoom.attributes("-zoomed",True)
+            except Exception:pass
         toolbar=tk.Frame(zoom,bg=PANEL); toolbar.pack(fill="x")
         show_conf=tk.BooleanVar(value=False); top_five=tk.BooleanVar(value=False)
         image_label=tk.Label(zoom,bg="#17231c"); image_label.pack(fill="both",expand=True,padx=10,pady=10)
@@ -2538,7 +2619,12 @@ class TennisApp(tk.Tk):
             if top_five.get():shown=shown[:5]
             rendered=draw_direction_court_lines(bgr,line_items,show_conf.get(),top_five.get())
             image=Image.fromarray(cv2.cvtColor(rendered,cv2.COLOR_BGR2RGB))
-            image.thumbnail((1140,650),Image.LANCZOS); photo=ImageTk.PhotoImage(image)
+            max_w=max(900,image_label.winfo_width()-16)
+            max_h=max(600,image_label.winfo_height()-16)
+            scale=min(max_w/max(image.width,1),max_h/max(image.height,1))
+            image=image.resize((max(1,int(image.width*scale)),max(1,int(image.height*scale))),
+                               Image.LANCZOS)
+            photo=ImageTk.PhotoImage(image)
             image_label.configure(image=photo); image_label.image=photo
             info.set(f"{float(item.get('time',0)):.1f}秒　表示 {len(shown)}/{len(line_items)}本")
         def add_toggle(text,var):
@@ -2546,6 +2632,11 @@ class TennisApp(tk.Tk):
                            activebackground=PANEL,selectcolor=DARK2,
                            font=_tk_font(10,True)).pack(side="right",padx=8,pady=7)
         add_toggle("Confidence表示",show_conf); add_toggle("Confidence上位5本のみ",top_five)
+        resize_job=[None]
+        def resized(_event=None):
+            if resize_job[0]:zoom.after_cancel(resize_job[0])
+            resize_job[0]=zoom.after(120,render)
+        image_label.bind("<Configure>",resized)
         def close():zoom.destroy(); parent.grab_set()
         zoom.protocol("WM_DELETE_WINDOW",close); render()
 

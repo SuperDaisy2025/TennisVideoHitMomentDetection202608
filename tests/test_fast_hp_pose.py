@@ -75,6 +75,24 @@ def test_court_line_confidence_rewards_long_bright_line():
     assert TA.court_line_confidence(frame,(0,80,199,80))>.7
 
 
+def test_parallel_edges_merge_into_one_area_band_and_extend_fragments():
+    lines=[(20,40,90,40),(22,50,95,50),(80,42,180,42)]
+    bands=TA.merge_line_bands(lines,(100,200,3),rho_bin=28,angle_bin=7)
+    assert len(bands)==1
+    assert bands[0]["width"]>=10
+    x_values=(bands[0]["line"][0],bands[0]["line"][2])
+    assert min(x_values)<=22 and max(x_values)>=178
+
+
+def test_yolo_body_direction_uses_anatomical_left_right_order():
+    kps=np.zeros((17,3),dtype=float)
+    for i,x,y in ((5,70,30),(6,30,30),(11,65,70),(12,35,70)):
+        kps[i]=[x,y,.9]
+    assert TA.yolo_body_direction(kps)=="正面（おへそ側）"
+    kps[[5,6]]=kps[[6,5]]; kps[[11,12]]=kps[[12,11]]
+    assert TA.yolo_body_direction(kps)=="背面"
+
+
 def test_yolo_face_direction_uses_nose_between_eyes():
     kps=np.zeros((17,3),dtype=float)
     kps[0]=[50,40,.9]; kps[1]=[45,35,.9]; kps[2]=[55,35,.9]
