@@ -26,9 +26,9 @@ def feat(x, y, serve=False, stroke=False, angle=120.0):
     }
 
 
-def test_camera_direction_prefers_visible_face_as_front():
+def test_camera_direction_does_not_treat_player_face_as_camera_front():
     direction,confidence,_=TA.classify_camera_direction_features(.7,.3,.5,.6)
-    assert direction=="正面" and confidence>.7
+    assert direction=="後ろ" and confidence>.7
 
 
 def test_camera_direction_uses_center_vanishing_point_as_rear():
@@ -63,6 +63,18 @@ def test_duplicate_court_segments_are_consolidated():
     assert len(TA.dedupe_line_segments(lines))==2
 
 
+def test_direction_explanation_states_that_face_is_not_decisive():
+    text=TA.camera_direction_explanation({"direction":"不明・複数","confidence":.25,
+        "convergence":0,"vp_x":None,"reason":"線不足","inspections":[]})
+    assert "顔向きは撮影方向の決定には使っていません" in text
+
+
+def test_court_line_confidence_rewards_long_bright_line():
+    frame=np.zeros((100,200,3),dtype=np.uint8)
+    frame[79:82,:]=255
+    assert TA.court_line_confidence(frame,(0,80,199,80))>.7
+
+
 def test_yolo_face_direction_uses_nose_between_eyes():
     kps=np.zeros((17,3),dtype=float)
     kps[0]=[50,40,.9]; kps[1]=[45,35,.9]; kps[2]=[55,35,.9]
@@ -71,10 +83,6 @@ def test_yolo_face_direction_uses_nose_between_eyes():
     assert TA.yolo_face_direction(kps)==(True,"画面右向き")
 
 
-def test_court_boundary_with_different_side_colors_is_rejected_by_distance():
-    frame=np.zeros((100,100,3),dtype=np.uint8)
-    frame[:50]=[0,150,0]; frame[50:]=[170,170,170]
-    assert TA.line_side_color_difference(frame,(10,50,90,50),offset=8)>32
 
 
 def classify(features):

@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v80"; APP_VERSION_DESC = "YOLO顔向き・ベースライン診断"
+APP_VERSION = "v81"; APP_VERSION_DESC = "線Confidence・拡大診断"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -412,8 +412,8 @@ def estimate_noise_metrics(data):
 
 def classify_camera_direction_features(face_rate,convergence,vp_x,oblique_ratio):
     """Fast, conservative mapping of visual cues to the popup camera choices."""
-    if face_rate>=.28:
-        return "正面",min(.92,.60+face_rate*.45),"顔が複数フレームで確認できました"
+    # 選手はプレー中にカメラ側も反対側も向く。顔は診断表示だけに使い、
+    # 撮影方向の決定根拠にはしない。
     if convergence>=.18 and vp_x is not None:
         if .32<=vp_x<=.68:
             return "後ろ",min(.90,.55+convergence*.9),"コート線が画面中央上方へ収束しています"
@@ -422,7 +422,7 @@ def classify_camera_direction_features(face_rate,convergence,vp_x,oblique_ratio)
         return "横(バック側)",min(.78,.48+convergence*.7),"コート線の消失点が右側です"
     if oblique_ratio>=.45:
         return "後ろ",.46,"斜めのコート線はありますが確信度が低めです"
-    return "不明・複数",.25,"十分なコート線・顔情報を取得できませんでした"
+    return "不明・複数",.25,"十分なコート線の収束情報を取得できませんでした"
 
 def normalize_hough_lines(lines):
     """Normalize OpenCV HoughLinesP output across (N,1,4)/(N,4)/(4,) variants."""
@@ -461,21 +461,52 @@ def dedupe_line_segments(lines,rho_bin=14,angle_bin=6):
         if key not in best or length>best[key][0]:best[key]=(length,(x1,y1,x2,y2))
     return [value[1] for value in best.values()]
 
-def line_side_color_difference(frame,line,offset=9,samples=11):
-    """Median Lab color distance between both sides of a candidate court line."""
-    x1,y1,x2,y2=map(float,line); dx=x2-x1; dy=y2-y1
-    length=math.hypot(dx,dy)
-    if length<1:return float("inf")
-    nx=-dy/length; ny=dx/length; h,w=frame.shape[:2]
-    lab=cv2.cvtColor(frame,cv2.COLOR_BGR2LAB); side_a=[]; side_b=[]
-    for ratio in np.linspace(.12,.88,samples):
-        x=x1+dx*ratio; y=y1+dy*ratio
-        points=((x+nx*offset,y+ny*offset),(x-nx*offset,y-ny*offset))
-        if all(0<=px<w and 0<=py<h for px,py in points):
-            side_a.append(lab[int(points[0][1]),int(points[0][0])].astype(float))
-            side_b.append(lab[int(points[1][1]),int(points[1][0])].astype(float))
-    if len(side_a)<max(3,samples//3):return float("inf")
-    return float(np.linalg.norm(np.median(side_a,axis=0)-np.median(side_b,axis=0)))
+def court_line_confidence(frame,line):
+    """Heuristic confidence from whiteness, length and court-side location."""
+    x1,y1,x2,y2=map(float,line); h,w=frame.shape[:2]
+    length=math.hypot(x2-x1,y2-y1); hsv=cv2.cvtColor(frame,cv2.COLOR_BGR2HSV)
+    values=[]
+    for ratio in np.linspace(.05,.95,15):
+        x=int(np.clip(x1+(x2-x1)*ratio,0,w-1)); y=int(np.clip(y1+(y2-y1)*ratio,0,h-1))
+        values.append(hsv[y,x])
+    white=np.mean([max(0.0,min(1.0,(float(v[2])-150)/90))*
+                   max(0.0,min(1.0,(85-float(v[1]))/85)) for v in values])
+    length_score=min(1.0,length/max(w*.45,1)); lower=min(1.0,max(y1,y2)/max(h*.75,1))
+    return float(np.clip(.58*white+.27*length_score+.15*lower,0,1))
+
+def camera_direction_explanation(estimate):
+    """Human-readable audit trail for the overall camera-direction result."""
+    direction=estimate.get("direction","不明・複数")
+    conf=float(estimate.get("confidence",0)); conv=float(estimate.get("convergence",0))
+    vp=estimate.get("vp_x"); inspections=estimate.get("inspections",[])
+    people=sum(int(i.get("people",0)>0) for i in inspections)
+    faces=sum(int(i.get("faces",0)>0) for i in inspections)
+    lines=sum(int(i.get("court_lines",0)) for i in inspections)
+    vp_text="検出なし" if vp is None else f"画面幅の{float(vp):.2f}位置"
+    return (f"総合判定は「{direction}」（信頼度 {conf:.0%}）です。5枚中、人物は{people}枚、"
+            f"YOLO顔は{faces}枚で確認しました。ただし選手はプレー中に向きを変えるため、顔向きは"
+            f"撮影方向の決定には使っていません。白いコート線候補は延べ{lines}本、斜線の収束度は"
+            f"{conv:.2f}、代表消失点は{vp_text}です。{estimate.get('reason','')}。"
+            "線情報が弱い場合は無理に正面・後ろと決めず『不明・複数』にします。")
+
+def draw_direction_court_lines(frame,line_items,show_confidence=False,top_five=False):
+    """Draw translucent yellow lines and baseline labels without hiding the source."""
+    output=frame.copy(); items=sorted(line_items,key=lambda x:x.get("confidence",0),reverse=True)
+    if top_five:items=items[:5]
+    layer=output.copy()
+    for item in items:
+        x1,y1,x2,y2=map(int,item["line"])
+        cv2.line(layer,(x1,y1),(x2,y2),(0,235,255),6,cv2.LINE_AA)
+    output=cv2.addWeighted(layer,.34,output,.66,0)
+    for item in items:
+        x1,y1,x2,y2=map(int,item["line"]); mx,my=(x1+x2)//2,(y1+y2)//2
+        if item.get("baseline"):
+            cv2.putText(output,"B",(mx-8,my+8),cv2.FONT_HERSHEY_SIMPLEX,.8,
+                        (255,70,20),2,cv2.LINE_AA)
+        if show_confidence:
+            cv2.putText(output,f"{float(item.get('confidence',0)):.2f}",(mx+6,my-7),
+                        cv2.FONT_HERSHEY_SIMPLEX,.48,(20,60,230),2,cv2.LINE_AA)
+    return output
 
 def point_segment_distance(point,line):
     px,py=map(float,point); x1,y1,x2,y2=map(float,line)
@@ -589,32 +620,33 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
                 length=math.hypot(float(cx2-cx1),float(cy2-cy1))
                 if length<max(55,w*.12):continue
                 line=(int(cx1),int(cy1),int(cx2),int(cy2))
-                # 本物のコート線は両側が同じコート面。フェンス境界などを除外。
-                if line_side_color_difference(frame,line,offset=max(6,int(w*.012)))<=32:
-                    court_candidates.append(line)
-            court_lines=dedupe_line_segments(court_candidates)
+                court_candidates.append(line)
+            # 太い白線の両縁を別々に数えないよう、角度・位置を広めに統合する。
+            court_lines=dedupe_line_segments(court_candidates,rho_bin=max(26,int(w*.045)),angle_bin=8)
             primary=max(people,key=lambda b:max(0,b[2]-b[0])*max(0,b[3]-b[1]),default=None)
             foot=((primary[0]+primary[2])*.5,primary[3]) if primary else None
-            baselines=[]
+            line_items=[]
             for cx1,cy1,cx2,cy2 in court_lines:
-                near_feet=(foot is not None and point_segment_distance(foot,(cx1,cy1,cx2,cy2))
-                           <=max(24,(primary[3]-primary[1])*.20))
-                mx,my=(cx1+cx2)//2,(cy1+cy2)//2
-                if near_feet:
-                    baselines.append((cx1,cy1,cx2,cy2))
-                    cv2.putText(overlay,"B",(mx-7,my+7),cv2.FONT_HERSHEY_SIMPLEX,
-                                .75,(255,80,20),2,cv2.LINE_AA)
-                else:
-                    # 線を塗らず、両端と中央へ★だけを置く。
-                    for sx,sy in ((cx1,cy1),(cx2,cy2),(mx,my)):
-                        cv2.putText(overlay,"*",(int(sx)-5,int(sy)+6),cv2.FONT_HERSHEY_SIMPLEX,
-                                    .72,(0,0,255),2,cv2.LINE_AA)
+                line=(cx1,cy1,cx2,cy2)
+                foot_distance=point_segment_distance(foot,line) if foot is not None else None
+                near_feet=(foot_distance is not None and foot_distance<=
+                           max(24,(primary[3]-primary[1])*.20))
+                line_items.append({"line":line,"confidence":court_line_confidence(frame,line),
+                                   "baseline":False,"near_feet":bool(near_feet),
+                                   "foot_distance":foot_distance})
+            # 太線の両縁や交差線が複数あっても、足元に最も近い1本だけをBとする。
+            near_items=[x for x in line_items if x.get("near_feet")]
+            if near_items:min(near_items,key=lambda x:x.get("foot_distance",float("inf")))["baseline"]=True
+            baselines=[x for x in line_items if x.get("baseline")]
             local_conv=min(1.0,len(frame_intersections)/12.0)
             local_dir,local_conf,local_reason=classify_camera_direction_features(
                 1.0 if face_directions else 0.0,local_conv,frame_vp,
                 frame_oblique/max(frame_lines,1))
-            ok_jpg,encoded=cv2.imencode(".jpg",overlay,[cv2.IMWRITE_JPEG_QUALITY,88])
+            ok_base,base_encoded=cv2.imencode(".jpg",overlay,[cv2.IMWRITE_JPEG_QUALITY,90])
+            rendered=draw_direction_court_lines(overlay,line_items)
+            ok_jpg,encoded=cv2.imencode(".jpg",rendered,[cv2.IMWRITE_JPEG_QUALITY,88])
             inspections.append({"time":float(t),"frame_jpeg":encoded.tobytes() if ok_jpg else None,
+                "base_jpeg":base_encoded.tobytes() if ok_base else None,"court_line_items":line_items,
                 "faces":int(len(face_directions)),"face_directions":face_directions,
                 "people":int(len(people)),"face_detector":bool(yolo_pose),"lines":int(frame_lines),
                 "oblique":int(frame_oblique),"court_lines":int(len(court_lines)),
@@ -628,9 +660,11 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
     vp_x=float(np.median(intersections)) if intersections else None
     direction,confidence,reason=classify_camera_direction_features(
         face_rate,convergence,vp_x,oblique_ratio)
-    return {"direction":direction,"confidence":float(confidence),"reason":reason,
+    result={"direction":direction,"confidence":float(confidence),"reason":reason,
             "sample_count":valid_frames,"face_rate":face_rate,
             "convergence":convergence,"vp_x":vp_x,"inspections":inspections}
+    result["explanation"]=camera_direction_explanation(result)
+    return result
 
 def detect_peaks(data, sensitivity=0.5, min_gap=1.0, wall_mode=False,
                  use_frequency_filter=True):
@@ -2423,7 +2457,7 @@ class TennisApp(tk.Tk):
     def _show_direction_inspection_popup(self,path,estimate):
         """v78: 方向推定に使った5枚と、画像ごとの検出根拠を先に示す。"""
         win=tk.Toplevel(self,bg=BG); win.title("撮影方向 自動推定の確認")
-        win.geometry("1380x610"); win.transient(self); win.grab_set()
+        win.geometry("1380x735"); win.transient(self); win.grab_set()
         head=tk.Frame(win,bg=PANEL); head.pack(fill="x")
         tk.Label(head,text="撮影方向の自動推定 — 解析した5枚",
                  bg=PANEL,fg=ACCENT2,font=_tk_font(15,True)).pack(side="left",padx=14,pady=10)
@@ -2447,14 +2481,17 @@ class TennisApp(tk.Tk):
                         image.thumbnail((250,230),Image.LANCZOS); photo=ImageTk.PhotoImage(image)
                 if photo:
                     self._direction_inspection_photos.append(photo)
-                    tk.Label(card,image=photo,bg=DARK2).pack(pady=(8,5))
+                    image_label=tk.Label(card,image=photo,bg=DARK2,cursor="hand2")
+                    image_label.pack(pady=(8,5))
+                    image_label.bind("<Button-1>",lambda _e,it=item,parent=win:
+                                     self._show_direction_frame_zoom(it,parent))
                 vp="なし" if item.get("vp_x") is None else f"{float(item['vp_x']):.2f}"
                 face_note="" if item.get("face_detector") else "（YOLO Poseなし）"
                 face_dirs="、".join(item.get("face_directions",[])) or "検出なし"
                 report=(f"#{i+1}  {float(item.get('time',0)):.1f}秒\n"
                         f"人物: {item.get('people',0)}人 / 顔: {item.get('faces',0)}人{face_note}\n"
                         f"顔向き: {face_dirs}\n"
-                        f"白いコート線: {item.get('court_lines',0)}本 ★  "
+                        f"白いコート線: {item.get('court_lines',0)}本  "
                         f"ベースライン候補: {item.get('baselines',0)}本 B\n"
                         f"線: {item.get('lines',0)}本（斜線 {item.get('oblique',0)}本）\n"
                         f"交点: {item.get('intersections',0)}個 / 消失点X: {vp}\n"
@@ -2465,8 +2502,15 @@ class TennisApp(tk.Tk):
                 report=f"#{i+1}\n画像を取得できませんでした"
             tk.Label(card,text=report,bg=DARK2,fg=TEXT,justify="left",anchor="nw",
                      wraplength=245,font=_tk_font(10)).pack(fill="x",padx=8,pady=5)
+        explain_box=tk.Frame(win,bg=PANEL); explain_box.pack(fill="x",padx=10,pady=(0,6))
+        tk.Label(explain_box,text="総合判定の説明",bg=PANEL,fg=ACCENT2,
+                 font=_tk_font(10,True)).pack(anchor="w",padx=5,pady=(5,2))
+        explanation=tk.Text(explain_box,height=4,wrap="word",bg=DARK2,fg=TEXT,
+                            relief="flat",font=_tk_font(10),padx=8,pady=6)
+        explanation.pack(fill="x"); explanation.insert("1.0",estimate.get("explanation") or
+            camera_direction_explanation(estimate)); explanation.configure(state="disabled")
         foot=tk.Frame(win,bg=PANEL); foot.pack(fill="x")
-        tk.Label(foot,text="青枠=人物、緑枠=YOLO顔、赤い★=白いコート線、青いB=足元のベースライン候補、赤点=推定消失点",
+        tk.Label(foot,text="画像クリック=拡大　青枠=人物、緑枠=YOLO顔、薄い黄色=白い線、青いB=ベースライン候補",
                  bg=PANEL,fg=SUBTEXT,font=_tk_font(10)).pack(side="left",padx=14,pady=10)
         def _confirm():
             win.destroy(); self._show_video_info_popup(path,estimate)
@@ -2475,6 +2519,35 @@ class TennisApp(tk.Tk):
                       side="right",padx=12,pady=7,ipadx=15,ipady=4)
         tk.Button(foot,text="キャンセル",command=win.destroy,bg=DARK2,fg=TEXT,
                   font=_tk_font(10),relief="flat").pack(side="right",padx=4,pady=7,ipady=4)
+
+    def _show_direction_frame_zoom(self,item,parent):
+        """Large evidence viewer with confidence and top-five toggles."""
+        zoom=tk.Toplevel(self,bg=BG); zoom.title("コート線の拡大確認")
+        zoom.geometry("1180x780"); zoom.transient(parent); zoom.grab_set()
+        toolbar=tk.Frame(zoom,bg=PANEL); toolbar.pack(fill="x")
+        show_conf=tk.BooleanVar(value=False); top_five=tk.BooleanVar(value=False)
+        image_label=tk.Label(zoom,bg="#17231c"); image_label.pack(fill="both",expand=True,padx=10,pady=10)
+        info=tk.StringVar(); tk.Label(toolbar,textvariable=info,bg=PANEL,fg=TEXT,
+                                     font=_tk_font(10,True)).pack(side="left",padx=12,pady=8)
+        def render():
+            encoded=item.get("base_jpeg") or item.get("frame_jpeg")
+            bgr=cv2.imdecode(np.frombuffer(encoded,dtype=np.uint8),cv2.IMREAD_COLOR) if encoded else None
+            if bgr is None:return
+            line_items=item.get("court_line_items",[])
+            shown=sorted(line_items,key=lambda x:x.get("confidence",0),reverse=True)
+            if top_five.get():shown=shown[:5]
+            rendered=draw_direction_court_lines(bgr,line_items,show_conf.get(),top_five.get())
+            image=Image.fromarray(cv2.cvtColor(rendered,cv2.COLOR_BGR2RGB))
+            image.thumbnail((1140,650),Image.LANCZOS); photo=ImageTk.PhotoImage(image)
+            image_label.configure(image=photo); image_label.image=photo
+            info.set(f"{float(item.get('time',0)):.1f}秒　表示 {len(shown)}/{len(line_items)}本")
+        def add_toggle(text,var):
+            tk.Checkbutton(toolbar,text=text,variable=var,command=render,bg=PANEL,fg=TEXT,
+                           activebackground=PANEL,selectcolor=DARK2,
+                           font=_tk_font(10,True)).pack(side="right",padx=8,pady=7)
+        add_toggle("Confidence表示",show_conf); add_toggle("Confidence上位5本のみ",top_five)
+        def close():zoom.destroy(); parent.grab_set()
+        zoom.protocol("WM_DELETE_WINDOW",close); render()
 
     def _show_video_info_popup(self, path, direction_estimate=None):
         """v25: 動画選択時に動画情報を表示・設定するポップアップ"""
