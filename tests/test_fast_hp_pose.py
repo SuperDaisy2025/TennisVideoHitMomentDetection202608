@@ -50,7 +50,7 @@ def test_hough_line_shapes_are_normalized_without_scalar_unpacking():
 
 def test_camera_samples_avoid_setup_and_stop_frames():
     times=TA.camera_sample_times(60,5)
-    assert np.allclose(times,[3,16.5,30,43.5,57])
+    assert np.allclose(times,[6,18,30,42,54])
     assert TA.camera_sample_times(5,5)[0]==0
 
 
@@ -61,6 +61,20 @@ def test_missing_haar_cascade_is_resolved_without_opening_bad_path():
 def test_duplicate_court_segments_are_consolidated():
     lines=[(100,100,100,400),(102,105,102,398),(300,100,500,100)]
     assert len(TA.dedupe_line_segments(lines))==2
+
+
+def test_yolo_face_direction_uses_nose_between_eyes():
+    kps=np.zeros((17,3),dtype=float)
+    kps[0]=[50,40,.9]; kps[1]=[45,35,.9]; kps[2]=[55,35,.9]
+    assert TA.yolo_face_direction(kps)==(True,"正面向き")
+    kps[0,0]=59
+    assert TA.yolo_face_direction(kps)==(True,"画面右向き")
+
+
+def test_court_boundary_with_different_side_colors_is_rejected_by_distance():
+    frame=np.zeros((100,100,3),dtype=np.uint8)
+    frame[:50]=[0,150,0]; frame[50:]=[170,170,170]
+    assert TA.line_side_color_difference(frame,(10,50,90,50),offset=8)>32
 
 
 def classify(features):

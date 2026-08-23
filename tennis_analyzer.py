@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v79"; APP_VERSION_DESC = "人物・白線ベース撮影方向診断"
+APP_VERSION = "v80"; APP_VERSION_DESC = "YOLO顔向き・ベースライン診断"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -430,8 +430,8 @@ def normalize_hough_lines(lines):
     arr=np.asarray(lines)
     return arr.reshape(-1,4) if arr.size and arr.size%4==0 else np.empty((0,4),dtype=np.int32)
 
-def camera_sample_times(duration,count=5,edge_margin=3.0):
-    """Avoid setup/stop frames; use 3s after start through 3s before end."""
+def camera_sample_times(duration,count=5,edge_margin=6.0):
+    """Avoid setup/stop frames; use 6s after start through 6s before end."""
     duration=max(0.0,float(duration))
     if duration>edge_margin*2:
         return np.linspace(edge_margin,duration-edge_margin,count)
@@ -461,6 +461,43 @@ def dedupe_line_segments(lines,rho_bin=14,angle_bin=6):
         if key not in best or length>best[key][0]:best[key]=(length,(x1,y1,x2,y2))
     return [value[1] for value in best.values()]
 
+def line_side_color_difference(frame,line,offset=9,samples=11):
+    """Median Lab color distance between both sides of a candidate court line."""
+    x1,y1,x2,y2=map(float,line); dx=x2-x1; dy=y2-y1
+    length=math.hypot(dx,dy)
+    if length<1:return float("inf")
+    nx=-dy/length; ny=dx/length; h,w=frame.shape[:2]
+    lab=cv2.cvtColor(frame,cv2.COLOR_BGR2LAB); side_a=[]; side_b=[]
+    for ratio in np.linspace(.12,.88,samples):
+        x=x1+dx*ratio; y=y1+dy*ratio
+        points=((x+nx*offset,y+ny*offset),(x-nx*offset,y-ny*offset))
+        if all(0<=px<w and 0<=py<h for px,py in points):
+            side_a.append(lab[int(points[0][1]),int(points[0][0])].astype(float))
+            side_b.append(lab[int(points[1][1]),int(points[1][0])].astype(float))
+    if len(side_a)<max(3,samples//3):return float("inf")
+    return float(np.linalg.norm(np.median(side_a,axis=0)-np.median(side_b,axis=0)))
+
+def point_segment_distance(point,line):
+    px,py=map(float,point); x1,y1,x2,y2=map(float,line)
+    vx=x2-x1; vy=y2-y1; den=vx*vx+vy*vy
+    t=0 if den<=1e-9 else np.clip(((px-x1)*vx+(py-y1)*vy)/den,0,1)
+    return math.hypot(px-(x1+t*vx),py-(y1+t*vy))
+
+def yolo_face_direction(kps,min_conf=.18):
+    """Infer visible face and 2D direction from YOLO Pose nose/eye/ear points."""
+    if kps is None or len(kps)<5:return False,"検出なし"
+    visible=lambda i:len(kps[i])>=3 and float(kps[i][2])>=min_conf
+    if not visible(0):return False,"後ろ向きまたは顔不明"
+    if visible(1) and visible(2):
+        eye_mid=(float(kps[1][0])+float(kps[2][0]))*.5
+        eye_gap=max(abs(float(kps[1][0])-float(kps[2][0])),1.0)
+        shift=(float(kps[0][0])-eye_mid)/eye_gap
+        direction="画面右向き" if shift>.28 else "画面左向き" if shift<-.28 else "正面向き"
+        return True,direction
+    if visible(1):return True,"斜め・画面右向きの可能性"
+    if visible(2):return True,"斜め・画面左向きの可能性"
+    return True,"顔位置のみ（向き不明）"
+
 def estimate_camera_direction_fast(video_path,max_samples=5):
     """Estimate direction from a few 640px frames using court lines and face cues."""
     cap=cv2.VideoCapture(video_path)
@@ -471,15 +508,13 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
     times=camera_sample_times(sample_end,max_samples)
     face_hits=0; valid_frames=0; oblique_total=0; line_total=0; intersections=[]; inspections=[]
     try:
-        cascade_path=find_haar_cascade()
-        face_detector=cv2.CascadeClassifier(cascade_path) if cascade_path else None
         hog=cv2.HOGDescriptor(); hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-        yolo_people=None
-        local_yolo=os.path.join(os.path.dirname(os.path.abspath(__file__)),"yolov8n.pt")
+        yolo_pose=None
+        local_yolo=os.path.join(os.path.dirname(os.path.abspath(__file__)),"yolov8n-pose.pt")
         if os.path.isfile(local_yolo):
             try:
                 from ultralytics import YOLO
-                yolo_people=YOLO(local_yolo)
+                yolo_pose=YOLO(local_yolo)
             except Exception:pass
         for t in times:
             cap.set(cv2.CAP_PROP_POS_FRAMES,int(round(float(t)*fps)))
@@ -488,22 +523,22 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             valid_frames+=1; h0,w0=frame.shape[:2]
             scale=min(1.0,640.0/max(w0,1)); frame=cv2.resize(frame,None,fx=scale,fy=scale)
             gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY); h,w=gray.shape
-            faces=[]
-            if face_detector is not None and not face_detector.empty():
-                faces=face_detector.detectMultiScale(gray,scaleFactor=1.12,minNeighbors=4,
-                                                      minSize=(max(24,w//24),max(24,h//24)))
-                if len(faces)>0:face_hits+=1
-            # 外部モデル不要の全身検出。顔が小さい/横向きでも人数表示に使う。
-            people=[]
-            if yolo_people is not None:
+            people=[]; pose_keypoints=[]; face_directions=[]
+            if yolo_pose is not None:
                 try:
-                    detected=yolo_people.predict(frame,verbose=False,conf=.25,classes=[0])[0]
+                    detected=yolo_pose.predict(frame,verbose=False,conf=.25)[0]
                     if detected.boxes is not None:
                         people=[tuple(map(int,b)) for b in detected.boxes.xyxy.cpu().numpy()]
-                except Exception:people=[]
+                    if detected.keypoints is not None:
+                        pose_keypoints=list(detected.keypoints.data.cpu().numpy())
+                except Exception:people=[]; pose_keypoints=[]
             if not people:
                 hog_people,_=hog.detectMultiScale(frame,winStride=(8,8),padding=(8,8),scale=1.05)
                 people=[(int(x),int(y),int(x+pw),int(y+ph)) for x,y,pw,ph in hog_people]
+            for kps in pose_keypoints:
+                found,face_dir=yolo_face_direction(kps)
+                if found:face_directions.append(face_dir)
+            if face_directions:face_hits+=1
             blur=cv2.GaussianBlur(gray,(5,5),0)
             edges=cv2.Canny(blur,55,150)
             edges[:int(h*.18),:]=0
@@ -513,10 +548,15 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             # OpenCVの版により (N,1,4) / (N,4) が返るため、必ず4列へ正規化。
             line_rows=normalize_hough_lines(lines)
             overlay=frame.copy()
-            for x,y,fw,fh in faces:
-                cv2.rectangle(overlay,(int(x),int(y)),(int(x+fw),int(y+fh)),(50,220,80),2)
             for x1p,y1p,x2p,y2p in people:
                 cv2.rectangle(overlay,(x1p,y1p),(x2p,y2p),(255,170,40),2)
+            for kps in pose_keypoints:
+                visible=[p for p in kps[:5] if len(p)>=3 and float(p[2])>=.18]
+                if visible:
+                    xs=[float(p[0]) for p in visible]; ys=[float(p[1]) for p in visible]
+                    pad=max(6,int((max(xs)-min(xs)+max(ys)-min(ys))*.25))
+                    cv2.rectangle(overlay,(max(0,int(min(xs))-pad),max(0,int(min(ys))-pad)),
+                                  (min(w-1,int(max(xs))+pad),min(h-1,int(max(ys))+pad)),(50,220,80),2)
             for x1,y1,x2,y2 in line_rows:
                 dx=float(x2-x1); dy=float(y2-y1)
                 length=math.hypot(dx,dy)
@@ -548,22 +588,37 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             for cx1,cy1,cx2,cy2 in normalize_hough_lines(court_raw):
                 length=math.hypot(float(cx2-cx1),float(cy2-cy1))
                 if length<max(55,w*.12):continue
-                court_candidates.append((int(cx1),int(cy1),int(cx2),int(cy2)))
+                line=(int(cx1),int(cy1),int(cx2),int(cy2))
+                # 本物のコート線は両側が同じコート面。フェンス境界などを除外。
+                if line_side_color_difference(frame,line,offset=max(6,int(w*.012)))<=32:
+                    court_candidates.append(line)
             court_lines=dedupe_line_segments(court_candidates)
+            primary=max(people,key=lambda b:max(0,b[2]-b[0])*max(0,b[3]-b[1]),default=None)
+            foot=((primary[0]+primary[2])*.5,primary[3]) if primary else None
+            baselines=[]
             for cx1,cy1,cx2,cy2 in court_lines:
-                # 線を塗らず、両端と中央へ★だけを置く。
-                for sx,sy in ((cx1,cy1),(cx2,cy2),((cx1+cx2)//2,(cy1+cy2)//2)):
-                    cv2.putText(overlay,"*",(int(sx)-5,int(sy)+6),cv2.FONT_HERSHEY_SIMPLEX,
-                                .72,(0,0,255),2,cv2.LINE_AA)
+                near_feet=(foot is not None and point_segment_distance(foot,(cx1,cy1,cx2,cy2))
+                           <=max(24,(primary[3]-primary[1])*.20))
+                mx,my=(cx1+cx2)//2,(cy1+cy2)//2
+                if near_feet:
+                    baselines.append((cx1,cy1,cx2,cy2))
+                    cv2.putText(overlay,"B",(mx-7,my+7),cv2.FONT_HERSHEY_SIMPLEX,
+                                .75,(255,80,20),2,cv2.LINE_AA)
+                else:
+                    # 線を塗らず、両端と中央へ★だけを置く。
+                    for sx,sy in ((cx1,cy1),(cx2,cy2),(mx,my)):
+                        cv2.putText(overlay,"*",(int(sx)-5,int(sy)+6),cv2.FONT_HERSHEY_SIMPLEX,
+                                    .72,(0,0,255),2,cv2.LINE_AA)
             local_conv=min(1.0,len(frame_intersections)/12.0)
             local_dir,local_conf,local_reason=classify_camera_direction_features(
-                1.0 if len(faces)>0 else 0.0,local_conv,frame_vp,
+                1.0 if face_directions else 0.0,local_conv,frame_vp,
                 frame_oblique/max(frame_lines,1))
             ok_jpg,encoded=cv2.imencode(".jpg",overlay,[cv2.IMWRITE_JPEG_QUALITY,88])
             inspections.append({"time":float(t),"frame_jpeg":encoded.tobytes() if ok_jpg else None,
-                "faces":int(len(faces)),"people":int(max(len(people),len(faces))),
-                "face_detector":bool(cascade_path),"lines":int(frame_lines),
+                "faces":int(len(face_directions)),"face_directions":face_directions,
+                "people":int(len(people)),"face_detector":bool(yolo_pose),"lines":int(frame_lines),
                 "oblique":int(frame_oblique),"court_lines":int(len(court_lines)),
+                "baselines":int(len(baselines)),
                 "intersections":int(len(frame_intersections)),"vp_x":frame_vp,
                 "direction":local_dir,"confidence":float(local_conf),"reason":local_reason})
     finally:cap.release()
@@ -2394,10 +2449,13 @@ class TennisApp(tk.Tk):
                     self._direction_inspection_photos.append(photo)
                     tk.Label(card,image=photo,bg=DARK2).pack(pady=(8,5))
                 vp="なし" if item.get("vp_x") is None else f"{float(item['vp_x']):.2f}"
-                face_note="" if item.get("face_detector") else "（顔モデルなし）"
+                face_note="" if item.get("face_detector") else "（YOLO Poseなし）"
+                face_dirs="、".join(item.get("face_directions",[])) or "検出なし"
                 report=(f"#{i+1}  {float(item.get('time',0)):.1f}秒\n"
                         f"人物: {item.get('people',0)}人 / 顔: {item.get('faces',0)}人{face_note}\n"
-                        f"白いコート線: {item.get('court_lines',0)}本 ★\n"
+                        f"顔向き: {face_dirs}\n"
+                        f"白いコート線: {item.get('court_lines',0)}本 ★  "
+                        f"ベースライン候補: {item.get('baselines',0)}本 B\n"
                         f"線: {item.get('lines',0)}本（斜線 {item.get('oblique',0)}本）\n"
                         f"交点: {item.get('intersections',0)}個 / 消失点X: {vp}\n"
                         f"画像判定: {item.get('direction','不明・複数')} "
@@ -2408,7 +2466,7 @@ class TennisApp(tk.Tk):
             tk.Label(card,text=report,bg=DARK2,fg=TEXT,justify="left",anchor="nw",
                      wraplength=245,font=_tk_font(10)).pack(fill="x",padx=8,pady=5)
         foot=tk.Frame(win,bg=PANEL); foot.pack(fill="x")
-        tk.Label(foot,text="青枠=人物、緑枠=顔、赤い★=白いコート線、赤点=推定消失点",
+        tk.Label(foot,text="青枠=人物、緑枠=YOLO顔、赤い★=白いコート線、青いB=足元のベースライン候補、赤点=推定消失点",
                  bg=PANEL,fg=SUBTEXT,font=_tk_font(10)).pack(side="left",padx=14,pady=10)
         def _confirm():
             win.destroy(); self._show_video_info_popup(path,estimate)
