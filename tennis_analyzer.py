@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v77"; APP_VERSION_DESC = "撮影方向推定・段階表示"
+APP_VERSION = "v78"; APP_VERSION_DESC = "撮影方向5枚診断・DB同期"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -424,6 +424,12 @@ def classify_camera_direction_features(face_rate,convergence,vp_x,oblique_ratio)
         return "後ろ",.46,"斜めのコート線はありますが確信度が低めです"
     return "不明・複数",.25,"十分なコート線・顔情報を取得できませんでした"
 
+def normalize_hough_lines(lines):
+    """Normalize OpenCV HoughLinesP output across (N,1,4)/(N,4)/(4,) variants."""
+    if lines is None:return np.empty((0,4),dtype=np.int32)
+    arr=np.asarray(lines)
+    return arr.reshape(-1,4) if arr.size and arr.size%4==0 else np.empty((0,4),dtype=np.int32)
+
 def estimate_camera_direction_fast(video_path,max_samples=5):
     """Estimate direction from a few 640px frames using court lines and face cues."""
     cap=cv2.VideoCapture(video_path)
@@ -432,7 +438,7 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
     duration=frames/fps if fps>0 else 0
     sample_end=max(0,min(duration,60.0)-.05)
     times=np.linspace(0,sample_end,max_samples) if sample_end>0 else [0.0]
-    face_hits=0; valid_frames=0; oblique_total=0; line_total=0; intersections=[]
+    face_hits=0; valid_frames=0; oblique_total=0; line_total=0; intersections=[]; inspections=[]
     try:
         cascade_path=os.path.join(cv2.data.haarcascades,"haarcascade_frontalface_default.xml")
         face_detector=cv2.CascadeClassifier(cascade_path)
@@ -443,6 +449,7 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             valid_frames+=1; h0,w0=frame.shape[:2]
             scale=min(1.0,640.0/max(w0,1)); frame=cv2.resize(frame,None,fx=scale,fy=scale)
             gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY); h,w=gray.shape
+            faces=[]
             if not face_detector.empty():
                 faces=face_detector.detectMultiScale(gray,scaleFactor=1.12,minNeighbors=4,
                                                       minSize=(max(24,w//24),max(24,h//24)))
@@ -452,17 +459,22 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             edges[:int(h*.18),:]=0
             lines=cv2.HoughLinesP(edges,1,np.pi/180,threshold=max(35,w//14),
                                   minLineLength=max(45,w//9),maxLineGap=max(12,w//40))
-            if lines is None:continue
-            pos=[]; neg=[]
-            for x1,y1,x2,y2 in lines[:,0]:
+            pos=[]; neg=[]; frame_intersections=[]; frame_lines=0; frame_oblique=0
+            # OpenCVの版により (N,1,4) / (N,4) が返るため、必ず4列へ正規化。
+            line_rows=normalize_hough_lines(lines)
+            overlay=frame.copy()
+            for x,y,fw,fh in faces:
+                cv2.rectangle(overlay,(int(x),int(y)),(int(x+fw),int(y+fh)),(50,220,80),2)
+            for x1,y1,x2,y2 in line_rows:
                 dx=float(x2-x1); dy=float(y2-y1)
                 length=math.hypot(dx,dy)
                 if length<45 or abs(dx)<2:continue
                 slope=dy/dx; angle=abs(math.degrees(math.atan2(dy,dx)))
-                angle=min(angle,180-angle); line_total+=1
+                angle=min(angle,180-angle); line_total+=1; frame_lines+=1
                 if 15<=angle<=75:
-                    oblique_total+=1
+                    oblique_total+=1; frame_oblique+=1
                     (pos if slope>0 else neg).append((x1,y1,slope))
+                    cv2.line(overlay,(int(x1),int(y1)),(int(x2),int(y2)),(0,165,255),2)
             for a in pos[:12]:
                 for b in neg[:12]:
                     den=a[2]-b[2]
@@ -470,7 +482,19 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
                     ix=(b[1]-a[1]+a[2]*a[0]-b[2]*b[0])/den
                     iy=a[1]+a[2]*(ix-a[0])
                     if -.4*w<=ix<=1.4*w and -.5*h<=iy<=.75*h:
-                        intersections.append(ix/w)
+                        intersections.append(ix/w); frame_intersections.append(ix/w)
+            frame_vp=float(np.median(frame_intersections)) if frame_intersections else None
+            if frame_vp is not None:
+                cv2.circle(overlay,(int(np.clip(frame_vp*w,0,w-1)),max(8,int(h*.08))),7,(40,40,255),-1)
+            local_conv=min(1.0,len(frame_intersections)/12.0)
+            local_dir,local_conf,local_reason=classify_camera_direction_features(
+                1.0 if len(faces)>0 else 0.0,local_conv,frame_vp,
+                frame_oblique/max(frame_lines,1))
+            ok_jpg,encoded=cv2.imencode(".jpg",overlay,[cv2.IMWRITE_JPEG_QUALITY,88])
+            inspections.append({"time":float(t),"frame_jpeg":encoded.tobytes() if ok_jpg else None,
+                "faces":int(len(faces)),"lines":int(frame_lines),"oblique":int(frame_oblique),
+                "intersections":int(len(frame_intersections)),"vp_x":frame_vp,
+                "direction":local_dir,"confidence":float(local_conf),"reason":local_reason})
     finally:cap.release()
     face_rate=face_hits/max(valid_frames,1)
     oblique_ratio=oblique_total/max(line_total,1)
@@ -480,7 +504,7 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
         face_rate,convergence,vp_x,oblique_ratio)
     return {"direction":direction,"confidence":float(confidence),"reason":reason,
             "sample_count":valid_frames,"face_rate":face_rate,
-            "convergence":convergence,"vp_x":vp_x}
+            "convergence":convergence,"vp_x":vp_x,"inspections":inspections}
 
 def detect_peaks(data, sensitivity=0.5, min_gap=1.0, wall_mode=False,
                  use_frequency_filter=True):
@@ -2266,9 +2290,60 @@ class TennisApp(tk.Tk):
             def _done():
                 if (getattr(self,"_direction_estimate_token",None)==token and
                         self.video_path.get().strip()==path):
-                    self._show_video_info_popup(path,estimate)
+                    self._show_direction_inspection_popup(path,estimate)
             self.after(0,_done)
         threading.Thread(target=_worker,daemon=True).start()
+
+    def _show_direction_inspection_popup(self,path,estimate):
+        """v78: 方向推定に使った5枚と、画像ごとの検出根拠を先に示す。"""
+        win=tk.Toplevel(self,bg=BG); win.title("撮影方向 自動推定の確認")
+        win.geometry("1380x610"); win.transient(self); win.grab_set()
+        head=tk.Frame(win,bg=PANEL); head.pack(fill="x")
+        tk.Label(head,text="撮影方向の自動推定 — 解析した5枚",
+                 bg=PANEL,fg=ACCENT2,font=_tk_font(15,True)).pack(side="left",padx=14,pady=10)
+        tk.Label(head,text=(f"総合: {estimate.get('direction','不明・複数')}  "
+                 f"信頼度 {float(estimate.get('confidence',0)):.0%}  "
+                 f"{estimate.get('reason','')}"),bg=PANEL,fg=TEXT,
+                 font=_tk_font(11,True)).pack(side="left",padx=12)
+        cards=tk.Frame(win,bg=BG); cards.pack(fill="both",expand=True,padx=8,pady=8)
+        self._direction_inspection_photos=[]
+        inspections=list(estimate.get("inspections",[]))
+        for i in range(5):
+            card=tk.Frame(cards,bg=DARK2,highlightbackground=BORDER,highlightthickness=1)
+            card.pack(side="left",fill="both",expand=True,padx=4)
+            if i<len(inspections):
+                item=inspections[i]; encoded=item.get("frame_jpeg")
+                photo=None
+                if encoded:
+                    bgr=cv2.imdecode(np.frombuffer(encoded,dtype=np.uint8),cv2.IMREAD_COLOR)
+                    if bgr is not None:
+                        image=Image.fromarray(cv2.cvtColor(bgr,cv2.COLOR_BGR2RGB))
+                        image.thumbnail((250,230),Image.LANCZOS); photo=ImageTk.PhotoImage(image)
+                if photo:
+                    self._direction_inspection_photos.append(photo)
+                    tk.Label(card,image=photo,bg=DARK2).pack(pady=(8,5))
+                vp="なし" if item.get("vp_x") is None else f"{float(item['vp_x']):.2f}"
+                report=(f"#{i+1}  {float(item.get('time',0)):.1f}秒\n"
+                        f"顔: {item.get('faces',0)}人\n"
+                        f"線: {item.get('lines',0)}本（斜線 {item.get('oblique',0)}本）\n"
+                        f"交点: {item.get('intersections',0)}個 / 消失点X: {vp}\n"
+                        f"画像判定: {item.get('direction','不明・複数')} "
+                        f"({float(item.get('confidence',0)):.0%})\n"
+                        f"{item.get('reason','')}")
+            else:
+                report=f"#{i+1}\n画像を取得できませんでした"
+            tk.Label(card,text=report,bg=DARK2,fg=TEXT,justify="left",anchor="nw",
+                     wraplength=245,font=_tk_font(10)).pack(fill="x",padx=8,pady=5)
+        foot=tk.Frame(win,bg=PANEL); foot.pack(fill="x")
+        tk.Label(foot,text="緑枠=顔、オレンジ線=方向判定に使った斜線、赤点=推定消失点",
+                 bg=PANEL,fg=SUBTEXT,font=_tk_font(10)).pack(side="left",padx=14,pady=10)
+        def _confirm():
+            win.destroy(); self._show_video_info_popup(path,estimate)
+        tk.Button(foot,text="確認 — 動画情報へ",command=_confirm,bg=ACCENT2,fg="white",
+                  font=_tk_font(11,True),relief="flat",cursor="hand2").pack(
+                      side="right",padx=12,pady=7,ipadx=15,ipady=4)
+        tk.Button(foot,text="キャンセル",command=win.destroy,bg=DARK2,fg=TEXT,
+                  font=_tk_font(10),relief="flat").pack(side="right",padx=4,pady=7,ipady=4)
 
     def _show_video_info_popup(self, path, direction_estimate=None):
         """v25: 動画選択時に動画情報を表示・設定するポップアップ"""
@@ -5069,6 +5144,14 @@ class TennisApp(tk.Tk):
         tree=self._truth_summary_tree
         for item in tree.get_children():tree.delete(item)
         try:
+            # v78: 現在開いている動画のチェック済みHPを、最新の方向・感度・
+            # ピーク高さ・姿勢値で再保存してから集計する。
+            path=self.video_path.get().strip()
+            if path and self.peaks:
+                keys=load_ground_truth_keys(path)
+                for peak in self.peaks:
+                    key=(int(peak["rank"]),round(float(peak["time"]),3),self._hp_backend(peak))
+                    if key in keys:save_ground_truth(self._ground_truth_row(peak),checked=True)
             backfill_ground_truth_peak_energies()
             db_path=init_ground_truth_db(); con=sqlite3.connect(db_path)
             rows=con.execute("""SELECT camera_dir,content_type,shot_type,

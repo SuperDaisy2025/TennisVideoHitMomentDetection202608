@@ -41,6 +41,13 @@ def test_camera_direction_keeps_uncertain_evidence_unknown():
     assert direction=="不明・複数" and confidence<.5
 
 
+def test_hough_line_shapes_are_normalized_without_scalar_unpacking():
+    nested=np.array([[[1,2,3,4]],[[5,6,7,8]]],dtype=np.int32)
+    flat=np.array([[1,2,3,4],[5,6,7,8]],dtype=np.int32)
+    assert TA.normalize_hough_lines(nested).shape==(2,4)
+    assert np.array_equal(TA.normalize_hough_lines(nested),TA.normalize_hough_lines(flat))
+
+
 def classify(features):
     app = object.__new__(TA.TennisApp)
     return app._classify_hp_pose_triplet(
