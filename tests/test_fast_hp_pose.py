@@ -123,6 +123,23 @@ def test_local_contrast_detects_worn_line_on_dark_court():
     assert regions and max(r["line"][2]-r["line"][0] for r in regions)>150
 
 
+def test_foot_color_sampling_ignores_white_paint():
+    frame=np.full((120,200,3),(60,130,70),dtype=np.uint8)
+    TA.cv2.line(frame,(100,80),(100,119),(255,255,255),5)
+    sample=TA.sample_foot_court_color(frame,(100,85),100)
+    assert sample is not None
+    assert np.linalg.norm(np.asarray(sample["bgr"])-np.array([60,130,70]))<12
+
+
+def test_line_is_kept_when_either_side_matches_foot_court_color():
+    frame=np.full((120,200,3),(60,130,70),dtype=np.uint8)
+    frame[:,105:]=(120,70,40)
+    foot=TA.sample_foot_court_color(frame,(70,90),80)
+    region={"line":[105,10,105,110],"width":4}
+    matched,_,_=TA.court_region_color_match(frame,region,foot["lab"])
+    assert matched
+
+
 def test_yolo_face_direction_uses_nose_between_eyes():
     kps=np.zeros((17,3),dtype=float)
     kps[0]=[50,40,.9]; kps[1]=[45,35,.9]; kps[2]=[55,35,.9]

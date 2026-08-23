@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v84"; APP_VERSION_DESC = "暗色コート白線・表示定義改善"
+APP_VERSION = "v85"; APP_VERSION_DESC = "足元コート色による白線検証"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -664,6 +664,42 @@ def point_court_region_distance(point,region):
         return 0.0 if signed>=0 else abs(float(signed))
     return point_segment_distance(point,region["line"])
 
+def sample_foot_court_color(frame,foot,player_height):
+    """Sample the court beneath the feet while excluding shoes and white paint."""
+    if frame is None or foot is None:return None
+    h,w=frame.shape[:2]; px,py=map(float,foot); ph=max(float(player_height or h*.3),20)
+    rx=max(10,int(ph*.13)); y1=int(np.clip(py+2,0,h-1)); y2=int(np.clip(py+ph*.10,y1+1,h))
+    x1=int(np.clip(px-rx,0,w-1)); x2=int(np.clip(px+rx,x1+1,w))
+    patch=frame[y1:y2,x1:x2]
+    if patch.size==0:return None
+    hsv=cv2.cvtColor(patch,cv2.COLOR_BGR2HSV)
+    valid=(hsv[:,:,2]>45)&~((hsv[:,:,1]<65)&(hsv[:,:,2]>165))
+    pixels=patch[valid]
+    if len(pixels)<8:pixels=patch.reshape(-1,3)
+    bgr=np.median(pixels,axis=0).astype(np.uint8)
+    lab=cv2.cvtColor(bgr.reshape(1,1,3),cv2.COLOR_BGR2LAB)[0,0].astype(float)
+    return {"bgr":list(map(int,bgr)),"lab":list(map(float,lab)),
+            "sample_rect":[x1,y1,x2,y2]}
+
+def court_region_color_match(frame,region,target_lab,threshold=34.0):
+    """Require at least one side of a line area to match the foot court color."""
+    if frame is None or target_lab is None:return True,float("inf"),float("inf")
+    h,w=frame.shape[:2]; lab_frame=cv2.cvtColor(frame,cv2.COLOR_BGR2LAB)
+    x1,y1,x2,y2=map(float,region.get("line",(0,0,0,0)))
+    dx=x2-x1; dy=y2-y1; length=math.hypot(dx,dy)
+    if length<1:return False,float("inf"),float("inf")
+    nx=-dy/length; ny=dx/length; offset=max(7.0,float(region.get("width",4))*.6+4)
+    sides=[[],[]]
+    for ratio in np.linspace(.15,.85,11):
+        x=x1+dx*ratio; y=y1+dy*ratio
+        for si,sign in enumerate((1,-1)):
+            sx=int(round(x+nx*offset*sign)); sy=int(round(y+ny*offset*sign))
+            if 0<=sx<w and 0<=sy<h:sides[si].append(lab_frame[sy,sx].astype(float))
+    distances=[]; target=np.asarray(target_lab,dtype=float)
+    for values in sides:
+        distances.append(float(np.linalg.norm(np.median(values,axis=0)-target)) if values else float("inf"))
+    return min(distances)<=threshold,distances[0],distances[1]
+
 def yolo_face_direction(kps,min_conf=.18):
     """Infer visible face and 2D direction from YOLO Pose nose/eye/ear points."""
     if kps is None or len(kps)<5:return False,"検出なし"
@@ -792,6 +828,15 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             court_lines=dedupe_line_segments(court_candidates,rho_bin=max(26,int(w*.045)),angle_bin=8)
             primary=max(people,key=lambda b:max(0,b[2]-b[0])*max(0,b[3]-b[1]),default=None)
             foot=((primary[0]+primary[2])*.5,primary[3]) if primary else None
+            player_height=(primary[3]-primary[1]) if primary else None
+            court_sample=sample_foot_court_color(frame,foot,player_height)
+            if court_sample and foot:
+                cx=int(np.clip(foot[0]+max(16,float(player_height)*.14),10,w-10))
+                cy=int(np.clip(foot[1]+max(10,float(player_height)*.07),10,h-10))
+                color=tuple(court_sample["bgr"])
+                cv2.circle(overlay,(cx,cy),10,(255,255,255),-1,cv2.LINE_AA)
+                cv2.circle(overlay,(cx,cy),8,color,-1,cv2.LINE_AA)
+                cv2.circle(overlay,(cx,cy),8,(25,25,25),1,cv2.LINE_AA)
             line_items=[]
             for cx1,cy1,cx2,cy2 in court_lines:
                 line=(cx1,cy1,cx2,cy2)
@@ -819,7 +864,7 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
                 "people":int(len(people)),"face_detector":bool(yolo_pose),"lines":int(frame_lines),
                 "oblique":int(frame_oblique),"court_lines":int(len(court_lines)),
                 "baselines":int(len(baselines)),
-                "foot":foot,"player_height":((primary[3]-primary[1]) if primary else None),
+                "foot":foot,"player_height":player_height,"court_color":court_sample,
                 "intersections":int(len(frame_intersections)),"vp_x":frame_vp,
                 "direction":local_dir,"confidence":float(local_conf),"reason":local_reason})
     finally:cap.release()
@@ -835,6 +880,9 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             court_top=max(median_frame.shape[0]*.42,
                           median_foot[1]-float(np.median(heights))*.32)
         common_regions=detect_common_court_regions(court_reference_frames,court_top)
+        court_labs=[i["court_color"]["lab"] for i in inspections if i.get("court_color")]
+        target_court_lab=(np.median(np.asarray(court_labs,dtype=float),axis=0).tolist()
+                          if court_labs else None)
         if feet:
             median_foot=tuple(np.median(np.asarray(feet,dtype=float),axis=0))
             mw=median_frame.shape[1]
@@ -847,6 +895,14 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
                 float(r.get("width",0))>mw*.02 and
                 math.hypot(float(r["line"][2])-float(r["line"][0]),
                            float(r["line"][3])-float(r["line"][1]))<mw*.45)]
+        if target_court_lab is not None:
+            color_verified=[]
+            for region in common_regions:
+                matched,d1,d2=court_region_color_match(median_frame,region,target_court_lab)
+                region["court_color_match"]=bool(matched)
+                region["court_color_distance_sides"]=[d1,d2]
+                if matched:color_verified.append(region)
+            common_regions=color_verified
         for item in inspections:
             encoded=item.get("base_jpeg"); base=(cv2.imdecode(
                 np.frombuffer(encoded,dtype=np.uint8),cv2.IMREAD_COLOR) if encoded else None)
@@ -2700,10 +2756,14 @@ class TennisApp(tk.Tk):
                 face_note="" if item.get("face_detector") else "（YOLO Poseなし）"
                 face_dirs="、".join(item.get("face_directions",[])) or "検出なし"
                 body_dirs="、".join(item.get("body_directions",[])) or "検出なし"
+                court_color=item.get("court_color"); court_hex="取得なし"
+                if court_color:
+                    b,g,r=court_color.get("bgr",[0,0,0]); court_hex=f"#{r:02X}{g:02X}{b:02X}（画像の●）"
                 report=(f"#{i+1}  {float(item.get('time',0)):.1f}秒\n"
                         f"人物: {item.get('people',0)}人 / 顔: {item.get('faces',0)}人{face_note}\n"
                         f"顔向き: {face_dirs}\n"
                         f"身体向き: {body_dirs}\n"
+                        f"足元コート色: {court_hex}\n"
                         f"白線面積（Confidence対象）: {item.get('court_lines',0)}領域  "
                         f"ベースライン候補: {item.get('baselines',0)}本 B\n"
                         f"一般エッジ線分（方向参考）: {item.get('lines',0)}本"
@@ -2724,7 +2784,7 @@ class TennisApp(tk.Tk):
         explanation.pack(fill="x"); explanation.insert("1.0",estimate.get("explanation") or
             camera_direction_explanation(estimate)); explanation.configure(state="disabled")
         foot=tk.Frame(win,bg=PANEL); foot.pack(fill="x")
-        tk.Label(foot,text="画像クリック=拡大　青枠=人物、緑枠=YOLO顔、薄い黄色=白い線、青いB=ベースライン候補",
+        tk.Label(foot,text="画像クリック=拡大　青枠=人物、緑枠=YOLO顔、●=足元コート色、薄い黄色=色検証済み白線、青いB=ベースライン候補",
                  bg=PANEL,fg=SUBTEXT,font=_tk_font(10)).pack(side="left",padx=14,pady=10)
         def _confirm():
             win.destroy(); self._show_video_info_popup(path,estimate)
