@@ -48,6 +48,21 @@ def test_hough_line_shapes_are_normalized_without_scalar_unpacking():
     assert np.array_equal(TA.normalize_hough_lines(nested),TA.normalize_hough_lines(flat))
 
 
+def test_camera_samples_avoid_setup_and_stop_frames():
+    times=TA.camera_sample_times(60,5)
+    assert np.allclose(times,[3,16.5,30,43.5,57])
+    assert TA.camera_sample_times(5,5)[0]==0
+
+
+def test_missing_haar_cascade_is_resolved_without_opening_bad_path():
+    assert TA.find_haar_cascade("definitely_missing_cascade.xml") is None
+
+
+def test_duplicate_court_segments_are_consolidated():
+    lines=[(100,100,100,400),(102,105,102,398),(300,100,500,100)]
+    assert len(TA.dedupe_line_segments(lines))==2
+
+
 def classify(features):
     app = object.__new__(TA.TennisApp)
     return app._classify_hp_pose_triplet(
