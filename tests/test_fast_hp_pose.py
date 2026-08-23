@@ -113,6 +113,16 @@ def test_body_front_majority_makes_coarse_side_view():
     assert direction=="横(側不明)" and confidence>.7
 
 
+def test_local_contrast_detects_worn_line_on_dark_court():
+    frames=[]
+    for _ in range(5):
+        frame=np.full((120,220,3),70,dtype=np.uint8)
+        TA.cv2.line(frame,(10,95),(210,90),(155,155,155),3)
+        frames.append(frame)
+    regions=TA.detect_common_court_regions(frames,court_top=50)
+    assert regions and max(r["line"][2]-r["line"][0] for r in regions)>150
+
+
 def test_yolo_face_direction_uses_nose_between_eyes():
     kps=np.zeros((17,3),dtype=float)
     kps[0]=[50,40,.9]; kps[1]=[45,35,.9]; kps[2]=[55,35,.9]

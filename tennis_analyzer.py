@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v83"; APP_VERSION_DESC = "白線面積投票・サイド粗判定"
+APP_VERSION = "v84"; APP_VERSION_DESC = "暗色コート白線・表示定義改善"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -491,42 +491,78 @@ def merge_line_bands(lines,image_shape,rho_bin=28,angle_bin=7):
         bands.append({"line":(*p1,*p2),"width":width,"support":len(values)})
     return bands
 
-def detect_common_court_regions(frames):
+def detect_common_court_regions(frames,court_top=None):
     """Detect stable white court *areas* by pixel voting across fixed-camera frames."""
     if not frames:return []
     h,w=frames[0].shape[:2]; masks=[]
     for frame in frames:
         hsv=cv2.cvtColor(frame,cv2.COLOR_BGR2HSV)
-        mask=cv2.inRange(hsv,np.array([0,0,175],np.uint8),np.array([180,72,255],np.uint8))
-        mask[:int(h*.42),:]=0
-        masks.append(mask>0)
-    votes=np.sum(np.stack(masks),axis=0)
+        lab=cv2.cvtColor(frame,cv2.COLOR_BGR2LAB); light=lab[:,:,0]
+        background=cv2.GaussianBlur(light,(0,0),7.0)
+        local_bright=cv2.subtract(light,background)
+        # 絶対的な白さに加え、暗色コート上で周囲より明るい細線を拾う。
+        mask=(((hsv[:,:,1]<78)&(hsv[:,:,2]>175)) |
+              ((hsv[:,:,1]<90)&(hsv[:,:,2]>120)&(local_bright>18))).astype(np.uint8)*255
+        mask[:int(court_top if court_top is not None else h*.42),:]=0
+        masks.append(mask)
+    votes=np.sum(np.stack([m>0 for m in masks]),axis=0)
     common=(votes>=max(2,int(math.ceil(len(masks)*.4)))).astype(np.uint8)*255
-    common=cv2.morphologyEx(common,cv2.MORPH_OPEN,np.ones((3,3),np.uint8))
-    common=cv2.morphologyEx(common,cv2.MORPH_CLOSE,np.ones((7,7),np.uint8))
+    # 細線をopeningで消さず、小さな圧縮切れだけを接続する。
+    common=cv2.morphologyEx(common,cv2.MORPH_CLOSE,np.ones((3,3),np.uint8))
     count,labels,stats,centroids=cv2.connectedComponentsWithStats(common,8)
     median_frame=np.median(np.stack(frames),axis=0).astype(np.uint8); regions=[]
     for label in range(1,count):
         area=int(stats[label,cv2.CC_STAT_AREA])
-        if area<max(40,int(w*h*.00012)):continue
+        if area<max(28,int(w*h*.00006)):continue
         ys,xs=np.where(labels==label)
         if len(xs)<2:continue
         points=np.column_stack((xs,ys)).astype(np.float32)
         mean,eigenvectors,eigenvalues=cv2.PCACompute2(points,mean=None)
         ux,uy=map(float,eigenvectors[0]); projections=(points-mean[0])@eigenvectors[0]
         length=float(np.max(projections)-np.min(projections)); width=float(area/max(length,1))
-        if length<w*.07 or length/max(width,1)<2.0:continue
+        eigen_ratio=float(eigenvalues[0,0]/max(float(eigenvalues[1,0]),1e-6))
+        if (length<w*.10 or width>max(36,w*.065) or
+                length/max(width,1)<2.5 or eigen_ratio<4.0):continue
         p1=mean[0]+eigenvectors[0]*np.min(projections); p2=mean[0]+eigenvectors[0]*np.max(projections)
         component=(labels==label).astype(np.uint8)*255
         contours,_=cv2.findContours(component,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
         contour=max(contours,key=cv2.contourArea)
         polygon=cv2.approxPolyDP(contour,1.5,True).reshape(-1,2).tolist()
+        ok_mask,mask_encoded=cv2.imencode(".png",component)
         stability=float(np.mean(votes[labels==label])/max(len(frames),1))
-        confidence=float(np.clip(.42*stability+.33*min(1,length/(w*.45))+
-                                 .25*min(1,length/max(width*8,1)),0,1))
+        confidence=float(np.clip(.38*stability+.34*min(1,length/(w*.45))+
+                                 .18*min(1,eigen_ratio/18)+.10*min(1,length/max(width*8,1)),0,1))
         regions.append({"polygon":polygon,"line":[float(p1[0]),float(p1[1]),float(p2[0]),float(p2[1])],
                         "width":width,"area":area,"centroid":list(map(float,centroids[label])),
-                        "confidence":confidence,"support":int(round(stability*len(frames)))})
+                        "confidence":confidence,"support":int(round(stability*len(frames))),
+                        "eigen_ratio":eigen_ratio,
+                        "mask_png":mask_encoded.tobytes() if ok_mask else None})
+    # 時間投票で点線状になった細いサイドラインは、同じ白画素マスク上の
+    # 共線断片を細長い面積へ再構成して補完する。
+    raw=cv2.HoughLinesP(common,1,np.pi/360,threshold=max(18,w//32),
+                        minLineLength=max(35,w//12),maxLineGap=max(18,w//18))
+    bands=merge_line_bands(normalize_hough_lines(raw),common.shape,
+                           rho_bin=max(10,int(w*.025)),angle_bin=5)
+    for band in bands:
+        x1,y1,x2,y2=map(float,band["line"]); length=math.hypot(x2-x1,y2-y1)
+        if length<w*.14:continue
+        samples=[(x1+(x2-x1)*t,y1+(y2-y1)*t) for t in np.linspace(.1,.9,7)]
+        overlap=False
+        for region in regions:
+            contour=np.asarray(region["polygon"],dtype=np.float32)
+            if sum(cv2.pointPolygonTest(contour,p,False)>=0 for p in samples)>=3:
+                overlap=True; break
+        if overlap:continue
+        dx=(x2-x1)/max(length,1); dy=(y2-y1)/max(length,1); nx=-dy; ny=dx
+        half=max(1.8,min(5.0,float(band.get("width",4))*.28))
+        polygon=[[x1+nx*half,y1+ny*half],[x2+nx*half,y2+ny*half],
+                 [x2-nx*half,y2-ny*half],[x1-nx*half,y1-ny*half]]
+        confidence=float(np.clip(.35+.30*min(1,length/(w*.5))+
+                                 .08*min(5,band.get("support",1)),0,1))
+        regions.append({"polygon":polygon,"line":[x1,y1,x2,y2],"width":half*2,
+                        "area":int(length*half*2),"centroid":[(x1+x2)*.5,(y1+y2)*.5],
+                        "confidence":confidence,"support":band.get("support",1),
+                        "eigen_ratio":99.0,"reconstructed":True})
     return sorted(regions,key=lambda x:x["confidence"],reverse=True)
 
 def court_line_confidence(frame,line):
@@ -582,8 +618,13 @@ def draw_direction_court_lines(frame,line_items,show_confidence=False,top_five=F
     if top_five:items=items[:5]
     layer=output.copy()
     for item in items:
-        polygon=item.get("polygon")
-        if polygon:
+        encoded_mask=item.get("mask_png")
+        if encoded_mask:
+            region_mask=cv2.imdecode(np.frombuffer(encoded_mask,dtype=np.uint8),cv2.IMREAD_GRAYSCALE)
+            if region_mask is not None and region_mask.shape==output.shape[:2]:
+                layer[region_mask>0]=(0,235,255)
+        elif item.get("polygon"):
+            polygon=item["polygon"]
             cv2.fillPoly(layer,[np.asarray(polygon,dtype=np.int32)],(0,235,255),cv2.LINE_AA)
         else:
             x1,y1,x2,y2=map(int,item["line"])
@@ -786,7 +827,26 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
     common_regions=[]; median_frame=None
     if inspections and court_reference_frames:
         median_frame=np.median(np.stack(court_reference_frames),axis=0).astype(np.uint8)
-        common_regions=detect_common_court_regions(court_reference_frames)
+        feet=[i.get("foot") for i in inspections if i.get("foot")]
+        heights=[i.get("player_height") for i in inspections if i.get("player_height")]
+        court_top=None
+        if feet and heights:
+            median_foot=tuple(np.median(np.asarray(feet,dtype=float),axis=0))
+            court_top=max(median_frame.shape[0]*.42,
+                          median_foot[1]-float(np.median(heights))*.32)
+        common_regions=detect_common_court_regions(court_reference_frames,court_top)
+        if feet:
+            median_foot=tuple(np.median(np.asarray(feet,dtype=float),axis=0))
+            mw=median_frame.shape[1]
+            common_regions=[r for r in common_regions
+                            if math.hypot(float(r["line"][2])-float(r["line"][0]),
+                                          float(r["line"][3])-float(r["line"][1]))>=mw*.30
+                            or point_court_region_distance(median_foot,r)<=mw*.38]
+            common_regions=[r for r in common_regions if not (
+                float(r.get("centroid",[0,0])[0])>mw*.78 and
+                float(r.get("width",0))>mw*.02 and
+                math.hypot(float(r["line"][2])-float(r["line"][0]),
+                           float(r["line"][3])-float(r["line"][1]))<mw*.45)]
         for item in inspections:
             encoded=item.get("base_jpeg"); base=(cv2.imdecode(
                 np.frombuffer(encoded,dtype=np.uint8),cv2.IMREAD_COLOR) if encoded else None)
@@ -2644,9 +2704,10 @@ class TennisApp(tk.Tk):
                         f"人物: {item.get('people',0)}人 / 顔: {item.get('faces',0)}人{face_note}\n"
                         f"顔向き: {face_dirs}\n"
                         f"身体向き: {body_dirs}\n"
-                        f"白いコート線: {item.get('court_lines',0)}本  "
+                        f"白線面積（Confidence対象）: {item.get('court_lines',0)}領域  "
                         f"ベースライン候補: {item.get('baselines',0)}本 B\n"
-                        f"線: {item.get('lines',0)}本（斜線 {item.get('oblique',0)}本）\n"
+                        f"一般エッジ線分（方向参考）: {item.get('lines',0)}本"
+                        f"（斜線 {item.get('oblique',0)}本）\n"
                         f"交点: {item.get('intersections',0)}個 / 消失点X: {vp}\n"
                         f"画像判定: {item.get('direction','不明・複数')} "
                         f"({float(item.get('confidence',0)):.0%})\n"
