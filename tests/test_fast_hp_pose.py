@@ -146,6 +146,20 @@ def test_all_edge_segments_are_drawn_as_thin_red_lines():
     assert rendered[30,20,2]>200 and rendered[30,20,0]<80
 
 
+def test_segment_is_clipped_at_ankle_court_boundary():
+    assert TA.clip_segment_below_y([10,10,30,50],30)==[20,30,30,50]
+    assert TA.clip_segment_below_y([0,5,20,10],30) is None
+
+
+def test_court_color_area_is_tinted_but_remains_visible():
+    frame=np.full((60,80,3),(60,130,70),dtype=np.uint8)
+    lab=TA.cv2.cvtColor(np.array([[[60,130,70]]],dtype=np.uint8),TA.cv2.COLOR_BGR2LAB)[0,0]
+    sample={"lab":lab.tolist(),"sample_rect":[35,45,45,55]}
+    rendered=TA.draw_court_color_area(frame,sample,(40,45),30)
+    assert not np.array_equal(rendered[45,40],frame[45,40])
+    assert np.all(rendered[45,40]>0)
+
+
 def test_yolo_face_direction_uses_nose_between_eyes():
     kps=np.zeros((17,3),dtype=float)
     kps[0]=[50,40,.9]; kps[1]=[45,35,.9]; kps[2]=[55,35,.9]

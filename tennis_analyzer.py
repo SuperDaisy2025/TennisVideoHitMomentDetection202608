@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v87"; APP_VERSION_DESC = "全エッジ線分診断"
+APP_VERSION = "v88"; APP_VERSION_DESC = "コート範囲・段階別線分診断"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -626,6 +626,46 @@ def draw_all_edge_segments(frame,segments):
         cv2.line(output,(x1,y1),(x2,y2),(35,35,245),1,cv2.LINE_AA)
     return output
 
+def clip_segment_below_y(row,cutoff_y):
+    """Return the part of a segment at/below the ankle-based court boundary."""
+    x1,y1,x2,y2=map(float,row); cutoff=float(cutoff_y)
+    if y1<cutoff and y2<cutoff:return None
+    if y1<cutoff and y2!=y1:
+        x1=x1+(x2-x1)*(cutoff-y1)/(y2-y1); y1=cutoff
+    if y2<cutoff and y1!=y2:
+        x2=x2+(x1-x2)*(cutoff-y2)/(y1-y2); y2=cutoff
+    return [int(round(x1)),int(round(y1)),int(round(x2)),int(round(y2))]
+
+def segment_white_ratio(hsv,row,samples=17):
+    """Fraction of sampled segment pixels that look like white court paint."""
+    h,w=hsv.shape[:2]; x1,y1,x2,y2=map(float,row); hits=0; valid=0
+    for t in np.linspace(0,1,samples):
+        x=int(np.clip(round(x1+(x2-x1)*t),0,w-1)); y=int(np.clip(round(y1+(y2-y1)*t),0,h-1))
+        pixel=hsv[y,x]; valid+=1
+        if int(pixel[1])<=80 and int(pixel[2])>=165:hits+=1
+    return hits/max(valid,1)
+
+def draw_court_color_area(frame,court_sample,foot,cutoff_y,alpha=.18):
+    """Tint the foot-connected, similarly colored court area translucent light blue."""
+    if frame is None or not court_sample or not court_sample.get("lab"):return frame.copy()
+    lab=cv2.cvtColor(frame,cv2.COLOR_BGR2LAB).astype(np.float32)
+    target=np.asarray(court_sample["lab"],dtype=np.float32)
+    distance=np.linalg.norm(lab-target,axis=2)
+    mask=(distance<=30).astype(np.uint8)*255
+    mask[:int(np.clip(cutoff_y,0,frame.shape[0])),:]=0
+    mask=cv2.morphologyEx(mask,cv2.MORPH_OPEN,np.ones((3,3),np.uint8))
+    mask=cv2.morphologyEx(mask,cv2.MORPH_CLOSE,np.ones((9,9),np.uint8))
+    # Only retain components touching the sampling rectangle beneath the feet.
+    count,labels,stats,_=cv2.connectedComponentsWithStats(mask,8)
+    keep=np.zeros_like(mask); rect=court_sample.get("sample_rect")
+    if rect:
+        x1,y1,x2,y2=map(int,rect); touched=set(np.unique(labels[max(0,y1):y2,max(0,x1):x2]))-{0}
+        for label in touched:
+            if stats[label,cv2.CC_STAT_AREA]>=30:keep[labels==label]=255
+    if not np.any(keep):keep=mask
+    layer=frame.copy(); layer[keep>0]=(255,205,90)
+    return cv2.addWeighted(layer,float(alpha),frame,1-float(alpha),0)
+
 def point_segment_distance(point,line):
     px,py=map(float,point); x1,y1,x2,y2=map(float,line)
     vx=x2-x1; vy=y2-y1; den=vx*vx+vy*vy
@@ -748,14 +788,25 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
                 if found:face_directions.append(face_dir)
                 body_directions.append(yolo_body_direction(kps))
             if face_directions:face_hits+=1
+            primary=max(people,key=lambda b:max(0,b[2]-b[0])*max(0,b[3]-b[1]),default=None)
+            foot=((primary[0]+primary[2])*.5,primary[3]) if primary else None
+            player_height=(primary[3]-primary[1]) if primary else None
+            # 人物がいれば足首より少し上をコート面の上端にする。未検出時だけ42%へ戻す。
+            court_cutoff=int(np.clip(primary[3]-player_height*.12,0,h-1)) if primary else int(h*.42)
             blur=cv2.GaussianBlur(gray,(5,5),0)
-            edges=cv2.Canny(blur,55,150)
-            edges[:int(h*.18),:]=0
-            lines=cv2.HoughLinesP(edges,1,np.pi/180,threshold=max(35,w//14),
-                                  minLineLength=max(45,w//9),maxLineGap=max(12,w//40))
+            # 診断用の入口は従来より緩くし、見えている境界を取りこぼしにくくする。
+            edges=cv2.Canny(blur,35,110)
+            lines=cv2.HoughLinesP(edges,1,np.pi/180,threshold=max(22,w//22),
+                                  minLineLength=max(28,w//16),maxLineGap=max(16,w//32))
             pos=[]; neg=[]; frame_intersections=[]; frame_lines=0; frame_oblique=0
             # OpenCVの版により (N,1,4) / (N,4) が返るため、必ず4列へ正規化。
             line_rows=normalize_hough_lines(lines)
+            stage1=[list(map(int,row)) for row in line_rows]
+            stage2=[clipped for row in stage1 if (clipped:=clip_segment_below_y(row,court_cutoff))]
+            hsv=cv2.cvtColor(frame,cv2.COLOR_BGR2HSV)
+            stage3=[row for row in stage2 if segment_white_ratio(hsv,row)>=.25]
+            stage4=[list(map(int,row)) for row in dedupe_line_segments(
+                stage3,rho_bin=max(18,int(w*.035)),angle_bin=7)]
             overlay=frame.copy()
             for x1p,y1p,x2p,y2p in people:
                 cv2.rectangle(overlay,(x1p,y1p),(x2p,y2p),(255,170,40),2)
@@ -787,9 +838,8 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             if frame_vp is not None:
                 cv2.circle(overlay,(int(np.clip(frame_vp*w,0,w-1)),max(8,int(h*.08))),7,(40,40,255),-1)
             # 白く、長く、足元側にある線をコート線として別検出する。
-            hsv=cv2.cvtColor(frame,cv2.COLOR_BGR2HSV)
             white=cv2.inRange(hsv,np.array([0,0,185],np.uint8),np.array([180,55,255],np.uint8))
-            white[:int(h*.42),:]=0
+            white[:court_cutoff,:]=0
             white=cv2.morphologyEx(white,cv2.MORPH_CLOSE,np.ones((5,5),np.uint8))
             court_raw=cv2.HoughLinesP(white,1,np.pi/360,threshold=max(24,w//24),
                                      minLineLength=max(55,w//8),maxLineGap=max(18,w//32))
@@ -802,9 +852,6 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             all_court_candidates.extend(court_candidates); court_reference_frames.append(frame.copy())
             # 太い白線の両縁を別々に数えないよう、角度・位置を広めに統合する。
             court_lines=dedupe_line_segments(court_candidates,rho_bin=max(26,int(w*.045)),angle_bin=8)
-            primary=max(people,key=lambda b:max(0,b[2]-b[0])*max(0,b[3]-b[1]),default=None)
-            foot=((primary[0]+primary[2])*.5,primary[3]) if primary else None
-            player_height=(primary[3]-primary[1]) if primary else None
             court_sample=sample_foot_court_color(frame,foot,player_height)
             if court_sample and foot:
                 cx=int(np.clip(foot[0]+max(16,float(player_height)*.14),10,w-10))
@@ -835,13 +882,15 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             ok_jpg,encoded=cv2.imencode(".jpg",rendered,[cv2.IMWRITE_JPEG_QUALITY,88])
             inspections.append({"time":float(t),"frame_jpeg":encoded.tobytes() if ok_jpg else None,
                 "base_jpeg":base_encoded.tobytes() if ok_base else None,"court_line_items":line_items,
-                "all_edge_segments":[list(map(int,row)) for row in line_rows],
+                "all_edge_segments":stage2,
+                "line_filter_stages":{"1":stage1,"2":stage2,"3":stage3,"4":stage4},
                 "faces":int(len(face_directions)),"face_directions":face_directions,
                 "body_directions":body_directions,
                 "people":int(len(people)),"face_detector":bool(yolo_pose),"lines":int(frame_lines),
                 "oblique":int(frame_oblique),"court_lines":int(len(court_lines)),
                 "baselines":int(len(baselines)),
                 "foot":foot,"player_height":player_height,"court_color":court_sample,
+                "court_cutoff":court_cutoff,
                 "intersections":int(len(frame_intersections)),"vp_x":frame_vp,
                 "direction":local_dir,"confidence":float(local_conf),"reason":local_reason})
     finally:cap.release()
@@ -850,7 +899,10 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
     if inspections and court_reference_frames:
         median_frame=np.median(np.stack(court_reference_frames),axis=0).astype(np.uint8)
         feet=[i.get("foot") for i in inspections if i.get("foot")]
-        common_regions=detect_common_court_regions(court_reference_frames)
+        cutoffs=[i.get("court_cutoff") for i in inspections if i.get("court_cutoff") is not None]
+        common_cutoff=int(np.median(cutoffs)) if cutoffs else None
+        common_regions=detect_common_court_regions(court_reference_frames,common_cutoff)
+        geometry_regions=[dict(region) for region in common_regions]
         court_labs=[i["court_color"]["lab"] for i in inspections if i.get("court_color")]
         target_court_lab=(np.median(np.asarray(court_labs,dtype=float),axis=0).tolist()
                           if court_labs else None)
@@ -877,6 +929,9 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             if ok_jpg:item["frame_jpeg"]=encoded.tobytes()
             item["court_line_items"]=line_items; item["court_lines"]=len(line_items)
             item["baselines"]=sum(bool(x.get("baseline")) for x in line_items)
+            stages=item.setdefault("line_filter_stages",{})
+            stages["5"]=[list(map(int,r["line"])) for r in geometry_regions]
+            stages["6"]=[list(map(int,r["line"])) for r in common_regions]
     face_rate=face_hits/max(valid_frames,1)
     oblique_ratio=oblique_total/max(line_total,1)
     convergence=min(1.0,len(intersections)/max(valid_frames*12,1))
@@ -2764,6 +2819,8 @@ class TennisApp(tk.Tk):
         toolbar=tk.Frame(zoom,bg=PANEL); toolbar.pack(fill="x")
         show_conf=tk.BooleanVar(value=False); top_five=tk.BooleanVar(value=False)
         show_all_edges=tk.BooleanVar(value=False)
+        show_court_area=tk.BooleanVar(value=False)
+        stage_var=tk.StringVar(value="6: 足元色後（最終）")
         image_label=tk.Label(zoom,bg="#17231c"); image_label.pack(fill="both",expand=True,padx=10,pady=10)
         info=tk.StringVar(); tk.Label(toolbar,textvariable=info,bg=PANEL,fg=TEXT,
                                      font=_tk_font(10,True)).pack(side="left",padx=12,pady=8)
@@ -2773,10 +2830,20 @@ class TennisApp(tk.Tk):
             if bgr is None:return
             line_items=item.get("court_line_items",[])
             all_edges=item.get("all_edge_segments",[])
+            stages=item.get("line_filter_stages",{})
+            stage_key=stage_var.get().split(":",1)[0]
+            stage_segments=stages.get(stage_key,[])
             shown=sorted(line_items,key=lambda x:x.get("confidence",0),reverse=True)
             if top_five.get():shown=shown[:5]
-            rendered=draw_direction_court_lines(bgr,line_items,show_conf.get(),top_five.get())
-            if show_all_edges.get():rendered=draw_all_edge_segments(rendered,all_edges)
+            rendered=bgr.copy()
+            if show_court_area.get():
+                rendered=draw_court_color_area(rendered,item.get("court_color"),item.get("foot"),
+                                               item.get("court_cutoff",int(bgr.shape[0]*.42)))
+            if stage_key=="6":
+                rendered=draw_direction_court_lines(rendered,line_items,show_conf.get(),top_five.get())
+            else:
+                rendered=draw_all_edge_segments(rendered,stage_segments)
+            if show_all_edges.get() and stage_key!="1":rendered=draw_all_edge_segments(rendered,all_edges)
             image=Image.fromarray(cv2.cvtColor(rendered,cv2.COLOR_BGR2RGB))
             max_w=max(900,image_label.winfo_width()-16)
             max_h=max(600,image_label.winfo_height()-16)
@@ -2785,14 +2852,21 @@ class TennisApp(tk.Tk):
                                Image.LANCZOS)
             photo=ImageTk.PhotoImage(image)
             image_label.configure(image=photo); image_label.image=photo
-            edge_text=f"　一般エッジ {len(all_edges)}本" if show_all_edges.get() else ""
-            info.set(f"{float(item.get('time',0)):.1f}秒　コート線 {len(shown)}/{len(line_items)}本{edge_text}")
+            stage_count=len(line_items) if stage_key=="6" else len(stage_segments)
+            edge_text=f"　全線分 {len(all_edges)}本" if show_all_edges.get() else ""
+            info.set(f"{float(item.get('time',0)):.1f}秒　段階{stage_key}: {stage_count}本{edge_text}")
         def add_toggle(text,var):
             tk.Checkbutton(toolbar,text=text,variable=var,command=render,bg=PANEL,fg=TEXT,
                            activebackground=PANEL,selectcolor=DARK2,
                            font=_tk_font(10,True)).pack(side="right",padx=8,pady=7)
         add_toggle("Confidence表示",show_conf); add_toggle("Confidence上位5本のみ",top_five)
         add_toggle("全線分",show_all_edges)
+        add_toggle("コート範囲",show_court_area)
+        stages=("1: Canny＋Hough全線分","2: 足首基準より下","3: 白線らしさ",
+                "4: 重複線統合","5: 5枚共通＋形状","6: 足元色後（最終）")
+        tk.Label(toolbar,text="絞り込み",bg=PANEL,fg=TEXT,font=_tk_font(10,True)).pack(side="right",padx=(12,3))
+        stage_box=ttk.Combobox(toolbar,textvariable=stage_var,values=stages,state="readonly",width=22)
+        stage_box.pack(side="right",padx=4,pady=7); stage_box.bind("<<ComboboxSelected>>",lambda _e:render())
         resize_job=[None]
         def resized(_event=None):
             if resize_job[0]:zoom.after_cancel(resize_job[0])
