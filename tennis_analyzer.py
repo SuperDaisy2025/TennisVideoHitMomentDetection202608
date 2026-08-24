@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v89"; APP_VERSION_DESC = "途切れ線統合・コート色3段階"
+APP_VERSION = "v90"; APP_VERSION_DESC = "人物遮蔽線統合・正面優先判定"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -461,7 +461,8 @@ def dedupe_line_segments(lines,rho_bin=14,angle_bin=6):
         if key not in best or length>best[key][0]:best[key]=(length,(x1,y1,x2,y2))
     return [value[1] for value in best.values()]
 
-def merge_collinear_fragments(lines,rho_tol=22,angle_tol=9,max_gap=90):
+def merge_collinear_fragments(lines,rho_tol=22,angle_tol=9,max_gap=90,
+                              occlusion_boxes=None,occlusion_gap=None):
     """Join separated but collinear fragments, preserving how many formed each line."""
     groups=[]
     for row in lines:
@@ -487,7 +488,13 @@ def merge_collinear_fragments(lines,rho_tol=22,angle_tol=9,max_gap=90):
             intervals.append((p[0],p[1]))
         intervals.sort(); clusters=[]
         for lo,hi in intervals:
-            if clusters and lo<=clusters[-1][1]+max_gap:
+            gap=lo-clusters[-1][1] if clusters else float("inf")
+            occluded=False
+            if clusters and occlusion_boxes and occlusion_gap is not None and gap<=occlusion_gap:
+                mid=(clusters[-1][1]+lo)*.5; mx=mid*ux+rho*nx; my=mid*uy+rho*ny
+                occluded=any(x1-12<=mx<=x2+12 and y1-12<=my<=y2+12
+                             for x1,y1,x2,y2 in occlusion_boxes)
+            if clusters and (gap<=max_gap or occluded):
                 clusters[-1]=(clusters[-1][0],max(clusters[-1][1],hi),clusters[-1][2]+1)
             else:clusters.append((lo,hi,1))
         for lo,hi,count in clusters:
@@ -612,16 +619,21 @@ def classify_camera_coarse(inspections,regions,image_shape,fallback):
     """First decide side view vs end view using body fronts and receding court areas."""
     front_count=sum(any(str(v).startswith("正面") for v in i.get("body_directions",[]))
                     for i in inspections)
+    face_front_count=sum(any(str(v).startswith("正面") for v in i.get("face_directions",[]))
+                         for i in inspections)
+    # 顔と身体の両方がほぼ全フレームで正面なら、曖昧な線収束より人物情報を優先する。
+    if front_count>=4 and face_front_count>=4:
+        return "正面",.94,(f"5枚中、身体正面{front_count}枚・顔正面{face_front_count}枚のため、"
+                           "人物向きの一致を最優先して正面撮影と判定しました")
     h,w=image_shape[:2]
     receding=[]
     for region in regions:
         x1,y1,x2,y2=map(float,region.get("line",(0,0,0,0)))
         dx=abs(x2-x1); dy=abs(y2-y1)
         if dy>dx*1.25 and max(y1,y2)>h*.78 and dy>h*.20:receding.append(region)
-    if front_count>=3 or receding:
-        confidence=.88 if front_count>=3 and receding else .74
+    if receding:
+        confidence=.74
         reasons=[]
-        if front_count>=3:reasons.append(f"5枚中{front_count}枚で身体の正面（おへそ側）を検出")
         if receding:reasons.append(f"手前から奥へ伸びる白線面を{len(receding)}本検出")
         return "横(側不明)",confidence,"、".join(reasons)+"したため、まずサイド撮影と判定しました"
     return fallback
@@ -845,9 +857,9 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             court_cutoff=int(np.clip(primary[3]-player_height*.12,0,h-1)) if primary else int(h*.42)
             blur=cv2.GaussianBlur(gray,(5,5),0)
             # 診断用の入口は従来より緩くし、見えている境界を取りこぼしにくくする。
-            edges=cv2.Canny(blur,35,110)
-            lines=cv2.HoughLinesP(edges,1,np.pi/180,threshold=max(22,w//22),
-                                  minLineLength=max(28,w//16),maxLineGap=max(16,w//32))
+            edges=cv2.Canny(blur,25,90)
+            lines=cv2.HoughLinesP(edges,1,np.pi/180,threshold=max(16,w//30),
+                                  minLineLength=max(20,w//22),maxLineGap=max(20,w//28))
             pos=[]; neg=[]; frame_intersections=[]; frame_lines=0; frame_oblique=0
             # OpenCVの版により (N,1,4) / (N,4) が返るため、必ず4列へ正規化。
             line_rows=normalize_hough_lines(lines)
@@ -856,7 +868,9 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
             hsv=cv2.cvtColor(frame,cv2.COLOR_BGR2HSV)
             stage3=[row for row in stage2 if segment_white_ratio(hsv,row)>=.25]
             stage4=merge_collinear_fragments(stage3,rho_tol=max(22,int(w*.04)),
-                                              angle_tol=10,max_gap=max(70,int(w*.18)))
+                                              angle_tol=10,max_gap=max(70,int(w*.18)),
+                                              occlusion_boxes=people,
+                                              occlusion_gap=max(130,int(w*.42)))
             overlay=frame.copy()
             for x1p,y1p,x2p,y2p in people:
                 cv2.rectangle(overlay,(x1p,y1p),(x2p,y2p),(255,170,40),2)
@@ -2892,7 +2906,7 @@ class TennisApp(tk.Tk):
             if top_five.get():shown=shown[:5]
             rendered=bgr.copy()
             if court_area_level.get()!="オフ":
-                level=int(court_area_level.get()); thresholds={1:42,2:30,3:18}
+                level=int(court_area_level.get()); thresholds={0:58,1:42,2:30,3:18}
                 rendered=draw_court_color_area(rendered,item.get("court_color"),item.get("foot"),
                                                item.get("court_cutoff",int(bgr.shape[0]*.42)),
                                                color_distance=thresholds[level])
@@ -2922,7 +2936,7 @@ class TennisApp(tk.Tk):
         add_toggle("全線分",show_all_edges)
         tk.Label(toolbar,text="コート範囲",bg=PANEL,fg=TEXT,font=_tk_font(10,True)).pack(side="right",padx=(10,3))
         court_box=ttk.Combobox(toolbar,textvariable=court_area_level,
-                              values=("オフ","1","2","3"),state="readonly",width=5)
+                              values=("オフ","0","1","2","3"),state="readonly",width=5)
         court_box.pack(side="right",padx=3,pady=7); court_box.bind("<<ComboboxSelected>>",lambda _e:render())
         stages=("1: Canny＋Hough全線分","2: 足首基準より下","3: 白線らしさ",
                 "4: 重複線統合","5: 5枚共通＋形状","6: 足元色後（最終）")

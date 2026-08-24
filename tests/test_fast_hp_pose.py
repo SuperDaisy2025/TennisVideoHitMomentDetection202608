@@ -105,12 +105,12 @@ def test_common_court_detection_returns_one_area_not_two_edges():
     assert regions[0]["area"]>900 and len(regions[0]["polygon"])>=4
 
 
-def test_body_front_majority_makes_coarse_side_view():
-    inspections=[{"body_directions":["正面（おへそ側）"]} for _ in range(4)]+[
-                 {"body_directions":["背面"]}]
+def test_five_front_faces_and_bodies_override_lines_as_front_view():
+    inspections=[{"body_directions":["正面（おへそ側）"],
+                  "face_directions":["正面向き"]} for _ in range(5)]
     direction,confidence,_=TA.classify_camera_coarse(
         inspections,[],(100,200,3),("不明・複数",.25,"線不足"))
-    assert direction=="横(側不明)" and confidence>.7
+    assert direction=="正面" and confidence>.9
 
 
 def test_foot_color_sampling_ignores_white_paint():
@@ -165,6 +165,15 @@ def test_collinear_fragments_are_extended_into_one_supported_line():
                                         angle_tol=3,max_gap=20)
     assert len(merged)==1 and merged[0]["merged_count"]==2
     assert abs(merged[0]["line"][2]-merged[0]["line"][0])>=84
+
+
+def test_person_occlusion_allows_a_wider_collinear_gap():
+    lines=[[10,50,80,50],[220,51,290,51]]
+    without=TA.merge_collinear_fragments(lines,rho_tol=4,angle_tol=3,max_gap=80)
+    with_person=TA.merge_collinear_fragments(lines,rho_tol=4,angle_tol=3,max_gap=80,
+                                             occlusion_boxes=[(90,20,210,100)],occlusion_gap=180)
+    assert len(without)==2
+    assert len(with_person)==1 and with_person[0]["merged_count"]==2
 
 
 def test_merged_diagnostic_line_is_pink():
