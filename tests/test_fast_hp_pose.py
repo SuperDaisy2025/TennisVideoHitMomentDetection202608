@@ -305,6 +305,14 @@ def test_selected_sensitivity_is_direct_energy_threshold():
     assert peaks.tolist() == [3]
 
 
+def test_wall_mode_enforces_eight_tenths_peak_gap():
+    energy=np.zeros(16,dtype=float); energy[[1,7,12]]=1.0
+    data={"combined":energy,"times":np.arange(16,dtype=float)*.1,"sr":512}
+    peaks,_=TA.detect_peaks(data,sensitivity=.4,min_gap=.1,wall_mode=True)
+    assert TA.WALL_PEAK_MIN_GAP==.8
+    assert peaks.tolist()==[1,12]
+
+
 def test_first_minute_cache_is_separate_from_full_analysis():
     video=str(Path("sample.mp4"))
     assert TA.get_analysis_cache_path(video,True).endswith("sample_first60_analysis.npz")
@@ -336,6 +344,7 @@ def test_motion_summary_is_signed_horizontal_cm_delta_and_reports_ball():
     # Uses -0.1s (x=.62) and +0.1s (x=.68): 6px * 2cm/px = +12cm.
     assert all(abs(values[key]-12.0)<1e-6 for key in ("rw_x","lw_x","re_x","le_x"))
     assert all(abs(values[key])<1e-6 for key in ("rw_y","lw_y","re_y","le_y"))
+    assert values["rw_d"]==12.0 and values["lw_d"]==12.0
 
 
 def test_motion_summary_treats_image_right_as_positive():
@@ -357,6 +366,7 @@ def test_motion_summary_treats_image_down_as_positive_y():
     values,_=TA.TennisApp._compute_hp_motion_cm(
         [sample(.5),sample(.3),sample(.4),sample(.5),sample(.4)],(100,100),160)
     assert all(abs(values[key]-40.0)<1e-6 for key in ("rw_y","lw_y","re_y","le_y"))
+    assert values["rw_d"]==40.0 and values["lw_d"]==40.0
 
 
 def test_motion_summary_uses_torso_scale_when_ankles_are_missing():

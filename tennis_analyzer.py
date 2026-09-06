@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v91"; APP_VERSION_DESC = "RTMPose既定姿勢エンジン"
+APP_VERSION = "v92"; APP_VERSION_DESC = "壁音間隔・手首移動ランク"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -329,6 +329,7 @@ HP_POSE_MAX_REFINE_SEC = 0.18
 HP_POSE_MIN_VIS = 0.35
 HP_POSE_MIN_WRIST_TRAVEL = 0.12  # 肩幅で正規化した3点間の右手首移動量
 HP_POSE_MIN_ARM_CHANGE_DEG = 10.0
+WALL_PEAK_MIN_GAP = 0.8
 
 # ── ラベル定義 ────────────────────────────────
 SHOT_TYPES = [
@@ -1049,10 +1050,10 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
 def detect_peaks(data, sensitivity=0.5, min_gap=1.0, wall_mode=False,
                  use_frequency_filter=True):
     """ピーク検出。
-       wall_mode=True なら壁打ちモード: min_gap を 0.5s 以上に強制し、
+       wall_mode=True なら壁打ちモード: min_gap を 0.8s 以上に強制し、
        0.05〜0.30秒間隔のペアピーク (壁エコー想定) を抑制"""
     if wall_mode:
-        min_gap=max(min_gap,0.5)
+        min_gap=max(min_gap,WALL_PEAK_MIN_GAP)
     combined=(data["combined"] if use_frequency_filter else
               data.get("broadband",data["combined"]))
     times=data["times"]; sr=data["sr"]
@@ -2027,16 +2028,23 @@ class TennisApp(tk.Tk):
                  ).pack(fill="x",padx=12)
         tk.Label(hp_hdr,text="ヒットポイント",bg=PANEL,fg=ACCENT2,
                  font=_tk_font(13,bold=True)).pack(side="left")
+        self._hp_sort_mode="time"; self._hp_sort_buttons={}
+        sort_box=tk.Frame(hp_hdr,bg=PANEL); sort_box.pack(side="left",padx=(8,4))
+        for text,mode in (("時系列","time"),("Rwdランク","rwd"),("Lwdランク","lwd")):
+            button=tk.Button(sort_box,text=text,relief="flat",font=_tk_font(8,bold=True),
+                             command=lambda m=mode:self._set_hp_sort_mode(m),cursor="hand2")
+            button.pack(side="left",padx=1,ipadx=2); self._hp_sort_buttons[mode]=button
+        self._refresh_hp_sort_buttons()
         # v24: 「分類済」チェックボックス — 未分類 HP を非表示
         self._show_classified_only=tk.BooleanVar(value=False)
         tk.Checkbutton(hp_hdr,text="分類済",variable=self._show_classified_only,
                        bg=PANEL,fg=SUBTEXT,activebackground=PANEL,selectcolor=DARK2,
                        font=_tk_font(11),command=self._on_classified_filter_changed
                         ).pack(side="right")
-        tk.Label(p,text="正解  時刻・分類 | RWx RWy LWx LWy REx REy LEx LEy  B",
+        tk.Label(p,text="正解  時刻・分類 | RWx RWy RWd  R% LWx LWy LWd  L% REx REy LEx LEy  B",
                  bg=PANEL,fg=SUBTEXT,font=("Courier",12,"bold"),anchor="w"
                  ).pack(fill="x",padx=12)
-        tk.Label(p,text="R/L:右/左  W:手首  E:ひじ  x=右＋  y=下＋  B=ボール (cm)",
+        tk.Label(p,text="R/L:右/左  W:手首  d=|x|+|y|  %=上位3件平均比  E:ひじ  B=ボール (cm)",
                  bg=PANEL,fg=SUBTEXT,font=_tk_font(11),anchor="w"
                  ).pack(fill="x",padx=12)
         tk.Button(hp_hdr,text="Excel出力",bg=DARK2,fg=GOLD,relief="flat",
@@ -3422,7 +3430,7 @@ class TennisApp(tk.Tk):
 
     def _current_audio_candidates(self):
         if self.data is None:return []
-        gap=.12 if bool(self.wall_mode.get()) else self.min_gap.get()
+        gap=WALL_PEAK_MIN_GAP if bool(self.wall_mode.get()) else self.min_gap.get()
         indices,_=detect_peaks(self.data,self.sensitivity.get(),gap,wall_mode=False,
                                use_frequency_filter=bool(self.audio_filter_enabled.get()))
         return [{"idx":int(i),"time":float(self.data["times"][i])} for i in indices]
@@ -3881,6 +3889,7 @@ class TennisApp(tk.Tk):
         """
         joint_map=(("rw",10),("lw",9),("re",8),("le",7))
         result={f"{key}_{axis}":None for key,_ in joint_map for axis in ("x","y")}
+        result.update({"rw_d":None,"lw_d":None})
         ball=any((lambda v: bool(v and len(v)>=3 and float(v[2])>=HP_POSE_MIN_VIS))(
                  s.get("kps",{}).get("18")) for s in samples[:5])
         if len(samples)<5:return result,ball
@@ -3937,6 +3946,9 @@ class TennisApp(tk.Tk):
             if key in before and key in after:
                 result[f"{key}_x"]=(after[key][0]-before[key][0])*cm_per_px
                 result[f"{key}_y"]=(after[key][1]-before[key][1])*cm_per_px
+        for key in ("rw","lw"):
+            x=result.get(f"{key}_x"); y=result.get(f"{key}_y")
+            if x is not None and y is not None:result[f"{key}_d"]=abs(float(x))+abs(float(y))
         return result,ball
 
     def _hp_motion_summary(self,peak):
@@ -4242,12 +4254,19 @@ class TennisApp(tk.Tk):
             export_sensitivity=float(self.sensitivity.get())
             rows=[]
             names=(("右手首_X_cm","rw_x"),("右手首_Y_cm","rw_y"),
+                   ("右手首_D_cm","rw_d"),
                    ("左手首_X_cm","lw_x"),("左手首_Y_cm","lw_y"),
+                   ("左手首_D_cm","lw_d"),
                    ("右ひじ_X_cm","re_x"),("右ひじ_Y_cm","re_y"),
                    ("左ひじ_X_cm","le_x"),("左ひじ_Y_cm","le_y"))
             truth_keys=load_ground_truth_keys(path)
-            for peak in self.peaks:
-                motion,ball=self._hp_motion_summary(peak); rank=peak.get("rank")
+            summaries=[self._hp_motion_summary(peak) for peak in self.peaks]
+            def top3_average(key):
+                values=sorted((float(m.get(key)) for m,_ in summaries if m.get(key) is not None),reverse=True)[:3]
+                return sum(values)/len(values) if values else None
+            rwd_top3=top3_average("rw_d"); lwd_top3=top3_average("lw_d")
+            for peak,(motion,ball) in zip(self.peaks,summaries):
+                rank=peak.get("rank")
                 label=all_labels.get(rank)
                 truth_key=(int(rank),round(float(peak.get("time",0)),3),self._hp_backend(peak))
                 row={"正解":("✓" if truth_key in truth_keys else ""),
@@ -4266,6 +4285,10 @@ class TennisApp(tk.Tk):
                      "ボール検出":"あり" if ball else "なし"}
                 for title,key in names:
                     value=motion.get(key); row[title]=None if value is None else round(float(value),2)
+                row["Rwd上位3平均比_%"]=(None if motion.get("rw_d") is None or not rwd_top3 else
+                                          round(float(motion["rw_d"])/rwd_top3*100,1))
+                row["Lwd上位3平均比_%"]=(None if motion.get("lw_d") is None or not lwd_top3 else
+                                          round(float(motion["lw_d"])/lwd_top3*100,1))
                 row["手動ショット分類"]=label[0] if label else ""
                 row["回転分類"]=label[1] if label else ""
                 row["評価"]=label[2] if label else ""
@@ -4295,6 +4318,21 @@ class TennisApp(tk.Tk):
         except Exception as e:
             messagebox.showerror("Excel出力",f"Excelの書き出しに失敗しました:\n{e}")
 
+    def _refresh_hp_sort_buttons(self):
+        if not hasattr(self,"_hp_sort_buttons"):return
+        mode=getattr(self,"_hp_sort_mode","time")
+        for key,button in self._hp_sort_buttons.items():
+            selected=key==mode
+            button.configure(bg=ACCENT2 if selected else DARK2,
+                             fg="white" if selected else TEXT)
+
+    def _set_hp_sort_mode(self,mode):
+        if mode not in ("time","rwd","lwd"):return
+        self._hp_sort_mode=mode; self._refresh_hp_sort_buttons(); self._update_shot_list()
+        mapping=getattr(self,"_list_to_peak_idx",[])
+        if self.peak_idx in mapping:
+            row=mapping.index(self.peak_idx); self.peak_list.selection_set(row); self.peak_list.see(row)
+
     def _update_shot_list(self):
         path=self.video_path.get()
         db_path=get_db_path(path)
@@ -4308,7 +4346,23 @@ class TennisApp(tk.Tk):
                          if hasattr(self,"_show_classified_only") else False)
         try: truth_keys=load_ground_truth_keys(path) if path else set()
         except Exception: truth_keys=set()
-        for i,p in enumerate(self.peaks):
+        motion_cache={i:self._hp_motion_summary(p) for i,p in enumerate(self.peaks)}
+        def top3_average(key):
+            values=sorted((float(m.get(key)) for m,_ in motion_cache.values()
+                           if m.get(key) is not None),reverse=True)[:3]
+            return sum(values)/len(values) if values else None
+        rwd_top3=top3_average("rw_d"); lwd_top3=top3_average("lw_d")
+        display_indices=list(range(len(self.peaks)))
+        sort_mode=getattr(self,"_hp_sort_mode","time")
+        if sort_mode in ("rwd","lwd"):
+            distance_key="rw_d" if sort_mode=="rwd" else "lw_d"
+            display_indices.sort(key=lambda i:(motion_cache[i][0].get(distance_key) is None,
+                                               -(motion_cache[i][0].get(distance_key) or 0),
+                                               float(self.peaks[i].get("time",0))))
+        else:
+            display_indices.sort(key=lambda i:float(self.peaks[i].get("time",0)))
+        for i in display_indices:
+            p=self.peaks[i]
             rank=p["rank"]; t=p["time"]
             lbl=all_labels.get(rank,None)
             # v24: 分類済フィルタ — ラベルがない HP は非表示
@@ -4340,12 +4394,19 @@ class TennisApp(tk.Tk):
             else:
                 state="確認中" if p.get("pose_reason")=="pending" else "未"
                 tag=f"{checkmark} #{rank:02d}{icons} {t:.2f}s {state}{cb}"
-            motion,ball=self._hp_motion_summary(p)
+            motion,ball=motion_cache[i]
             def compact(key):
                 value=motion.get(key)
                 return "  --" if value is None else f"{value:+4.0f}"
-            tag += (" |"+"".join(compact(key) for key in
-                                  ("rw_x","rw_y","lw_x","lw_y","re_x","re_y","le_x","le_y"))+
+            def distance(key):
+                value=motion.get(key); return "  --" if value is None else f"{value:4.0f}"
+            def ratio(key,base):
+                value=motion.get(key)
+                return "  --" if value is None or not base else f"{value/base*100:4.0f}%"
+            tag += (" |"+compact("rw_x")+compact("rw_y")+distance("rw_d")+
+                    ratio("rw_d",rwd_top3)+compact("lw_x")+compact("lw_y")+
+                    distance("lw_d")+ratio("lw_d",lwd_top3)+
+                    "".join(compact(key) for key in ("re_x","re_y","le_x","le_y"))+
                     ("  ●" if ball else "  ─"))
             self.peak_list.insert("end",tag)
             self._list_to_peak_idx.append(i)
