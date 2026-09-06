@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v92"; APP_VERSION_DESC = "壁音間隔・手首移動ランク"
+APP_VERSION = "v93"; APP_VERSION_DESC = "サウンドエネルギーランク"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -2030,7 +2030,8 @@ class TennisApp(tk.Tk):
                  font=_tk_font(13,bold=True)).pack(side="left")
         self._hp_sort_mode="time"; self._hp_sort_buttons={}
         sort_box=tk.Frame(hp_hdr,bg=PANEL); sort_box.pack(side="left",padx=(8,4))
-        for text,mode in (("時系列","time"),("Rwdランク","rwd"),("Lwdランク","lwd")):
+        for text,mode in (("時系列","time"),("Rwdランク","rwd"),("Lwdランク","lwd"),
+                          ("サウンドランク","sound")):
             button=tk.Button(sort_box,text=text,relief="flat",font=_tk_font(8,bold=True),
                              command=lambda m=mode:self._set_hp_sort_mode(m),cursor="hand2")
             button.pack(side="left",padx=1,ipadx=2); self._hp_sort_buttons[mode]=button
@@ -2041,10 +2042,10 @@ class TennisApp(tk.Tk):
                        bg=PANEL,fg=SUBTEXT,activebackground=PANEL,selectcolor=DARK2,
                        font=_tk_font(11),command=self._on_classified_filter_changed
                         ).pack(side="right")
-        tk.Label(p,text="正解  時刻・分類 | RWx RWy RWd  R% LWx LWy LWd  L% REx REy LEx LEy  B",
+        tk.Label(p,text="正解  時刻・分類 | RWx RWy RWd  R% LWx LWy LWd  L% REx REy LEx LEy  B   SE   S%",
                  bg=PANEL,fg=SUBTEXT,font=("Courier",12,"bold"),anchor="w"
                  ).pack(fill="x",padx=12)
-        tk.Label(p,text="R/L:右/左  W:手首  d=|x|+|y|  %=上位3件平均比  E:ひじ  B=ボール (cm)",
+        tk.Label(p,text="R/L:右/左 W:手首 d=|x|+|y| E:ひじ B=ボール SE=音響エネルギー %=各TOP3平均比",
                  bg=PANEL,fg=SUBTEXT,font=_tk_font(11),anchor="w"
                  ).pack(fill="x",padx=12)
         tk.Button(hp_hdr,text="Excel出力",bg=DARK2,fg=GOLD,relief="flat",
@@ -4265,7 +4266,11 @@ class TennisApp(tk.Tk):
                 values=sorted((float(m.get(key)) for m,_ in summaries if m.get(key) is not None),reverse=True)[:3]
                 return sum(values)/len(values) if values else None
             rwd_top3=top3_average("rw_d"); lwd_top3=top3_average("lw_d")
-            for peak,(motion,ball) in zip(self.peaks,summaries):
+            energy_values=[self._peak_energy_at(float(p.get("time",0)),
+                           bool(self.audio_filter_enabled.get())) for p in self.peaks]
+            valid_energy=sorted((float(v) for v in energy_values if v is not None),reverse=True)[:3]
+            energy_top3=sum(valid_energy)/len(valid_energy) if valid_energy else None
+            for peak,(motion,ball),peak_energy in zip(self.peaks,summaries,energy_values):
                 rank=peak.get("rank")
                 label=all_labels.get(rank)
                 truth_key=(int(rank),round(float(peak.get("time",0)),3),self._hp_backend(peak))
@@ -4275,8 +4280,9 @@ class TennisApp(tk.Tk):
                      "内容":extra.get("content_type",""),
                      "動画の主ショット":",".join(extra.get("main_shots") or []),
                      "検出感度":float(peak.get("detection_sensitivity",export_sensitivity)),
-                     "実ピーク高さ":self._peak_energy_at(float(peak.get("time",0)),
-                                                      bool(self.audio_filter_enabled.get())),
+                     "実ピーク高さ":peak_energy,
+                     "サウンドTOP3平均比_%":(None if peak_energy is None or not energy_top3 else
+                                             round(float(peak_energy)/energy_top3*100,1)),
                      "採用フレーム_秒":round(float(peak.get("frame_time") or peak.get("time",0)),3),
                      "姿勢検出":pose_backend_label(peak.get("pose_backend")),
                      "自動判定":peak.get("pose_shot") or "",
@@ -4327,7 +4333,7 @@ class TennisApp(tk.Tk):
                              fg="white" if selected else TEXT)
 
     def _set_hp_sort_mode(self,mode):
-        if mode not in ("time","rwd","lwd"):return
+        if mode not in ("time","rwd","lwd","sound"):return
         self._hp_sort_mode=mode; self._refresh_hp_sort_buttons(); self._update_shot_list()
         mapping=getattr(self,"_list_to_peak_idx",[])
         if self.peak_idx in mapping:
@@ -4347,17 +4353,25 @@ class TennisApp(tk.Tk):
         try: truth_keys=load_ground_truth_keys(path) if path else set()
         except Exception: truth_keys=set()
         motion_cache={i:self._hp_motion_summary(p) for i,p in enumerate(self.peaks)}
+        energy_cache={i:self._peak_energy_at(float(p.get("time",0)),
+                      bool(self.audio_filter_enabled.get())) for i,p in enumerate(self.peaks)}
         def top3_average(key):
             values=sorted((float(m.get(key)) for m,_ in motion_cache.values()
                            if m.get(key) is not None),reverse=True)[:3]
             return sum(values)/len(values) if values else None
         rwd_top3=top3_average("rw_d"); lwd_top3=top3_average("lw_d")
+        valid_energy=sorted((float(v) for v in energy_cache.values() if v is not None),reverse=True)[:3]
+        energy_top3=sum(valid_energy)/len(valid_energy) if valid_energy else None
         display_indices=list(range(len(self.peaks)))
         sort_mode=getattr(self,"_hp_sort_mode","time")
         if sort_mode in ("rwd","lwd"):
             distance_key="rw_d" if sort_mode=="rwd" else "lw_d"
             display_indices.sort(key=lambda i:(motion_cache[i][0].get(distance_key) is None,
                                                -(motion_cache[i][0].get(distance_key) or 0),
+                                               float(self.peaks[i].get("time",0))))
+        elif sort_mode=="sound":
+            display_indices.sort(key=lambda i:(energy_cache[i] is None,
+                                               -(energy_cache[i] or 0),
                                                float(self.peaks[i].get("time",0))))
         else:
             display_indices.sort(key=lambda i:float(self.peaks[i].get("time",0)))
@@ -4403,11 +4417,15 @@ class TennisApp(tk.Tk):
             def ratio(key,base):
                 value=motion.get(key)
                 return "  --" if value is None or not base else f"{value/base*100:4.0f}%"
+            def ratio_value(value,base):
+                return "  --" if value is None or not base else f"{float(value)/base*100:4.0f}%"
             tag += (" |"+compact("rw_x")+compact("rw_y")+distance("rw_d")+
                     ratio("rw_d",rwd_top3)+compact("lw_x")+compact("lw_y")+
                     distance("lw_d")+ratio("lw_d",lwd_top3)+
                     "".join(compact(key) for key in ("re_x","re_y","le_x","le_y"))+
-                    ("  ●" if ball else "  ─"))
+                    ("  ●" if ball else "  ─")+
+                    ("   --" if energy_cache[i] is None else f" {energy_cache[i]:4.2f}")+
+                    ratio_value(energy_cache[i],energy_top3))
             self.peak_list.insert("end",tag)
             self._list_to_peak_idx.append(i)
 
