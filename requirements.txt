@@ -21,6 +21,8 @@ matplotlib>=3.7.0
 # ── 姿勢推定 ──
 mediapipe>=0.10.0
 ultralytics>=8.0.0
+rtmlib>=0.0.13
+onnxruntime>=1.17.0
 
 # ── MediaPipe 依存 ──
 absl-py>=1.4.0

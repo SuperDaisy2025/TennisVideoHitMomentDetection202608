@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v90"; APP_VERSION_DESC = "人物遮蔽線統合・正面優先判定"
+APP_VERSION = "v91"; APP_VERSION_DESC = "RTMPose既定姿勢エンジン"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -429,6 +429,36 @@ def normalize_hough_lines(lines):
     if lines is None:return np.empty((0,4),dtype=np.int32)
     arr=np.asarray(lines)
     return arr.reshape(-1,4) if arr.size and arr.size%4==0 else np.empty((0,4),dtype=np.int32)
+
+def rtmpose_result_to_coco(keypoints,scores,image_width,image_height,min_score=.05):
+    """Convert RTMLib RTMPose output to the normalized COCO-17 mapping used by HP analysis."""
+    points=np.asarray(keypoints,dtype=float); confidence=np.asarray(scores,dtype=float)
+    if points.size==0:return {}
+    if points.ndim==2:points=points[None,...]
+    if confidence.ndim==1:confidence=confidence[None,...]
+    confidence=np.squeeze(confidence)
+    if confidence.ndim==1:confidence=confidence[None,...]
+    people=min(len(points),len(confidence))
+    if people<=0:return {}
+    best_index=0; best_area=-1.0
+    for person_i in range(people):
+        count=min(17,len(points[person_i]),len(confidence[person_i]))
+        visible=np.asarray(confidence[person_i][:count])>=min_score
+        if not np.any(visible):continue
+        visible_points=np.asarray(points[person_i][:count])[visible]
+        span=np.ptp(visible_points,axis=0) if len(visible_points)>1 else np.zeros(2)
+        area=float(span[0]*span[1])
+        if area>best_area:best_area=area; best_index=person_i
+    result={}; count=min(17,len(points[best_index]),len(confidence[best_index]))
+    for i in range(count):
+        x,y=points[best_index][i][:2]; score=float(confidence[best_index][i])
+        result[str(i)]=[float(x)/max(float(image_width),1.0),
+                        float(y)/max(float(image_height),1.0),score]
+    return result
+
+def pose_backend_label(value):
+    return {"rtmpose":"RTMPose","yolo":"YOLO","mediapipe":"MediaPipe"}.get(
+        str(value or "").lower(),str(value or "不明"))
 
 def camera_sample_times(duration,count=5,edge_margin=6.0):
     """Avoid setup/stop frames; use 6s after start through 6s before end."""
@@ -3060,12 +3090,14 @@ class TennisApp(tk.Tk):
             tk.Radiobutton(ct_frame, text=ct, variable=content_var, value=ct,
                            bg=PANEL, fg=TEXT, activebackground=PANEL,
                            selectcolor=DARK2, font=_tk_font(9)).pack(side="left", padx=2)
-        # v67: HP候補の姿勢エンジン (デフォルトYOLO)
+        # v91: HP候補の姿勢エンジン (新規動画はRTMPoseがデフォルト)
         tk.Label(right, text="姿勢・ボール検出:", bg=PANEL, fg=TEXT,
                  font=_tk_font(10, True)).pack(anchor="w", pady=(8,2))
         kp_frame = tk.Frame(right, bg=PANEL); kp_frame.pack(anchor="w", padx=8)
-        pose_backend_var=tk.StringVar(value=saved_extra.get("pose_backend","yolo"))
-        for label,value in (("YOLO Nano（姿勢＋ボール）","yolo"),("MediaPipe Pose","mediapipe")):
+        pose_backend_var=tk.StringVar(value=saved_extra.get("pose_backend","rtmpose"))
+        for label,value in (("RTMPose（姿勢）＋YOLOボール","rtmpose"),
+                            ("YOLO Nano（姿勢＋ボール）","yolo"),
+                            ("MediaPipe Pose","mediapipe")):
             tk.Radiobutton(kp_frame,text=label,variable=pose_backend_var,value=value,
                            bg=PANEL,fg=TEXT,activebackground=PANEL,selectcolor=DARK2,
                            font=_tk_font(9)).pack(side="left",padx=(0,10))
@@ -3396,7 +3428,7 @@ class TennisApp(tk.Tk):
         return [{"idx":int(i),"time":float(self.data["times"][i])} for i in indices]
 
     def _show_provisional_audio_candidates(self,candidates):
-        backend=str(getattr(self,"_video_meta_extra",{}).get("pose_backend","yolo"))
+        backend=str(getattr(self,"_video_meta_extra",{}).get("pose_backend","rtmpose"))
         self.peaks=[]; self._hp_candidate_audit=[]
         for rank,cand in enumerate(candidates,1):
             self.peaks.append({**cand,"rank":rank,"frame_time":None,
@@ -3542,7 +3574,7 @@ class TennisApp(tk.Tk):
             return
         path=self.video_path.get(); gen=self._gen
         camera_dir=str(getattr(self,"_video_meta_extra",{}).get("camera_dir",""))
-        backend=str(getattr(self,"_video_meta_extra",{}).get("pose_backend","yolo"))
+        backend=str(getattr(self,"_video_meta_extra",{}).get("pose_backend","rtmpose"))
         self._set_progress(62,f"姿勢で候補確認中… 0/{len(candidates)}")
 
         def _worker():
@@ -3552,8 +3584,25 @@ class TennisApp(tk.Tk):
                 fps=cap.get(cv2.CAP_PROP_FPS) or 30.0
                 duration=(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)/fps
                 mp=None; detector_cm=contextlib.nullcontext(None)
-                yolo_pose=None; yolo_objects=None
-                if backend=="yolo":
+                yolo_pose=None; yolo_objects=None; rtmpose=None; active_backend=backend
+                if backend=="rtmpose":
+                    self.after(0,lambda:self.status_var.set("RTMPoseモデル準備中…"))
+                    try:
+                        import onnxruntime as ort
+                        from rtmlib import Body
+                        device="cuda" if "CUDAExecutionProvider" in ort.get_available_providers() else "cpu"
+                        rtmpose=Body(to_openpose=False,mode="lightweight",
+                                     backend="onnxruntime",device=device)
+                        from ultralytics import YOLO
+                        yolo_objects=YOLO("yolov8n.pt")
+                    except Exception as rtmpose_error:
+                        print(f"[RTMPose準備エラー・YOLOへフォールバック] {rtmpose_error}")
+                        from ultralytics import YOLO
+                        active_backend="yolo"
+                        self.after(0,lambda:self.status_var.set("RTMPoseを準備できないためYOLOで継続します…"))
+                        yolo_pose=YOLO("yolov8n-pose.pt")
+                        yolo_objects=YOLO("yolov8n.pt")
+                elif backend=="yolo":
                     from ultralytics import YOLO
                     self.after(0,lambda:self.status_var.set("YOLO Nanoモデル準備中…"))
                     yolo_pose=YOLO("yolov8n-pose.pt")
@@ -3575,7 +3624,7 @@ class TennisApp(tk.Tk):
                     frame_no=max(0,int(round(max(0.0,t)*fps)))
                     if frame_no in frame_cache:
                         cached=frame_cache[frame_no]
-                        if need_ball and backend=="yolo" and not cached.get("ball_checked"):
+                        if need_ball and active_backend in ("yolo","rtmpose") and not cached.get("ball_checked"):
                             bgr_cached=cv2.imdecode(np.frombuffer(cached["frame_jpeg"],dtype=np.uint8),
                                                     cv2.IMREAD_COLOR)
                             h,w=bgr_cached.shape[:2]
@@ -3599,18 +3648,22 @@ class TennisApp(tk.Tk):
                         result={"time":frame_no/fps,"frame_no":frame_no,"feat":None,"kps":{}}
                         frame_cache[frame_no]=result; return result
                     kps={}
-                    if backend=="yolo":
+                    if active_backend in ("yolo","rtmpose"):
                         h,w=bgr.shape[:2]
-                        pose_result=yolo_pose.predict(bgr,verbose=False,conf=0.25)[0]
-                        best=0
-                        if pose_result.boxes is not None and len(pose_result.boxes)>1:
-                            boxes=pose_result.boxes.xyxy.cpu().numpy()
-                            best=int(np.argmax((boxes[:,2]-boxes[:,0])*(boxes[:,3]-boxes[:,1])))
-                        if pose_result.keypoints is not None and len(pose_result.keypoints.data)>best:
-                            values=pose_result.keypoints.data[best].cpu().numpy()
-                            for coco_i,value in enumerate(values[:17]):
-                                conf=float(value[2]) if len(value)>2 else 1.0
-                                kps[str(coco_i)]=[float(value[0])/w,float(value[1])/h,conf]
+                        if active_backend=="rtmpose":
+                            rt_keypoints,rt_scores=rtmpose(bgr)
+                            kps=rtmpose_result_to_coco(rt_keypoints,rt_scores,w,h)
+                        else:
+                            pose_result=yolo_pose.predict(bgr,verbose=False,conf=0.25)[0]
+                            best=0
+                            if pose_result.boxes is not None and len(pose_result.boxes)>1:
+                                boxes=pose_result.boxes.xyxy.cpu().numpy()
+                                best=int(np.argmax((boxes[:,2]-boxes[:,0])*(boxes[:,3]-boxes[:,1])))
+                            if pose_result.keypoints is not None and len(pose_result.keypoints.data)>best:
+                                values=pose_result.keypoints.data[best].cpu().numpy()
+                                for coco_i,value in enumerate(values[:17]):
+                                    conf=float(value[2]) if len(value)>2 else 1.0
+                                    kps[str(coco_i)]=[float(value[0])/w,float(value[1])/h,conf]
                         if need_ball:
                             obj_result=yolo_objects.predict(bgr,verbose=False,conf=0.15,classes=[32])[0]
                             if obj_result.boxes is not None and len(obj_result.boxes)>0:
@@ -3643,7 +3696,7 @@ class TennisApp(tk.Tk):
                     result={"time":frame_no/fps,"frame_no":frame_no,
                             "feat":feat,"kps":kps,
                             "frame_jpeg":encoded.tobytes() if ok_jpg else None,
-                            "ball_checked":bool(need_ball and backend=="yolo")}
+                            "ball_checked":bool(need_ball and active_backend in ("yolo","rtmpose"))}
                     frame_cache[frame_no]=result
                     return result
 
@@ -3658,7 +3711,7 @@ class TennisApp(tk.Tk):
                         audit_item={"time":float(t),"idx":int(cand["idx"]),
                                     "selected":bool(verdict["keep"]),
                                     "reason":verdict.get("reason","unknown"),
-                                    "backend":backend,
+                                    "backend":active_backend,
                                     "shot":verdict.get("shot","unknown"),
                                     "travel":verdict.get("travel"),
                                     "arm_change":verdict.get("arm_change")}
@@ -3690,7 +3743,7 @@ class TennisApp(tk.Tk):
                             item=dict(cand); item.update({"frame_time":float(best_t),
                                 "pose_shot":shot,"pose_confidence":verdict["confidence"],
                                 "pose_reason":verdict["reason"],
-                                "pose_backend":backend,
+                                "pose_backend":active_backend,
                                 "pose_travel":verdict.get("travel"),
                                 "pose_arm_change":verdict.get("arm_change"),
                                 "pose_samples":[{"time":float(s["time"]),
@@ -3904,7 +3957,7 @@ class TennisApp(tk.Tk):
         peak=self.peaks[self.peak_idx]; samples=list(peak.get("pose_samples") or [])
         while len(samples)<5:
             i=len(samples); samples.append({"time":max(0,peak["time"]+HP_POSE_SAMPLE_OFFSETS[i]),"kps":{}})
-        backend="YOLO" if peak.get("pose_backend")=="yolo" else "MediaPipe"
+        backend=pose_backend_label(peak.get("pose_backend"))
         _,ball_found=self._hp_motion_summary(peak)
         ball_text="  ボール検出✓" if ball_found else ""
         self._hp_detail_title.set(f"HP #{peak['rank']}  {backend}{ball_text}  "
@@ -4206,7 +4259,7 @@ class TennisApp(tk.Tk):
                      "実ピーク高さ":self._peak_energy_at(float(peak.get("time",0)),
                                                       bool(self.audio_filter_enabled.get())),
                      "採用フレーム_秒":round(float(peak.get("frame_time") or peak.get("time",0)),3),
-                     "姿勢検出":("YOLO" if peak.get("pose_backend")=="yolo" else "MediaPipe"),
+                     "姿勢検出":pose_backend_label(peak.get("pose_backend")),
                      "自動判定":peak.get("pose_shot") or "",
                      "判定理由":peak.get("pose_reason") or "",
                      "信頼度":peak.get("pose_confidence"),

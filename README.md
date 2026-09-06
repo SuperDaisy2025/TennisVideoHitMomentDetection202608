@@ -1,5 +1,14 @@
 # Hit Moment Analyzer
 
+## v91: RTMPoseを既定の姿勢エンジンへ
+
+- 動画情報画面へ `RTMPose（姿勢）＋YOLOボール` を追加し、新規動画の既定値に設定
+- RTMLibの軽量RTMPoseをONNX Runtimeで実行し、COCO-17座標へ正規化して既存のスイング判定へ接続
+- RTMPose選択時もYOLO Nanoのボール検出を併用
+- RTMPoseの初期化に失敗した場合はYOLO Poseへ安全にフォールバックし、音声候補を失わない
+- 既存動画は `_meta_extra.json` に保存済みのYOLO／MediaPipe選択を維持
+- 初回だけRTMPose／人物検出モデルが自動取得されるため、インターネット接続が必要
+
 ## v90: 人物遮蔽線統合・正面優先判定
 
 - 同一直線の途切れ区間が人物枠を横切る場合、通常より広い空白を許容して1本へ統合

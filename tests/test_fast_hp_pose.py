@@ -202,6 +202,27 @@ def test_yolo_face_direction_uses_nose_between_eyes():
     assert TA.yolo_face_direction(kps)==(True,"画面右向き")
 
 
+def test_rtmpose_output_is_normalized_to_coco17():
+    points=np.zeros((1,17,2),dtype=float)
+    scores=np.full((1,17),.8,dtype=float)
+    points[0,10]=[320,180]
+    result=TA.rtmpose_result_to_coco(points,scores,640,360)
+    assert len(result)==17
+    assert result["10"]==[.5,.5,.8]
+
+
+def test_rtmpose_selects_largest_detected_person():
+    points=np.zeros((2,17,2),dtype=float); scores=np.full((2,17),.9,dtype=float)
+    points[0,:,0]=np.linspace(10,20,17); points[0,:,1]=np.linspace(10,30,17)
+    points[1,:,0]=np.linspace(100,300,17); points[1,:,1]=np.linspace(50,330,17)
+    result=TA.rtmpose_result_to_coco(points,scores,400,400)
+    assert result["16"][0]==.75 and result["16"][1]==.825
+
+
+def test_pose_backend_label_includes_rtmpose():
+    assert TA.pose_backend_label("rtmpose")=="RTMPose"
+
+
 
 
 def classify(features):
