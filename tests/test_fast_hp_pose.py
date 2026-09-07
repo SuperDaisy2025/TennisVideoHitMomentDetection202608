@@ -308,9 +308,15 @@ def test_selected_sensitivity_is_direct_energy_threshold():
 def test_wall_mode_enforces_eight_tenths_peak_gap():
     energy=np.zeros(16,dtype=float); energy[[1,7,12]]=1.0
     data={"combined":energy,"times":np.arange(16,dtype=float)*.1,"sr":512}
-    peaks,_=TA.detect_peaks(data,sensitivity=.4,min_gap=.1,wall_mode=True)
+    peaks,_,rejected=TA.detect_peaks(data,sensitivity=.4,min_gap=.1,wall_mode=True,
+                                     return_rejected=True)
     assert TA.WALL_PEAK_MIN_GAP==.8
     assert peaks.tolist()==[1,12]
+    assert rejected.tolist()==[7]
+
+
+def test_three_meter_sound_delay_is_about_nine_milliseconds():
+    assert abs(3.0/TA.SOUND_SPEED-0.00882)<0.0001
 
 
 def test_first_minute_cache_is_separate_from_full_analysis():

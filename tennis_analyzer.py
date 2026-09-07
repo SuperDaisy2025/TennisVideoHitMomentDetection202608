@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v93"; APP_VERSION_DESC = "サウンドエネルギーランク"
+APP_VERSION = "v94"; APP_VERSION_DESC = "壁音後続ピーク監査・音速補正"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -1048,7 +1048,7 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
     return result
 
 def detect_peaks(data, sensitivity=0.5, min_gap=1.0, wall_mode=False,
-                 use_frequency_filter=True):
+                 use_frequency_filter=True,return_rejected=False):
     """ピーク検出。
        wall_mode=True なら壁打ちモード: min_gap を 0.8s 以上に強制し、
        0.05〜0.30秒間隔のペアピーク (壁エコー想定) を抑制"""
@@ -1063,7 +1063,7 @@ def detect_peaks(data, sensitivity=0.5, min_gap=1.0, wall_mode=False,
     if wall_mode:
         # 壁打ち: 候補をまず時系列で並べる
         raw_sorted=sorted(raw, key=lambda i: times[i])
-        suppressed=set()
+        suppressed=set(); gap_rejected=set()
         for j,idx in enumerate(raw_sorted):
             if idx in suppressed: continue
             tj=times[idx]
@@ -1078,11 +1078,15 @@ def detect_peaks(data, sensitivity=0.5, min_gap=1.0, wall_mode=False,
             if idx in suppressed: continue
             t=times[idx]
             if t-last_t>=min_gap: filtered.append(idx); last_t=t
-        return np.array(filtered, dtype=int), len(suppressed)
+            else:gap_rejected.add(idx)
+        rejected=np.array(sorted(suppressed|gap_rejected,key=lambda i:times[i]),dtype=int)
+        base=(np.array(filtered,dtype=int),len(rejected))
+        return (*base,rejected) if return_rejected else base
     for idx in raw:
         t=times[idx]
         if t-last_t>=min_gap: filtered.append(idx); last_t=t
-    return np.array(filtered, dtype=int), 0
+    base=(np.array(filtered,dtype=int),0)
+    return (*base,np.array([],dtype=int)) if return_rejected else base
 
 def grab_frame(video_path, time_sec):
     cap=cv2.VideoCapture(video_path)
@@ -3431,9 +3435,14 @@ class TennisApp(tk.Tk):
 
     def _current_audio_candidates(self):
         if self.data is None:return []
-        gap=WALL_PEAK_MIN_GAP if bool(self.wall_mode.get()) else self.min_gap.get()
-        indices,_=detect_peaks(self.data,self.sensitivity.get(),gap,wall_mode=False,
-                               use_frequency_filter=bool(self.audio_filter_enabled.get()))
+        wall=bool(self.wall_mode.get())
+        gap=WALL_PEAK_MIN_GAP if wall else self.min_gap.get()
+        indices,_,rejected=detect_peaks(
+            self.data,self.sensitivity.get(),gap,wall_mode=wall,
+            use_frequency_filter=bool(self.audio_filter_enabled.get()),return_rejected=True)
+        self._wall_gap_rejected_candidates=[
+            {"idx":int(i),"time":float(self.data["times"][i]),"selected":False,
+             "reason":"wall_gap","backend":"audio"} for i in rejected]
         return [{"idx":int(i),"time":float(self.data["times"][i])} for i in indices]
 
     def _show_provisional_audio_candidates(self,candidates):
@@ -3446,6 +3455,7 @@ class TennisApp(tk.Tk):
                                "pose_samples":[]})
             self._hp_candidate_audit.append({**cand,"selected":None,
                                              "reason":"pending","backend":backend})
+        self._hp_candidate_audit.extend(getattr(self,"_wall_gap_rejected_candidates",[]))
         self.peak_idx=min(self.peak_idx,max(0,len(self.peaks)-1))
         self._update_shot_list(); self._draw_timeline()
         self.status_var.set(f"音声候補 {len(candidates)}件を仮表示しました。姿勢確認中…")
@@ -3574,8 +3584,7 @@ class TennisApp(tk.Tk):
     def _start_fast_hp_pose_filter(self,candidates=None):
         """音声候補を3枚のMediaPipe Poseで絞り、打点だけ局所探索する。"""
         if self.data is None: return
-        # 壁打ちはラケット音と壁音を両方候補に残し、姿勢一致で後者を落とす。
-        # find_peaksのdistanceで先に片方を消さないよう、この段階だけ間隔を短くする。
+        # 壁打ちは0.8秒以内の後続ピークを壁音候補として先に除外する。
         candidates=self._current_audio_candidates() if candidates is None else list(candidates)
         if not candidates:
             self._hp_candidate_audit=[]
@@ -3584,6 +3593,9 @@ class TennisApp(tk.Tk):
         path=self.video_path.get(); gen=self._gen
         camera_dir=str(getattr(self,"_video_meta_extra",{}).get("camera_dir",""))
         backend=str(getattr(self,"_video_meta_extra",{}).get("pose_backend","rtmpose"))
+        try:camera_distance=float(self.camera_dist.get())
+        except Exception:camera_distance=3.0
+        sound_delay=camera_distance/SOUND_SPEED
         self._set_progress(62,f"姿勢で候補確認中… 0/{len(candidates)}")
 
         def _worker():
@@ -3714,7 +3726,8 @@ class TennisApp(tk.Tk):
                     for n,cand in enumerate(candidates,1):
                         if self._gen != gen: return
                         t=cand["time"]
-                        coarse=[detect_at(det,max(0.0,min(duration,t+d)),need_ball=True)
+                        hit_t=max(0.0,t-sound_delay)
+                        coarse=[detect_at(det,max(0.0,min(duration,hit_t+d)),need_ball=True)
                                 for d in HP_POSE_SAMPLE_OFFSETS]
                         verdict=self._classify_hp_pose_triplet(coarse)
                         audit_item={"time":float(t),"idx":int(cand["idx"]),
@@ -3724,6 +3737,8 @@ class TennisApp(tk.Tk):
                                     "shot":verdict.get("shot","unknown"),
                                     "travel":verdict.get("travel"),
                                     "arm_change":verdict.get("arm_change")}
+                        audit_item["sound_delay_sec"]=sound_delay
+                        audit_item["pose_center_time"]=hit_t
                         audit.append(audit_item)
                         item=None
                         if not verdict["keep"]:
@@ -3742,7 +3757,7 @@ class TennisApp(tk.Tk):
                             best_score=self._hp_objective(best.get("feat"),shot,camera_dir) if best else None
                             stale=0; max_steps=max(1,int(round(HP_POSE_MAX_REFINE_SEC*fps)))
                             for step in range(1,max_steps+1):
-                                s=detect_at(det,t+direction*step/fps)
+                                s=detect_at(det,hit_t+direction*step/fps)
                                 score=self._hp_objective(s.get("feat"),shot,camera_dir)
                                 if score is not None and (best_score is None or score>best_score+1e-4):
                                     best_score=score; best_t=s["time"]; stale=0
@@ -3755,6 +3770,7 @@ class TennisApp(tk.Tk):
                                 "pose_backend":active_backend,
                                 "pose_travel":verdict.get("travel"),
                                 "pose_arm_change":verdict.get("arm_change"),
+                                "sound_delay_sec":sound_delay,
                                 "pose_samples":[{"time":float(s["time"]),
                                                 "frame_no":int(s.get("frame_no",round(s["time"]*fps))),
                                                 "kps":s.get("kps",{}),
@@ -3777,7 +3793,8 @@ class TennisApp(tk.Tk):
         threading.Thread(target=_worker,daemon=True).start()
 
     def _finish_fast_hp_pose_filter(self,accepted,rejected,audit):
-        self._hp_candidate_audit=list(audit)
+        self._hp_candidate_audit=list(audit)+list(
+            getattr(self,"_wall_gap_rejected_candidates",[]))
         self._refresh_peaks(refined_candidates=accepted,pose_rejected=rejected)
 
     def _render_hp_detail_photo(self,canvas,sample,slot):
