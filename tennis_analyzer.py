@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v94"; APP_VERSION_DESC = "壁音後続ピーク監査・音速補正"
+APP_VERSION = "v95"; APP_VERSION_DESC = "ヒットポイント画面整理"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -2024,10 +2024,9 @@ class TennisApp(tk.Tk):
 
         self._hsep(p)
 
-        # ヒットポイント一覧 + 分類済フィルタ
+        # ヒットポイント一覧
         hp_hdr=tk.Frame(p,bg=PANEL); hp_hdr.pack(fill="x",padx=12,pady=(2,2))
-        # v61: ★凡例
-        tk.Label(p,text="★=KP検出済  ◆=クロップ設定済  △=手ぶれ",
+        tk.Label(p,text="★=KP検出済  ◆=クロップ設定済  ⚠=手ぶれ  C1/C2=クロップ番号  未分類=手動分類なし",
                  bg=PANEL,fg=SUBTEXT,font=_tk_font(11),anchor="w"
                  ).pack(fill="x",padx=12)
         tk.Label(hp_hdr,text="ヒットポイント",bg=PANEL,fg=ACCENT2,
@@ -2040,16 +2039,12 @@ class TennisApp(tk.Tk):
                              command=lambda m=mode:self._set_hp_sort_mode(m),cursor="hand2")
             button.pack(side="left",padx=1,ipadx=2); self._hp_sort_buttons[mode]=button
         self._refresh_hp_sort_buttons()
-        # v24: 「分類済」チェックボックス — 未分類 HP を非表示
+        # 互換用。分類UIはv95で非表示だが、保存済みデータは維持する。
         self._show_classified_only=tk.BooleanVar(value=False)
-        tk.Checkbutton(hp_hdr,text="分類済",variable=self._show_classified_only,
-                       bg=PANEL,fg=SUBTEXT,activebackground=PANEL,selectcolor=DARK2,
-                       font=_tk_font(11),command=self._on_classified_filter_changed
-                        ).pack(side="right")
-        tk.Label(p,text="正解  時刻・分類 | RWx RWy RWd  R% LWx LWy LWd  L% REx REy LEx LEy  B   SE   S%",
+        tk.Label(p,text="正解  HP/状態・時刻       | 右手首X  Y   距離  比率  左手首X  Y   距離  比率  右肘X  Y  左肘X  Y  球  音量  比率",
                  bg=PANEL,fg=SUBTEXT,font=("Courier",12,"bold"),anchor="w"
                  ).pack(fill="x",padx=12)
-        tk.Label(p,text="R/L:右/左 W:手首 d=|x|+|y| E:ひじ B=ボール SE=音響エネルギー %=各TOP3平均比",
+        tk.Label(p,text="X=画面右＋ / Y=画面下＋ / 距離=|X|+|Y| (cm) / 比率=各項目TOP3平均に対する割合",
                  bg=PANEL,fg=SUBTEXT,font=_tk_font(11),anchor="w"
                  ).pack(fill="x",padx=12)
         tk.Button(hp_hdr,text="Excel出力",bg=DARK2,fg=GOLD,relief="flat",
@@ -2073,33 +2068,10 @@ class TennisApp(tk.Tk):
         self.peak_list.bind("<Button-3>",self._on_list_right_click)
         self.peak_list.bind("<Delete>",
                              lambda e: (self._delete_current_checkpoint(), "break")[1])
-        try: truth_name=os.path.basename(get_ground_truth_db_path())
-        except Exception: truth_name="hit_point_ground_truth.db"
-        tk.Label(p,text=f"☑ 正解データ: {truth_name}",bg=PANEL,fg=SUBTEXT,
-                 font=_tk_font(11),anchor="w").pack(fill="x",padx=12,pady=(0,2))
-
-        # v53: 検出情報（削除/再採番は削除、検出ステータスを表示）
-        # v61: 検出情報 3行+ボタン形式
+        # v95: 正解DB名と画像/MP/YOLO検出ステータス行は画面から撤去。
+        # 辞書だけ残し、旧処理から参照されても安全にする。
         self._di_vars = {}
         self._di_btns = {}
-        di_frame = tk.Frame(p, bg=PANEL)
-        di_frame.pack(fill="x", padx=12, pady=(2,4))
-        for key, lbl, btn_txt, cmd in [
-                ("img", "画像", "抽出", self._di_extract_images),
-                ("mp",  "MP",  "検出", lambda: self._run_mp_detect_bg()),
-                ("yolo","YOLO","検出", self._run_yolo_current_cp)]:
-            row = tk.Frame(di_frame, bg=PANEL)
-            row.pack(fill="x", pady=1)
-            tk.Label(row, text=f"{lbl}:", bg=PANEL, fg=TEXT, width=5,
-                     font=_tk_font(9, True), anchor="w").pack(side="left")
-            v = tk.StringVar(value="─")
-            self._di_vars[key] = v
-            tk.Label(row, textvariable=v, bg=PANEL, fg=TEXT,
-                     font=_tk_font(9), anchor="w").pack(side="left", fill="x", expand=True)
-            b = tk.Button(row, text=btn_txt, bg=DARK2, fg=GOLD, relief="flat",
-                          font=_tk_font(8), cursor="hand2", command=cmd, width=5)
-            b.pack(side="right")
-            self._di_btns[key] = b
         # 旧互換
         self._detect_info_var = tk.StringVar(value="")
 
@@ -2350,56 +2322,14 @@ class TennisApp(tk.Tk):
                  bg=BG,fg=SUBTEXT,font=_tk_font(10),anchor="w").pack(fill="x",padx=20,pady=(0,10))
 
     def _build_label_bar(self,parent):
-        # ショット
-        c1=tk.Frame(parent,bg=PANEL2); c1.pack(side="left",padx=(8,4),pady=5)
-        tk.Label(c1,text="ショット",bg=PANEL2,fg=SUBTEXT,font=_tk_font(9)).pack(anchor="w")
-        sg=tk.Frame(c1,bg=PANEL2); sg.pack()
+        # v95: 手動分類UIは一旦非表示。保存済み分類データとの互換性は維持する。
         self._shot_btns={}
-        for i,(ja,en) in enumerate(SHOT_TYPES):
-            noise=(en=="noise")
-            b=tk.Button(sg,text=ja,width=6,
-                        bg="#2a0a0a" if noise else DARK2,
-                        fg=ACCENT   if noise else TEXT,
-                        relief="flat",font=_tk_font(10),
-                        command=lambda e=en: self._select_shot(e,auto_save=True))
-            b.grid(row=i//4,column=i%4,padx=2,pady=1)
-            self._shot_btns[en]=b
-
-        tk.Frame(parent,bg=BORDER,width=1).pack(side="left",fill="y",pady=4)
-
-        # 回転
-        c2=tk.Frame(parent,bg=PANEL2); c2.pack(side="left",padx=4,pady=5)
-        tk.Label(c2,text="回転",bg=PANEL2,fg=SUBTEXT,font=_tk_font(9)).pack(anchor="w")
-        spg=tk.Frame(c2,bg=PANEL2); spg.pack()
         self._spin_btns={}
-        for i,(ja,en) in enumerate(SPINS):
-            b=tk.Button(spg,text=ja,width=6,bg=DARK2,fg=TEXT,
-                        relief="flat",font=_tk_font(10),
-                        command=lambda e=en: self._select_spin(e,auto_save=True))
-            b.grid(row=0,column=i,padx=2,pady=1)
-            self._spin_btns[en]=b
-
-        tk.Frame(parent,bg=BORDER,width=1).pack(side="left",fill="y",pady=4)
-
-        # 評価
-        c3=tk.Frame(parent,bg=PANEL2); c3.pack(side="left",padx=4,pady=5)
-        tk.Label(c3,text="評価",bg=PANEL2,fg=SUBTEXT,font=_tk_font(9)).pack(anchor="w")
-        rtg=tk.Frame(c3,bg=PANEL2); rtg.pack()
         self._rating_btns={}
         self._rating_selected={}
-        for i,(ja,en) in enumerate(RATINGS):
-            self._rating_selected[en]=False
-            b=tk.Button(rtg,text=ja,width=6,bg=DARK2,fg=TEXT,
-                        relief="flat",font=_tk_font(10),
-                        command=lambda e=en: self._select_rating(e,auto_save=True))
-            b.grid(row=0,column=i,padx=2,pady=1)
-            self._rating_btns[en]=b
-
-        tk.Frame(parent,bg=BORDER,width=1).pack(side="left",fill="y",pady=4)
 
         # CP追加ボタン (現在の表示コマを新規チェックポイントとして登録)
-        c4=tk.Frame(parent,bg=PANEL2); c4.pack(side="left",padx=8,pady=5)
-        tk.Label(c4,text="",bg=PANEL2,fg=SUBTEXT,font=_tk_font(9)).pack()
+        c4=tk.Frame(parent,bg=PANEL2); c4.pack(side="right",padx=8,pady=4)
         tk.Button(c4,text="CP追加",bg=ACCENT2,fg="white",
                   relief="flat",font=_tk_font(12,bold=True),
                   command=self._add_checkpoint_at_current,cursor="hand2",width=7
@@ -4423,7 +4353,7 @@ class TennisApp(tk.Tk):
                 ft_str=f"{ft:.2f}s" if (ft is not None and ft>0) else f"{t:.2f}s"
                 tag=f"{checkmark} #{rank:02d}{icons}{rating_icon} {ft_str} {shot_ja}/{spin_ja}{cb}"
             else:
-                state="確認中" if p.get("pose_reason")=="pending" else "未"
+                state="確認中" if p.get("pose_reason")=="pending" else "未分類"
                 tag=f"{checkmark} #{rank:02d}{icons} {t:.2f}s {state}{cb}"
             motion,ball=motion_cache[i]
             def compact(key):
@@ -4451,7 +4381,7 @@ class TennisApp(tk.Tk):
     # ══════════════════════════════════════════
     def _update_detect_info(self):
         """v61: 検出情報 (画像/MP/YOLO) 3行を更新"""
-        if not hasattr(self, "_di_vars"): return
+        if not getattr(self, "_di_vars", None): return
         if not self.peaks or self.peak_idx >= len(self.peaks):
             for v in self._di_vars.values(): v.set("─")
             return

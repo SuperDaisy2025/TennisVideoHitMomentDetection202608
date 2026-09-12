@@ -460,3 +460,10 @@ def test_verified_database_migrates_existing_schema_for_sensitivity():
         con.close()
         assert {"content_type","sensitivity","peak_energy","audio_filter_enabled"}.issubset(columns)
         assert "pose_backend" in pk
+
+
+def test_crop_badges_use_clear_time_ordered_numbers():
+    app=object.__new__(TA.TennisApp)
+    app._crops=[{"rank":8,"time":3.0},{"rank":4,"time":1.0},
+                {"rank":0,"time":0.5}]
+    assert app._crop_badges()=={4:"C1",8:"C2"}
