@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v97"; APP_VERSION_DESC = "同期ヘッダー・移動量安定化"
+APP_VERSION = "v98"; APP_VERSION_DESC = "詳細グラフ時刻・一覧簡素化"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -2026,7 +2026,7 @@ class TennisApp(tk.Tk):
 
         # ヒットポイント一覧
         hp_hdr=tk.Frame(p,bg=PANEL); hp_hdr.pack(fill="x",padx=12,pady=(2,2))
-        tk.Label(p,text="★=KP検出済  ◆=クロップ設定済  ⚠=手ぶれ  C1/C2=クロップ番号  未分類=手動分類なし",
+        tk.Label(p,text="★=KP検出済  ◆=詳細検出済  ✂=クロップあり  ⚠=手ぶれ",
                  bg=PANEL,fg=SUBTEXT,font=_tk_font(11),anchor="w"
                  ).pack(fill="x",padx=12)
         tk.Label(hp_hdr,text="ヒットポイント",bg=PANEL,fg=ACCENT2,
@@ -2054,7 +2054,7 @@ class TennisApp(tk.Tk):
         self.peak_header=tk.Listbox(lf,bg="#dfe7e1",fg="#111111",height=1,
                                     relief="flat",font=("Courier",11,"bold"),
                                     activestyle="none",takefocus=False)
-        self.peak_header.insert("end","正  No    秒    種類/状態      C  | RWx RWy RWd  %  LWx LWy LWd  %  REx REy LEx LEy 球  音   %")
+        self.peak_header.insert("end","No     秒      印  RWx RWy RWd  %  LWx LWy LWd  %  REx REy LEx LEy 球  音   %")
         self.peak_header.pack(side="top",fill="x")
         self.peak_list=tk.Listbox(lf,bg=DARK2,fg=TEXT,selectbackground=GOLD,
                                    selectforeground="#111111",exportselection=False,
@@ -2067,7 +2067,6 @@ class TennisApp(tk.Tk):
             self.peak_header.xview(*args); self.peak_list.xview(*args)
         hsb.config(command=_scroll_hp_columns)
         self.peak_list.bind("<<ListboxSelect>>",self._on_list_select)
-        self.peak_list.bind("<Button-1>",self._on_peak_truth_click,add="+")
         # 右クリック / Delキー で削除
         self.peak_list.bind("<Button-3>",self._on_list_right_click)
         self.peak_list.bind("<Delete>",
@@ -3774,6 +3773,11 @@ class TennisApp(tk.Tk):
                           self.data.get("broadband",self.data.get("combined",[])))
         mask=(times>=lo)&(times<=hi); tx=times[mask]; ey=energy[mask]
         pl,pr,pt,pb=42,14,12,25
+        # v98: 点の意味をグラフ内の空き領域へ表示（描画サイズは変えない）。
+        cv.create_text(w-pr-88,pt,text="● 採用",fill="#26c281",
+                       font=_tk_font(8,bold=True),anchor="ne")
+        cv.create_text(w-pr,pt,text="● 除外",fill=RED,
+                       font=_tk_font(8,bold=True),anchor="ne")
         cv.create_line(pl,h-pb,w-pr,h-pb,fill=BORDER); cv.create_line(pl,pt,pl,h-pb,fill=BORDER)
         if len(tx)>1:
             top=max(float(np.max(energy)),1e-6); coords=[]
@@ -3786,7 +3790,9 @@ class TennisApp(tk.Tk):
             cv.create_text(pl+4,threshold_y-3,text=f"検出閾値 {threshold:.2f}",fill=RED,
                            font=_tk_font(8,bold=True),anchor="sw")
         for rel in range(-2,3):
-            x=pl+(rel+2)/4*(w-pl-pr); cv.create_text(x,h-10,text=f"{rel:+d}s",fill=SUBTEXT,font=_tk_font(8))
+            x=pl+(rel+2)/4*(w-pl-pr)
+            cv.create_text(x,h-10,text=f"{rel:+d}s / {center+rel:.2f}s",
+                           fill=SUBTEXT,font=_tk_font(8))
         for i,s in enumerate(samples[:5]):
             x=pl+(float(s.get("time",center))-lo)/4*(w-pl-pr); color=GOLD if i==2 else "#68a9ff"
             cv.create_line(x,pt,x,h-pb,fill=color,width=3 if i==2 else 2)
@@ -4291,8 +4297,6 @@ class TennisApp(tk.Tk):
         self._list_to_peak_idx=[]
         classified_only=(self._show_classified_only.get()
                          if hasattr(self,"_show_classified_only") else False)
-        try: truth_keys=load_ground_truth_keys(path) if path else set()
-        except Exception: truth_keys=set()
         motion_cache={i:self._hp_motion_summary(p) for i,p in enumerate(self.peaks)}
         energy_cache={i:self._peak_energy_at(float(p.get("time",0)),
                       bool(self.audio_filter_enabled.get())) for i,p in enumerate(self.peaks)}
@@ -4323,8 +4327,6 @@ class TennisApp(tk.Tk):
             # v24: 分類済フィルタ — ラベルがない HP は非表示
             if classified_only and lbl is None:
                 continue
-            cb=badges.get(rank,"")
-            cb=f" [{cb}]" if cb else ""
             # v23: アイコン (クロップ + 検出済 + refined)
             has_y,has_r=check_cp_yolo_status(path,rank) if path else (False,False)
             icons=""
@@ -4335,21 +4337,7 @@ class TennisApp(tk.Tk):
             if self._is_shaky(rank): icons+="⚠"
             icons=icons
             # v24: 評価アイコン (nice/super→👍、miss→👎、それ以外はスペース)
-            checked=(int(rank),round(float(t),3),self._hp_backend(p)) in truth_keys
-            checkmark="☑" if checked else "☐"
-            if lbl:
-                rating=lbl[2]
-                rating_icon="👍" if rating in ("nice","super") else \
-                            "👎" if rating=="miss" else ""
-                shot_ja=next((ja for ja,en in SHOT_TYPES if en==lbl[0]),"?")
-                spin_ja=next((ja for ja,en in SPINS      if en==lbl[1]),"")
-                ft=lbl[3]
-                ft_str=f"{ft:.2f}s" if (ft is not None and ft>0) else f"{t:.2f}s"
-                shot_state=f"{shot_ja}/{spin_ja}"
-                tag=f"{checkmark}  {rank:02d}  {ft_str:>7}  {shot_state:<12.12} {cb:<5} {icons}{rating_icon}"
-            else:
-                state="確認中" if p.get("pose_reason")=="pending" else "未分類"
-                tag=f"{checkmark}  {rank:02d}  {t:6.2f}s  {state:<12} {cb:<5} {icons}"
+            tag=f"{rank:02d}  {t:7.2f}s  {icons:<4}"
             motion,ball=motion_cache[i]
             def compact(key):
                 value=motion.get(key)
@@ -4361,7 +4349,7 @@ class TennisApp(tk.Tk):
                 return "  --" if value is None or not base else f"{value/base*100:4.0f}%"
             def ratio_value(value,base):
                 return "  --" if value is None or not base else f"{float(value)/base*100:4.0f}%"
-            tag += (" |"+compact("rw_x")+compact("rw_y")+distance("rw_d")+
+            tag += (compact("rw_x")+compact("rw_y")+distance("rw_d")+
                     ratio("rw_d",rwd_top3)+compact("lw_x")+compact("lw_y")+
                     distance("lw_d")+ratio("lw_d",lwd_top3)+
                     "".join(compact(key) for key in ("re_x","re_y","le_x","le_y"))+
