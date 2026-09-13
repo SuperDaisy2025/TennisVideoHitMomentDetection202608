@@ -347,10 +347,10 @@ def test_motion_summary_is_signed_horizontal_cm_delta_and_reports_ball():
     samples=[sample(0.6),sample(0.62),sample(0.65,True),sample(0.68),sample(0.7)]
     values,ball=TA.TennisApp._compute_hp_motion_cm(samples,(100,100),160)
     assert ball is True
-    # Uses -0.1s (x=.62) and +0.1s (x=.68): 6px * 2cm/px = +12cm.
-    assert all(abs(values[key]-12.0)<1e-6 for key in ("rw_x","lw_x","re_x","le_x"))
+    # ±0.1秒の12cmと、±0.2秒を同じ時間幅へ直した10cmの平均。
+    assert all(abs(values[key]-11.0)<1e-6 for key in ("rw_x","lw_x","re_x","le_x"))
     assert all(abs(values[key])<1e-6 for key in ("rw_y","lw_y","re_y","le_y"))
-    assert values["rw_d"]==12.0 and values["lw_d"]==12.0
+    assert values["rw_d"]==11.0 and values["lw_d"]==11.0
 
 
 def test_motion_summary_treats_image_right_as_positive():
@@ -360,7 +360,7 @@ def test_motion_summary_treats_image_right_as_positive():
         return {"kps":kps}
     values,_=TA.TennisApp._compute_hp_motion_cm(
         [sample(.5),sample(.7),sample(.6),sample(.4),sample(.5)],(100,100),160)
-    assert all(abs(values[key]+60.0)<1e-6 for key in ("rw_x","lw_x","re_x","le_x"))
+    assert all(abs(values[key]+30.0)<1e-6 for key in ("rw_x","lw_x","re_x","le_x"))
     assert all(abs(values[key])<1e-6 for key in ("rw_y","lw_y","re_y","le_y"))
 
 
@@ -371,8 +371,19 @@ def test_motion_summary_treats_image_down_as_positive_y():
         return {"kps":kps}
     values,_=TA.TennisApp._compute_hp_motion_cm(
         [sample(.5),sample(.3),sample(.4),sample(.5),sample(.4)],(100,100),160)
-    assert all(abs(values[key]-40.0)<1e-6 for key in ("rw_y","lw_y","re_y","le_y"))
-    assert values["rw_d"]==40.0 and values["lw_d"]==40.0
+    assert all(abs(values[key]-15.0)<1e-6 for key in ("rw_y","lw_y","re_y","le_y"))
+    assert values["rw_d"]==15.0 and values["lw_d"]==15.0
+
+
+def test_motion_summary_ignores_low_confidence_outer_outlier():
+    def sample(x,confidence=.9):
+        kps={"0":[.5,.1,.9],"15":[.5,.9,.9],"16":[.5,.9,.9]}
+        for index in (10,9,8,7):kps[str(index)]=[x,.4,confidence]
+        return {"kps":kps}
+    values,_=TA.TennisApp._compute_hp_motion_cm(
+        [sample(-.3,.3),sample(.4),sample(.5),sample(.6),sample(1.3,.3)],(100,100),160)
+    # 外側ペアは大きく低信頼なので、±0.1秒の値を採用する。
+    assert all(abs(values[key]-40.0)<1e-6 for key in ("rw_x","lw_x","re_x","le_x"))
 
 
 def test_motion_summary_uses_torso_scale_when_ankles_are_missing():
@@ -467,3 +478,14 @@ def test_crop_badges_use_clear_time_ordered_numbers():
     app._crops=[{"rank":8,"time":3.0},{"rank":4,"time":1.0},
                 {"rank":0,"time":0.5}]
     assert app._crop_badges()=={4:"C1",8:"C2"}
+
+
+def test_video_selection_opens_info_without_direction_estimation():
+    class Value:
+        def get(self): return __file__
+    app=object.__new__(TA.TennisApp)
+    app.video_path=Value(); app._cached_video_path=""
+    opened=[]
+    app._show_video_info_popup=lambda path:opened.append(path)
+    app._on_video_selected()
+    assert opened==[__file__]

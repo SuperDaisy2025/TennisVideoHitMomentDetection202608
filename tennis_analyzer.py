@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v95"; APP_VERSION_DESC = "ヒットポイント画面整理"
+APP_VERSION = "v97"; APP_VERSION_DESC = "同期ヘッダー・移動量安定化"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -2041,11 +2041,8 @@ class TennisApp(tk.Tk):
         self._refresh_hp_sort_buttons()
         # 互換用。分類UIはv95で非表示だが、保存済みデータは維持する。
         self._show_classified_only=tk.BooleanVar(value=False)
-        tk.Label(p,text="正解  HP/状態・時刻       | 右手首X  Y   距離  比率  左手首X  Y   距離  比率  右肘X  Y  左肘X  Y  球  音量  比率",
-                 bg=PANEL,fg=SUBTEXT,font=("Courier",12,"bold"),anchor="w"
-                 ).pack(fill="x",padx=12)
-        tk.Label(p,text="X=画面右＋ / Y=画面下＋ / 距離=|X|+|Y| (cm) / 比率=各項目TOP3平均に対する割合",
-                 bg=PANEL,fg=SUBTEXT,font=_tk_font(11),anchor="w"
+        tk.Label(p,text="RW/LW=右/左手首  RE/LE=右/左肘  d=移動cm  %対Top3=上位3件平均比  C=クロップ",
+                 bg=PANEL,fg=SUBTEXT,font=_tk_font(10),anchor="w"
                  ).pack(fill="x",padx=12)
         tk.Button(hp_hdr,text="Excel出力",bg=DARK2,fg=GOLD,relief="flat",
                   font=_tk_font(10,bold=True),command=self._export_hit_points_xlsx,
@@ -2054,14 +2051,21 @@ class TennisApp(tk.Tk):
         lf.pack(fill="both",expand=True,padx=12,pady=(0,4))
         sb=tk.Scrollbar(lf,bg=PANEL); sb.pack(side="right",fill="y")
         hsb=tk.Scrollbar(lf,bg=PANEL,orient="horizontal"); hsb.pack(side="bottom",fill="x")
+        self.peak_header=tk.Listbox(lf,bg="#dfe7e1",fg="#111111",height=1,
+                                    relief="flat",font=("Courier",11,"bold"),
+                                    activestyle="none",takefocus=False)
+        self.peak_header.insert("end","正  No    秒    種類/状態      C  | RWx RWy RWd  %  LWx LWy LWd  %  REx REy LEx LEy 球  音   %")
+        self.peak_header.pack(side="top",fill="x")
         self.peak_list=tk.Listbox(lf,bg=DARK2,fg=TEXT,selectbackground=GOLD,
                                    selectforeground="#111111",exportselection=False,
-                                   relief="flat",font=("Courier",13),
+                                   relief="flat",font=("Courier",12),
                                    yscrollcommand=sb.set,xscrollcommand=hsb.set,
                                    activestyle="none")
         self.peak_list.pack(side="left",fill="both",expand=True)
         sb.config(command=self.peak_list.yview)
-        hsb.config(command=self.peak_list.xview)
+        def _scroll_hp_columns(*args):
+            self.peak_header.xview(*args); self.peak_list.xview(*args)
+        hsb.config(command=_scroll_hp_columns)
         self.peak_list.bind("<<ListboxSelect>>",self._on_list_select)
         self.peak_list.bind("<Button-1>",self._on_peak_truth_click,add="+")
         # 右クリック / Delキー で削除
@@ -2074,16 +2078,6 @@ class TennisApp(tk.Tk):
         self._di_btns = {}
         # 旧互換
         self._detect_info_var = tk.StringVar(value="")
-
-        # v59: KP検出ボタン (MediaPipeデフォルト + YOLO別メニュー)
-        tk.Button(p,text="🎯  現在のヒットポイントを解析",
-                  bg=DARK2,fg=GOLD,relief="flat",font=_tk_font(10,bold=True),
-                  command=self._run_yolo_current_cp,cursor="hand2"
-                  ).pack(fill="x",padx=12,pady=(0,2),ipady=4)
-        tk.Button(p,text="📥  YOLOで再検出",
-                  bg=DARK2,fg=SUBTEXT,relief="flat",font=_tk_font(8),
-                  command=self._run_yolo_current_cp,cursor="hand2"
-                  ).pack(fill="x",padx=12,pady=(0,4),ipady=2)
 
         self.status_var=tk.StringVar(value="動画を選択してください")
         tk.Label(p,textvariable=self.status_var,bg=PANEL,fg=SUBTEXT,
@@ -2236,10 +2230,9 @@ class TennisApp(tk.Tk):
                                       font=_tk_font(9))
         self.lbl_crop_status.pack(side="left",padx=8)
 
-        # ラベルバー
-        self._label_bar=tk.Frame(m,bg=PANEL2)
-        self._label_bar.pack(fill="x")
-        self._build_label_bar(self._label_bar)
+        # v96: CP追加はクロップ操作と同じ行へ集約。
+        self._label_bar=crop_bar
+        self._build_label_bar(crop_bar)
 
     def _build_tab_hp_detail(self,parent):
         """選択HPの5姿勢フレーム、音声エネルギー、判定結果を表示。"""
@@ -2762,20 +2755,8 @@ class TennisApp(tk.Tk):
         # v22: 同じ動画への再選択は無視 (state リセットでフリッカ防止)
         if path == self._cached_video_path:
             return
-        # v77: 設定画面より先に、数枚だけで撮影方向を高速推定する。
-        token=time.time(); self._direction_estimate_token=token
-        if hasattr(self,"status_var"): self.status_var.set("撮影方向を高速推定中…")
-        def _worker():
-            try: estimate=estimate_camera_direction_fast(path)
-            except Exception as e:
-                estimate={"direction":"不明・複数","confidence":0.0,
-                          "reason":f"推定できませんでした: {e}","samples":0}
-            def _done():
-                if (getattr(self,"_direction_estimate_token",None)==token and
-                        self.video_path.get().strip()==path):
-                    self._show_direction_inspection_popup(path,estimate)
-            self.after(0,_done)
-        threading.Thread(target=_worker,daemon=True).start()
+        # v96: 撮影方向の自動推定・5枚確認は行わず、動画情報へ直接進む。
+        self._show_video_info_popup(path)
 
     def _show_direction_inspection_popup(self,path,estimate):
         """v78: 方向推定に使った5枚と、画像ごとの検出根拠を先に示す。"""
@@ -2990,18 +2971,11 @@ class TennisApp(tk.Tk):
                 with open(extra_path, "r", encoding="utf-8") as f:
                     saved_extra = json.load(f)
         except Exception: pass
-        # カメラ方向: 自動推定を初期値にし、ラジオボタンで訂正可能。
-        direction_estimate=direction_estimate or {"direction":"不明・複数",
-                                                   "confidence":0.0,"reason":"推定なし"}
-        estimated_dir=str(direction_estimate.get("direction","不明・複数"))
+        # v96: カメラ方向は保存済み設定またはユーザー入力のみを使用する。
+        direction_estimate={"direction":"不明・複数","confidence":0.0,"reason":"自動推定なし"}
+        estimated_dir="不明・複数"
         saved_dir=saved_extra.get("camera_dir")
         confidence=float(direction_estimate.get("confidence",0.0))
-        estimate_text=(f"自動推定: {estimated_dir}（信頼度 {confidence:.0%}）  "
-                       f"{direction_estimate.get('reason','')}")
-        if saved_dir: estimate_text += "  ※保存済みの選択を優先"
-        tk.Label(right,text=estimate_text,bg="#cbe6d1",fg=ACCENT2,
-                 font=_tk_font(9,True),justify="left",wraplength=500,
-                 padx=7,pady=5).pack(anchor="w",fill="x",pady=(2,4))
         tk.Label(right, text="カメラ方向:", bg=PANEL, fg=TEXT,
                  font=_tk_font(10, True)).pack(anchor="w", pady=(4,2))
         prior_meta=(meta.get("camera_dirs",[])+[None])[0]
@@ -3579,7 +3553,8 @@ class TennisApp(tk.Tk):
                             bgr_cached=cv2.imdecode(np.frombuffer(cached["frame_jpeg"],dtype=np.uint8),
                                                     cv2.IMREAD_COLOR)
                             h,w=bgr_cached.shape[:2]
-                            obj=yolo_objects.predict(bgr_cached,verbose=False,conf=0.15,classes=[32])[0]
+                            obj=yolo_objects.predict(bgr_cached,verbose=False,conf=0.08,
+                                                     imgsz=1280,classes=[32])[0]
                             if obj.boxes is not None and len(obj.boxes)>0:
                                 confs=obj.boxes.conf.cpu().numpy(); boxes=obj.boxes.xyxy.cpu().numpy()
                                 wrist=cached["kps"].get("10")
@@ -3616,7 +3591,8 @@ class TennisApp(tk.Tk):
                                     conf=float(value[2]) if len(value)>2 else 1.0
                                     kps[str(coco_i)]=[float(value[0])/w,float(value[1])/h,conf]
                         if need_ball:
-                            obj_result=yolo_objects.predict(bgr,verbose=False,conf=0.15,classes=[32])[0]
+                            obj_result=yolo_objects.predict(bgr,verbose=False,conf=0.08,
+                                                            imgsz=1280,classes=[32])[0]
                             if obj_result.boxes is not None and len(obj_result.boxes)>0:
                                 confs=obj_result.boxes.conf.cpu().numpy()
                                 boxes=obj_result.boxes.xyxy.cpu().numpy()
@@ -3887,13 +3863,31 @@ class TennisApp(tk.Tk):
             out={}
             for key,ki in joint_map:
                 v=kps.get(str(ki))
-                if valid(v):out[key]=(float(v[0])*w,float(v[1])*h)
+                if valid(v):out[key]=(float(v[0])*w,float(v[1])*h,float(v[2]))
             return out
-        before=positions(samples[1]); after=positions(samples[3])
+        points=[positions(sample) for sample in samples[:5]]
+        def interval_vector(key,left,right,scale=1.0):
+            if key not in points[left] or key not in points[right]:return None
+            a=points[left][key]; b=points[right][key]
+            return ((b[0]-a[0])*scale,(b[1]-a[1])*scale,min(a[2],b[2]))
+        def stable_vector(key):
+            # ±0.1秒と±0.2秒を同じ0.2秒相当へ正規化して平均する。
+            inner=interval_vector(key,1,3,1.0)
+            outer=interval_vector(key,0,4,0.5)
+            if inner is None:return outer
+            if outer is None:return inner
+            mi=math.hypot(inner[0],inner[1]); mo=math.hypot(outer[0],outer[1])
+            if min(mi,mo)>1.0 and max(mi,mo)>min(mi,mo)*2.5:
+                # 大きく食い違い、信頼度にも差がある時は正常側だけを使う。
+                if abs(inner[2]-outer[2])>.08:return inner if inner[2]>outer[2] else outer
+            wi=max(inner[2],.05); wo=max(outer[2],.05); total=wi+wo
+            return ((inner[0]*wi+outer[0]*wo)/total,
+                    (inner[1]*wi+outer[1]*wo)/total,max(inner[2],outer[2]))
         for key,_ in joint_map:
-            if key in before and key in after:
-                result[f"{key}_x"]=(after[key][0]-before[key][0])*cm_per_px
-                result[f"{key}_y"]=(after[key][1]-before[key][1])*cm_per_px
+            vector=stable_vector(key)
+            if vector is not None:
+                result[f"{key}_x"]=vector[0]*cm_per_px
+                result[f"{key}_y"]=vector[1]*cm_per_px
         for key in ("rw","lw"):
             x=result.get(f"{key}_x"); y=result.get(f"{key}_y")
             if x is not None and y is not None:result[f"{key}_d"]=abs(float(x))+abs(float(y))
@@ -4351,10 +4345,11 @@ class TennisApp(tk.Tk):
                 spin_ja=next((ja for ja,en in SPINS      if en==lbl[1]),"")
                 ft=lbl[3]
                 ft_str=f"{ft:.2f}s" if (ft is not None and ft>0) else f"{t:.2f}s"
-                tag=f"{checkmark} #{rank:02d}{icons}{rating_icon} {ft_str} {shot_ja}/{spin_ja}{cb}"
+                shot_state=f"{shot_ja}/{spin_ja}"
+                tag=f"{checkmark}  {rank:02d}  {ft_str:>7}  {shot_state:<12.12} {cb:<5} {icons}{rating_icon}"
             else:
                 state="確認中" if p.get("pose_reason")=="pending" else "未分類"
-                tag=f"{checkmark} #{rank:02d}{icons} {t:.2f}s {state}{cb}"
+                tag=f"{checkmark}  {rank:02d}  {t:6.2f}s  {state:<12} {cb:<5} {icons}"
             motion,ball=motion_cache[i]
             def compact(key):
                 value=motion.get(key)
@@ -4539,9 +4534,9 @@ class TennisApp(tk.Tk):
             # 再生中: 中央下に大きな字幕
             self._draw_play_overlay(frame_time,cw,ch)
         elif info is not None:
-            self.img_canvas.create_rectangle(4,4,260,30,fill="#000000",stipple="gray50",outline="")
+            self.img_canvas.create_rectangle(4,4,260,30,fill="white",stipple="gray50",outline="")
             self.img_canvas.create_text(10,16,anchor="w",text=info,
-                fill=TEXT,font=("Helvetica",13,"bold"))
+                fill="black",font=("Helvetica",13,"bold"))
         else:
             rank     = self._rank()
             n_peaks  = len(self.peaks)
@@ -4551,13 +4546,29 @@ class TennisApp(tk.Tk):
             line1 = f"#{rank}  ({pos}/{n_peaks})"
             line2 = f"表示: {frame_time:.2f}s"
             line3 = f"ピーク: {pt:.2f}s  (offset {offset_f:+d}f)"
-            self.img_canvas.create_rectangle(4,4,290,76,fill="#000000",stipple="gray50",outline="")
+            motion,_=self._hp_motion_summary(self.peaks[self.peak_idx]) if self.peaks else ({},False)
+            motions=[self._hp_motion_summary(p)[0] for p in self.peaks]
+            def _top3(key):
+                vals=sorted((float(v[key]) for v in motions if v.get(key) is not None),reverse=True)[:3]
+                return sum(vals)/len(vals) if vals else None
+            def _pct(value,base):return "--" if value is None or not base else f"{float(value)/base*100:.0f}%"
+            use_filter=bool(self.audio_filter_enabled.get())
+            energies=[self._peak_energy_at(float(p.get("time",0)),use_filter) for p in self.peaks]
+            valid=sorted((float(v) for v in energies if v is not None),reverse=True)[:3]
+            ebase=sum(valid)/len(valid) if valid else None
+            current_energy=self._peak_energy_at(pt,use_filter)
+            line4=(f"対Top3  音 {_pct(current_energy,ebase)}  "
+                   f"右d {_pct(motion.get('rw_d'),_top3('rw_d'))}  "
+                   f"左d {_pct(motion.get('lw_d'),_top3('lw_d'))}")
+            self.img_canvas.create_rectangle(4,4,310,98,fill="white",stipple="gray50",outline="")
             self.img_canvas.create_text(10,16,anchor="nw",text=line1,
-                fill="white",font=("Helvetica",16,"bold"))
+                fill="black",font=("Helvetica",16,"bold"))
             self.img_canvas.create_text(10,38,anchor="nw",text=line2,
-                fill=TEXT,font=("Helvetica",14))
+                fill="black",font=("Helvetica",14))
             self.img_canvas.create_text(10,58,anchor="nw",text=line3,
-                fill=SUBTEXT,font=("Helvetica",12))
+                fill="black",font=("Helvetica",12))
+            self.img_canvas.create_text(10,78,anchor="nw",text=line4,
+                fill="black",font=("Helvetica",11,"bold"))
         # クロップ中バッジ
         if crop_active:
             self.img_canvas.create_rectangle(cw-86,4,cw-4,24,fill="#1d9e75",outline="")
