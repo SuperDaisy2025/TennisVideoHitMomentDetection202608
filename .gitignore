@@ -10,3 +10,4 @@ managed_videos/
 *.npz
 *.pt
 .ultralytics/
+analyzed_videos.json

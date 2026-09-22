@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v99"; APP_VERSION_DESC = "採否監査・一覧整列"
+APP_VERSION = "v106"; APP_VERSION_DESC = "音域表示の即時切替"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -1047,15 +1047,28 @@ def estimate_camera_direction_fast(video_path,max_samples=5):
     result["explanation"]=camera_direction_explanation(result)
     return result
 
+def audio_energy_series(data,mode="combined"):
+    """Return normalized onset energy for the requested acoustic band."""
+    key={"combined":"combined","racket":"impact","wall":"wall",
+         "broadband":"broadband"}.get(str(mode),"combined")
+    return np.asarray(data.get(key,data.get("combined",[])),dtype=float)
+
+
+def audio_band_color(mode="combined"):
+    """Keep the button and both energy charts visually consistent."""
+    return {"combined":"#23845b","racket":"#2d78c4",
+            "wall":"#d17a22","broadband":"#6b7280"}.get(str(mode),"#23845b")
+
+
 def detect_peaks(data, sensitivity=0.5, min_gap=1.0, wall_mode=False,
-                 use_frequency_filter=True,return_rejected=False):
+                 use_frequency_filter=True,return_rejected=False,frequency_mode=None):
     """ピーク検出。
        wall_mode=True なら壁打ちモード: min_gap を 0.8s 以上に強制し、
        0.05〜0.30秒間隔のペアピーク (壁エコー想定) を抑制"""
     if wall_mode:
         min_gap=max(min_gap,WALL_PEAK_MIN_GAP)
-    combined=(data["combined"] if use_frequency_filter else
-              data.get("broadband",data["combined"]))
+    mode=frequency_mode or ("combined" if use_frequency_filter else "broadband")
+    combined=audio_energy_series(data,mode)
     times=data["times"]; sr=data["sr"]
     raw,_=sp.find_peaks(combined, height=float(sensitivity),
                         distance=max(1,int(min_gap*sr/512)) if not wall_mode else 1)
@@ -1718,6 +1731,40 @@ def get_video_info(video_path):
 # ══════════════════════════════════════════════
 #  メインアプリ
 # ══════════════════════════════════════════════
+class PeakTable(ttk.Treeview):
+    """Treeview with the small Listbox-compatible API used by legacy controls."""
+    def _ids(self):return list(self.get_children(""))
+    def clear_rows(self):
+        ids=self._ids()
+        if ids:super().delete(*ids)
+    def append_row(self,values,image=None):
+        return super().insert("","end",text=values[0],image=image,values=values[1:])
+    def delete(self,first,last=None):
+        if first==0 and last=="end":self.clear_rows(); return
+        ids=self._ids(); indexes=range(first,(len(ids) if last=="end" else int(last)+1))
+        targets=[ids[i] for i in indexes if 0<=i<len(ids)]
+        if targets:super().delete(*targets)
+    def selection_clear(self,*_):super().selection_remove(super().selection())
+    def selection_set(self,index):
+        ids=self._ids()
+        if 0<=index<len(ids):super().selection_set(ids[index])
+    def curselection(self):
+        ids=self._ids(); selected=set(super().selection())
+        return tuple(i for i,item in enumerate(ids) if item in selected)
+    def size(self):return len(self._ids())
+    def nearest(self,y):
+        item=self.identify_row(y); ids=self._ids()
+        return ids.index(item) if item in ids else max(0,min(len(ids)-1,int(y/20)))
+    def see(self,index):
+        ids=self._ids()
+        if 0<=index<len(ids):super().see(ids[index])
+    def itemconfig(self,index,**kwargs):
+        ids=self._ids()
+        if not (0<=index<len(ids)):return
+        tag=f"row_style_{index}"; super().item(ids[index],tags=(tag,))
+        self.tag_configure(tag,**kwargs)
+
+
 class TennisApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1734,6 +1781,7 @@ class TennisApp(tk.Tk):
         self.min_gap      = tk.DoubleVar(value=0.35)   # v18: 1.0 → 0.35s
         self.wall_mode    = tk.BooleanVar(value=False) # v18: 壁打ちモード
         self.audio_filter_enabled = tk.BooleanVar(value=True)
+        self.audio_band_mode = tk.StringVar(value="combined")
         self._analysis_first_minute = False
         self.camera_dist  = tk.DoubleVar(value=3.0)
         # v23: プレイヤー身長 (cm)
@@ -1889,6 +1937,11 @@ class TennisApp(tk.Tk):
         if 0<=k<len(self.peaks): return self.peaks[k]["rank"]
         return k+1
 
+    @staticmethod
+    def _display_no(peak):
+        """採用・除外を含む一覧と共通の画面表示番号。DB rankとは分離する。"""
+        return int(peak.get("_display_no",peak.get("rank",0)))
+
     def _cur_thumb(self):
         if 0<=self.peak_idx<len(self.peaks):
             return self.peaks[self.peak_idx].get("thumb","") or ""
@@ -1936,7 +1989,13 @@ class TennisApp(tk.Tk):
     def _crop_rect_for_time(self, time_sec):
         """v24: 与えられた時刻に対応するCPのクロップ矩形を返す。
            時刻が最も近いCPを選び、そのCPのクロップを使用 (CP境界で切替)"""
-        if not self.peaks or not self._crops: return None
+        if not self._crops:return None
+        global_crop=next((c.get("rect") for c in self._crops if c.get("rank")==0),None)
+        if global_crop is not None:return global_crop
+        rects=[tuple(round(float(v),5) for v in c["rect"])
+               for c in self._crops if c.get("rank",0)>0]
+        if rects and len(set(rects))==1:return self._crops[0]["rect"]
+        if not self.peaks:return None
         # 最も時刻が近い CP を選ぶ
         closest = min(self.peaks,
                       key=lambda p: abs((p.get("frame_time") or p["time"]) - time_sec))
@@ -1963,8 +2022,8 @@ class TennisApp(tk.Tk):
     #  UI構築
     # ══════════════════════════════════════════
     def _build_ui(self):
-        # 6関節の移動量を一覧に収めるため、左パネルを少し拡張
-        self.left=tk.Frame(self, bg=PANEL, width=540)
+        # 一覧を横スクロールなしで表示できる幅にする。
+        self.left=tk.Frame(self, bg=PANEL, width=630)
         self.left.pack(side="left", fill="y")
         self.left.pack_propagate(False)
         self._build_left()
@@ -2026,9 +2085,12 @@ class TennisApp(tk.Tk):
 
         # ヒットポイント一覧
         hp_hdr=tk.Frame(p,bg=PANEL); hp_hdr.pack(fill="x",padx=12,pady=(2,2))
-        tk.Label(p,text="🟢=採用  🔴=除外  ✂=クロップあり  ⚠=手ぶれ",
-                 bg=PANEL,fg=SUBTEXT,font=_tk_font(11),anchor="w"
-                 ).pack(fill="x",padx=12)
+        legend=tk.Frame(p,bg=PANEL); legend.pack(fill="x",padx=12)
+        tk.Label(legend,text="●",bg=PANEL,fg="#19a463",font=_tk_font(12,bold=True)).pack(side="left")
+        tk.Label(legend,text="=採用  ",bg=PANEL,fg=SUBTEXT,font=_tk_font(10)).pack(side="left")
+        tk.Label(legend,text="●",bg=PANEL,fg="#e53935",font=_tk_font(12,bold=True)).pack(side="left")
+        tk.Label(legend,text="=除外  ✂=クロップあり  ⚠=手ぶれ",bg=PANEL,fg=SUBTEXT,
+                 font=_tk_font(10)).pack(side="left")
         tk.Label(hp_hdr,text="ヒットポイント",bg=PANEL,fg=ACCENT2,
                  font=_tk_font(13,bold=True)).pack(side="left")
         self._hp_sort_mode="time"; self._hp_sort_buttons={}
@@ -2040,6 +2102,7 @@ class TennisApp(tk.Tk):
             button.pack(side="left",padx=1,ipadx=2); self._hp_sort_buttons[mode]=button
         self._refresh_hp_sort_buttons()
         self._hide_rejected_peaks=False
+        self._show_rejected_only=False
         # 互換用。分類UIはv95で非表示だが、保存済みデータは維持する。
         self._show_classified_only=tk.BooleanVar(value=False)
         tk.Label(p,text="RW/LW=右/左手首  d=移動cm  %=上位3件平均比",
@@ -2052,26 +2115,34 @@ class TennisApp(tk.Tk):
                   relief="flat",font=_tk_font(9,bold=True),command=self._toggle_rejected_peaks,
                   cursor="hand2")
         self.btn_rejected_peaks.pack(side="right",padx=(0,4),ipadx=3)
+        self.btn_rejected_only=tk.Button(hp_hdr,text="赤点のみ OFF",bg=DARK2,fg=TEXT,
+                  relief="flat",font=_tk_font(9,bold=True),command=self._toggle_rejected_only,
+                  cursor="hand2")
+        self.btn_rejected_only.pack(side="right",padx=(0,4),ipadx=3)
         lf=tk.Frame(p,bg=PANEL)
         lf.pack(fill="both",expand=True,padx=12,pady=(0,4))
         sb=tk.Scrollbar(lf,bg=PANEL); sb.pack(side="right",fill="y")
-        hsb=tk.Scrollbar(lf,bg=PANEL,orient="horizontal"); hsb.pack(side="bottom",fill="x")
-        self.peak_header=tk.Listbox(lf,bg="#dfe7e1",fg="#111111",height=1,
-                                    relief="flat",font=("Courier",12,"bold"),
-                                    activestyle="none",takefocus=False)
-        self.peak_header.insert("end","No   秒     RWx RWy RWd   % LWx LWy LWd   % 球   音   %")
-        self.peak_header.pack(side="top",fill="x")
-        self.peak_list=tk.Listbox(lf,bg=DARK2,fg=TEXT,selectbackground=GOLD,
-                                   selectforeground="#111111",exportselection=False,
-                                   relief="flat",font=("Courier",12),
-                                   yscrollcommand=sb.set,xscrollcommand=hsb.set,
-                                   activestyle="none")
+        def _dot_image(color):
+            im=Image.new("RGBA",(12,12),(0,0,0,0)); d=ImageDraw.Draw(im)
+            d.ellipse((1,1,10,10),fill=color,outline="#ffffff",width=1)
+            return ImageTk.PhotoImage(im)
+        self._hp_dot_images={"accepted":_dot_image("#19a463"),"rejected":_dot_image("#e53935")}
+        columns=("sec","rwx","rwy","rwd","rpct","lwx","lwy","lwd","lpct","ball","sound","spct")
+        self.peak_list=PeakTable(lf,columns=columns,show="tree headings",selectmode="browse",
+                                 yscrollcommand=sb.set,style="HP.Treeview")
+        style=ttk.Style(self); style.configure("HP.Treeview",font=("MS Gothic",9),rowheight=21,
+                                                background=DARK2,foreground=TEXT,fieldbackground=DARK2)
+        style.configure("HP.Treeview.Heading",font=("MS Gothic",9,"bold"))
+        self.peak_list.heading("#0",text="No",anchor="center")
+        self.peak_list.column("#0",width=66,minwidth=66,stretch=False,anchor="center")
+        headings=("秒","RWx","RWy","RWd","%","LWx","LWy","LWd","%","球","音","%")
+        widths=(55,38,38,40,42,38,38,40,42,30,44,42)
+        for col,title,width in zip(columns,headings,widths):
+            self.peak_list.heading(col,text=title,anchor="center")
+            self.peak_list.column(col,width=width,minwidth=width,stretch=False,anchor="center")
         self.peak_list.pack(side="left",fill="both",expand=True)
         sb.config(command=self.peak_list.yview)
-        def _scroll_hp_columns(*args):
-            self.peak_header.xview(*args); self.peak_list.xview(*args)
-        hsb.config(command=_scroll_hp_columns)
-        self.peak_list.bind("<<ListboxSelect>>",self._on_list_select)
+        self.peak_list.bind("<<TreeviewSelect>>",self._on_list_select)
         # 右クリック / Delキー で削除
         self.peak_list.bind("<Button-3>",self._on_list_right_click)
         self.peak_list.bind("<Delete>",
@@ -2165,8 +2236,8 @@ class TennisApp(tk.Tk):
                                          font=_tk_font(9,bold=True),width=7,
                                          command=self._toggle_timeline_zoom,cursor="hand2")
         self.btn_timeline_zoom.pack(side="right",padx=5,ipady=4,pady=3)
-        self.btn_audio_filter=tk.Button(trans,text="周波数フィルター ON",bg=GREEN,fg="white",
-                                        relief="flat",font=_tk_font(9,bold=True),width=16,
+        self.btn_audio_filter=tk.Button(trans,text="音域: 合成",bg=GREEN,fg="white",
+                                        relief="flat",font=_tk_font(9,bold=True),width=12,
                                         command=self._toggle_audio_filter,cursor="hand2")
         self.btn_audio_filter.pack(side="right",padx=3,ipady=4,pady=3)
 
@@ -3310,8 +3381,9 @@ class TennisApp(tk.Tk):
         first_minute=bool(getattr(self,"_analysis_first_minute",False))
         cache_path=get_analysis_cache_path(path,first_minute)
         cached=load_analysis_cache(cache_path)
-        # v65: 旧キャッシュには周波数フィルターOFF用の広帯域エネルギーがない。
-        if cached is not None and "broadband" not in cached:
+        # v106: 旧キャッシュは新しい帯域別波形を持たない。合成波形への
+        # 暗黙フォールバックを避け、音声だけを一度再解析して更新する。
+        if cached is not None and not {"combined","impact","wall","broadband"}.issubset(cached):
             cached=None
         if cached is not None:
             self.data=cached
@@ -3351,7 +3423,8 @@ class TennisApp(tk.Tk):
         gap=WALL_PEAK_MIN_GAP if wall else self.min_gap.get()
         indices,_,rejected=detect_peaks(
             self.data,self.sensitivity.get(),gap,wall_mode=wall,
-            use_frequency_filter=bool(self.audio_filter_enabled.get()),return_rejected=True)
+            use_frequency_filter=bool(self.audio_filter_enabled.get()),return_rejected=True,
+            frequency_mode=self.audio_band_mode.get())
         self._wall_gap_rejected_candidates=[
             {"idx":int(i),"time":float(self.data["times"][i]),"selected":False,
              "reason":"wall_gap","backend":"audio"} for i in rejected]
@@ -3651,6 +3724,10 @@ class TennisApp(tk.Tk):
                                     "shot":verdict.get("shot","unknown"),
                                     "travel":verdict.get("travel"),
                                     "arm_change":verdict.get("arm_change")}
+                        audit_item["pose_samples"]=[{"time":float(s["time"]),
+                            "frame_no":int(s.get("frame_no",round(s["time"]*fps))),
+                            "kps":s.get("kps",{}),"frame_jpeg":s.get("frame_jpeg")}
+                            for s in coarse]
                         audit_item["sound_delay_sec"]=sound_delay
                         audit_item["pose_center_time"]=hit_t
                         audit.append(audit_item)
@@ -3740,7 +3817,17 @@ class TennisApp(tk.Tk):
                 if float(val[2])>=min_conf:
                     points[ki]=(float(val[0])*iw,float(val[1])*ih)
             except Exception: pass
-        if points:
+        user_rect=self._active_crop_rect(float(sample.get("time",0)))
+        if user_rect is not None:
+            x1r,y1r,x2r,y2r=user_rect
+            ux1=max(0,int(min(x1r,x2r)*iw)); uy1=max(0,int(min(y1r,y2r)*ih))
+            ux2=min(iw,int(max(x1r,x2r)*iw)); uy2=min(ih,int(max(y1r,y2r)*ih))
+            if ux2>ux1 and uy2>uy1:
+                img=img.crop((ux1,uy1,ux2,uy2))
+                points={k:(x-ux1,y-uy1) for k,(x,y) in points.items()
+                        if ux1<=x<=ux2 and uy1<=y<=uy2}
+                iw,ih=img.size
+        if points and user_rect is None:
             bounds_points=list(points.values())
             peak=self.peaks[self.peak_idx] if self.peaks and self.peak_idx<len(self.peaks) else {}
             is_serve=peak.get("pose_shot")=="serve"
@@ -3778,10 +3865,13 @@ class TennisApp(tk.Tk):
         if self.data is None:return
         center=float(peak["time"]); lo=center-2; hi=center+2
         times=np.asarray(self.data.get("times",[]))
-        energy=np.asarray(self.data.get("combined",[]) if self.audio_filter_enabled.get() else
-                          self.data.get("broadband",self.data.get("combined",[])))
+        energy=audio_energy_series(self.data,self.audio_band_mode.get())
         mask=(times>=lo)&(times<=hi); tx=times[mask]; ey=energy[mask]
         pl,pr,pt,pb=42,14,12,25
+        band_labels={"combined":"合成","racket":"ラケット帯 >2kHz",
+                     "wall":"壁帯 200–1500Hz","broadband":"広帯域"}
+        cv.create_text(pl+4,pt,text=band_labels.get(self.audio_band_mode.get(),"合成"),
+                       fill="#333333",font=_tk_font(8,bold=True),anchor="nw")
         # v98: 点の意味をグラフ内の空き領域へ表示（描画サイズは変えない）。
         cv.create_text(w-pr-88,pt,text="● 採用",fill="#26c281",
                        font=_tk_font(8,bold=True),anchor="ne")
@@ -3792,7 +3882,7 @@ class TennisApp(tk.Tk):
             top=max(float(np.max(energy)),1e-6); coords=[]
             for t,e in zip(tx,ey):
                 coords += [pl+(float(t)-lo)/4*(w-pl-pr),h-pb-float(e)/top*(h-pt-pb)]
-            cv.create_line(*coords,fill=ACCENT2,width=2,smooth=True)
+            cv.create_line(*coords,fill=audio_band_color(self.audio_band_mode.get()),width=2,smooth=True)
             threshold=float(self.sensitivity.get())
             threshold_y=np.clip(h-pb-threshold/top*(h-pt-pb),pt,h-pb)
             cv.create_line(pl,threshold_y,w-pr,threshold_y,fill=RED,width=1,dash=(5,3))
@@ -3915,7 +4005,32 @@ class TennisApp(tk.Tk):
         samples=list(peak.get("pose_samples") or [])
         try: height=float(self.player_height.get())
         except Exception: height=DEFAULT_PLAYER_HEIGHT_CM
-        return self._compute_hp_motion_cm(samples,getattr(self,"_video_wh",(0,0)),height)
+        key=(height,tuple(getattr(self,"_video_wh",(0,0))),
+             tuple((s.get("frame_no"),round(float(s.get("time",0)),4)) for s in samples[:5]))
+        cached=peak.get("_motion_summary_cache")
+        if cached and cached[0]==key:return cached[1]
+        value=self._compute_hp_motion_cm(samples,getattr(self,"_video_wh",(0,0)),height)
+        peak["_motion_summary_cache"]=(key,value)
+        return value
+
+    def _rejected_preview_samples(self,peak):
+        cached=peak.get("_preview_samples_cache")
+        if cached:return list(cached)
+        center=float(peak.get("time",0)); path=self.video_path.get(); samples=[]
+        cap=cv2.VideoCapture(path)
+        try:
+            fps=cap.get(cv2.CAP_PROP_FPS) or self.video_fps or 30.0
+            for offset in HP_POSE_SAMPLE_OFFSETS:
+                t=max(0.0,center+offset); frame_no=max(0,int(round(t*fps)))
+                cap.set(cv2.CAP_PROP_POS_FRAMES,frame_no); ok,frame=cap.read()
+                encoded=None
+                if ok:
+                    good,buf=cv2.imencode(".jpg",frame,[cv2.IMWRITE_JPEG_QUALITY,90])
+                    if good:encoded=buf.tobytes()
+                samples.append({"time":t,"frame_no":frame_no,"kps":{},"frame_jpeg":encoded})
+        finally:cap.release()
+        peak["_preview_samples_cache"]=list(samples)
+        return samples
 
     def _update_hp_motion_summary(self,peak):
         values,ball=self._hp_motion_summary(peak)
@@ -3925,14 +4040,19 @@ class TennisApp(tk.Tk):
         self._hp_motion_ball_var.set("検出 ✓" if ball else "未検出")
 
     def _refresh_hp_detail(self):
-        if not hasattr(self,"_hp_detail_canvases") or not self.peaks:return
-        peak=self.peaks[self.peak_idx]; samples=list(peak.get("pose_samples") or [])
+        rejected=getattr(self,"_selected_rejected_candidate",None)
+        if not hasattr(self,"_hp_detail_canvases") or (not self.peaks and not rejected):return
+        peak=rejected if rejected is not None else self.peaks[self.peak_idx]
+        samples=list(peak.get("pose_samples") or [])
+        if rejected is not None and len(samples)<5:
+            samples=self._rejected_preview_samples(peak)
         while len(samples)<5:
             i=len(samples); samples.append({"time":max(0,peak["time"]+HP_POSE_SAMPLE_OFFSETS[i]),"kps":{}})
         backend=pose_backend_label(peak.get("pose_backend"))
         _,ball_found=self._hp_motion_summary(peak)
         ball_text="  ボール検出✓" if ball_found else ""
-        self._hp_detail_title.set(f"HP #{peak['rank']}  {backend}{ball_text}  "
+        status="除外候補" if rejected is not None else "HP"
+        self._hp_detail_title.set(f"{status} #{self._display_no(peak)}  {backend}{ball_text}  "
                                   f"音声候補 {peak['time']:.3f}秒  "
                                   f"採用フレーム {(peak.get('frame_time') or peak['time']):.3f}秒")
         for i,(cv,s) in enumerate(zip(self._hp_detail_canvases,samples[:5])):
@@ -3945,23 +4065,20 @@ class TennisApp(tk.Tk):
         pct=f" {float(conf):.0%}" if conf is not None else ""
         self._hp_detail_result_vars["serve"].set("✓ サーブ"+pct if shot=="serve" else "─ 条件なし")
         self._hp_detail_result_vars["stroke"].set("✓ ストローク"+pct if shot=="stroke" else "─ 条件なし")
-        self._hp_detail_result_vars["wall"].set("✓ 除外せず（動作あり）" if reason=="swing" else
-                                                "✓ 壁音として除外" if reason=="no_swing" else "─ 判定保留")
+        self._hp_detail_result_vars["wall"].set("✓ 壁音候補として除外" if reason=="wall_gap" else
+                                                "✓ 動作不足として除外" if reason=="no_swing" else
+                                                "✓ 除外せず（動作あり）" if reason=="swing" else "─ 判定保留")
         self._hp_detail_result_vars["safe"].set("✓ 姿勢失敗のため保持" if reason=="pose_uncertain" else
                                                 "─ 姿勢検出成功")
         reason_names={"wall_gap":"直前ピークから0.8秒未満（壁音候補）",
                       "no_swing":"スイング動作または打球姿勢が不足",
                       "pending":"姿勢判定待ち"}
-        audit_sorted=sorted(getattr(self,"_hp_candidate_audit",[]),
-                            key=lambda a:float(a.get("time",0)))
-        rejected=[]
-        for number,cand in enumerate(audit_sorted,1):
-            ct=float(cand.get("time",0))
-            if cand.get("selected") is False and abs(ct-float(peak["time"]))<=2.0:
-                label=reason_names.get(str(cand.get("reason","")),str(cand.get("reason","不明")))
-                rejected.append(f"No{number} {ct:.2f}s: {label}")
-        self._hp_rejected_reason_var.set(
-            "赤点の不採用理由: "+(" / ".join(rejected) if rejected else "この範囲にはありません"))
+        if rejected is not None:
+            label=reason_names.get(str(peak.get("reason","")),str(peak.get("reason","不明")))
+            self._hp_rejected_reason_var.set(
+                f"赤点 No{peak['rank']}（{float(peak['time']):.2f}s）の不採用理由: {label}")
+        else:
+            self._hp_rejected_reason_var.set("")
 
     def _on_error(self,msg):
         try: self.progress.stop()
@@ -3981,7 +4098,8 @@ class TennisApp(tk.Tk):
             indices,n_echo=detect_peaks(self.data,self.sensitivity.get(),
                                          self.min_gap.get(),
                                          wall_mode=bool(self.wall_mode.get()),
-                                         use_frequency_filter=bool(self.audio_filter_enabled.get()))
+                                         use_frequency_filter=bool(self.audio_filter_enabled.get()),
+                                         frequency_mode=self.audio_band_mode.get())
             all_times=[float(self.data["times"][i]) for i in indices]
             refined_candidates=[{"idx":int(i),"time":t} for i,t in zip(indices,all_times)]
         else:
@@ -4171,8 +4289,8 @@ class TennisApp(tk.Tk):
                 self.video_path.get(),bool(getattr(self,"_analysis_first_minute",False))))
         if not data:return None
         times=np.asarray(data.get("times",[]),dtype=float)
-        energy=np.asarray(data.get("combined",[]) if use_filter else
-                          data.get("broadband",data.get("combined",[])),dtype=float)
+        mode=self.audio_band_mode.get() if use_filter else "broadband"
+        energy=audio_energy_series(data,mode)
         if len(times)==0 or len(energy)==0:return None
         j=int(np.argmin(np.abs(times-float(time_sec))))
         return float(energy[j]) if j<len(energy) else None
@@ -4306,11 +4424,25 @@ class TennisApp(tk.Tk):
 
     def _toggle_rejected_peaks(self):
         self._hide_rejected_peaks=not getattr(self,"_hide_rejected_peaks",False)
+        if self._hide_rejected_peaks:self._show_rejected_only=False
+        self._refresh_rejected_filter_buttons()
+        self._update_shot_list()
+
+    def _toggle_rejected_only(self):
+        self._show_rejected_only=not getattr(self,"_show_rejected_only",False)
+        if self._show_rejected_only:self._hide_rejected_peaks=False
+        self._refresh_rejected_filter_buttons()
+        self._update_shot_list()
+
+    def _refresh_rejected_filter_buttons(self):
         self.btn_rejected_peaks.configure(
             text=f"赤点除去 {'ON' if self._hide_rejected_peaks else 'OFF'}",
             bg=ACCENT2 if self._hide_rejected_peaks else DARK2,
             fg="white" if self._hide_rejected_peaks else TEXT)
-        self._update_shot_list()
+        self.btn_rejected_only.configure(
+            text=f"赤点のみ {'ON' if self._show_rejected_only else 'OFF'}",
+            bg="#b51f2e" if self._show_rejected_only else DARK2,
+            fg="white" if self._show_rejected_only else TEXT)
 
     def _set_hp_sort_mode(self,mode):
         if mode not in ("time","rwd","lwd","sound"):return
@@ -4339,25 +4471,18 @@ class TennisApp(tk.Tk):
         rwd_top3=top3_average("rw_d"); lwd_top3=top3_average("lw_d")
         valid_energy=sorted((float(v) for v in energy_cache.values() if v is not None),reverse=True)[:3]
         energy_top3=sum(valid_energy)/len(valid_energy) if valid_energy else None
-        display_indices=list(range(len(self.peaks)))
-        sort_mode=getattr(self,"_hp_sort_mode","time")
-        if sort_mode in ("rwd","lwd"):
-            distance_key="rw_d" if sort_mode=="rwd" else "lw_d"
-            display_indices.sort(key=lambda i:(motion_cache[i][0].get(distance_key) is None,
-                                               -(motion_cache[i][0].get(distance_key) or 0),
-                                               float(self.peaks[i].get("time",0))))
-        elif sort_mode=="sound":
-            display_indices.sort(key=lambda i:(energy_cache[i] is None,
-                                               -(energy_cache[i] or 0),
-                                               float(self.peaks[i].get("time",0))))
-        else:
-            display_indices.sort(key=lambda i:float(self.peaks[i].get("time",0)))
         audit_sorted=sorted(getattr(self,"_hp_candidate_audit",[]),
                             key=lambda a:float(a.get("time",0)))
         audit_no={round(float(a.get("time",0)),6):n
                   for n,a in enumerate(audit_sorted,1)}
-        for i in display_indices:
-            p=self.peaks[i]
+        rows=[]
+        def compact_value(value,signed=False):
+            if value is None:return "  --"
+            return f"{float(value):+4.0f}" if signed else f"{float(value):4.0f}"
+        def ratio_value(value,base):
+            return "  --" if value is None or not base else f"{float(value)/base*100:4.0f}%"
+        for i,p in enumerate(self.peaks):
+            if getattr(self,"_show_rejected_only",False):continue
             rank=p["rank"]; t=p["time"]
             lbl=all_labels.get(rank,None)
             # v24: 分類済フィルタ — ラベルがない HP は非表示
@@ -4365,26 +4490,18 @@ class TennisApp(tk.Tk):
                 continue
             icons=("✂" if rank in crop_ranks else "")+("⚠" if self._is_shaky(rank) else "")
             no=audit_no.get(round(float(t),6),rank)
-            tag=f"{no:02d}🟢{icons:<2}{t:6.2f}"
+            p["_display_no"]=int(no)
             motion,ball=motion_cache[i]
-            def compact(key):
-                value=motion.get(key)
-                return "  --" if value is None else f"{value:+4.0f}"
-            def distance(key):
-                value=motion.get(key); return "  --" if value is None else f"{value:4.0f}"
-            def ratio(key,base):
-                value=motion.get(key)
-                return "  --" if value is None or not base else f"{value/base*100:4.0f}%"
-            def ratio_value(value,base):
-                return "  --" if value is None or not base else f"{float(value)/base*100:4.0f}%"
-            tag += (compact("rw_x")+compact("rw_y")+distance("rw_d")+
-                    ratio("rw_d",rwd_top3)+compact("lw_x")+compact("lw_y")+
-                    distance("lw_d")+ratio("lw_d",lwd_top3)+
-                    ("  ●" if ball else "  ─")+
-                    ("   --" if energy_cache[i] is None else f" {energy_cache[i]:4.2f}")+
-                    ratio_value(energy_cache[i],energy_top3))
-            self.peak_list.insert("end",tag)
-            self._list_to_peak_idx.append(i)
+            values=(f"{no:02d}{icons}",f"{t:.2f}",compact_value(motion.get("rw_x"),True).strip(),
+                    compact_value(motion.get("rw_y"),True).strip(),compact_value(motion.get("rw_d")).strip(),
+                    ratio_value(motion.get("rw_d"),rwd_top3).strip(),
+                    compact_value(motion.get("lw_x"),True).strip(),compact_value(motion.get("lw_y"),True).strip(),
+                    compact_value(motion.get("lw_d")).strip(),ratio_value(motion.get("lw_d"),lwd_top3).strip(),
+                    "●" if ball else "─","--" if energy_cache[i] is None else f"{energy_cache[i]:.2f}",
+                    ratio_value(energy_cache[i],energy_top3).strip())
+            rows.append({"time":float(t),"rwd":motion.get("rw_d"),"lwd":motion.get("lw_d"),
+                         "sound":energy_cache[i],"values":values,"peak_idx":i,
+                         "accepted":True,"item":{"kind":"accepted","peak_idx":i}})
         if not getattr(self,"_hide_rejected_peaks",False):
             accepted_times={round(float(p.get("time",0)),6) for p in self.peaks}
             for n,cand in enumerate(audit_sorted,1):
@@ -4392,11 +4509,22 @@ class TennisApp(tk.Tk):
                 t=float(cand.get("time",0))
                 if round(t,6) in accepted_times:continue
                 energy=self._peak_energy_at(t,bool(self.audio_filter_enabled.get()))
-                tag=(f"{n:02d}🔴  {t:6.2f}"+"  --"*8+"  ─"+
-                     ("   --" if energy is None else f" {energy:4.2f}")+
-                     ratio_value(energy,energy_top3))
-                self.peak_list.insert("end",tag)
-                self._list_to_peak_idx.append(None)
+                values=(f"{n:02d}",f"{t:.2f}","--","--","--","--","--","--","--","--","─",
+                        "--" if energy is None else f"{energy:.2f}",ratio_value(energy,energy_top3).strip())
+                rows.append({"time":t,"rwd":None,"lwd":None,"sound":energy,"values":values,
+                             "peak_idx":None,"accepted":False,
+                             "item":{"kind":"rejected","candidate":cand,"no":n}})
+        sort_mode=getattr(self,"_hp_sort_mode","time")
+        if sort_mode=="time":rows.sort(key=lambda row:row["time"])
+        else:
+            key={"rwd":"rwd","lwd":"lwd","sound":"sound"}.get(sort_mode,"time")
+            rows.sort(key=lambda row:(row[key] is None,-float(row[key] or 0),row["time"]))
+        self._list_row_items=[]
+        for row in rows:
+            dot=self._hp_dot_images["accepted" if row["accepted"] else "rejected"]
+            self.peak_list.append_row(row["values"],image=dot)
+            self._list_to_peak_idx.append(row["peak_idx"])
+            self._list_row_items.append(row["item"])
 
     # ══════════════════════════════════════════
     #  フレーム表示
@@ -4491,6 +4619,10 @@ class TennisApp(tk.Tk):
         if preview_frame is not None:
             self._display_frame(preview_frame, preview_time or 0.0, preview=True)
             return
+        rejected=getattr(self,"_selected_rejected_candidate",None)
+        if rejected is not None:
+            self._show_rejected_main(rejected)
+            return
         # 再生中はプレイヤーがキャンバスを占有
         if self._play_running:
             self._draw_timeline()
@@ -4529,10 +4661,14 @@ class TennisApp(tk.Tk):
         # (frame_offset でずれた時にも、ユーザーの認識通りそのCPのクロップを保つ)
         crop_active=False
         if not self._crop_mode and not self._force_uncropped:
-            cur_rank=None
-            if self.peaks and 0<=self.peak_idx<len(self.peaks):
-                cur_rank=self.peaks[self.peak_idx]["rank"]
-            rect=self._crop_rect_for_rank(cur_rank) if cur_rank is not None else None
+            rejected=getattr(self,"_selected_rejected_candidate",None)
+            if rejected is not None:
+                rect=self._active_crop_rect(float(rejected.get("time",frame_time)))
+            else:
+                cur_rank=None
+                if self.peaks and 0<=self.peak_idx<len(self.peaks):
+                    cur_rank=self.peaks[self.peak_idx]["rank"]
+                rect=self._crop_rect_for_rank(cur_rank) if cur_rank is not None else None
             if rect is not None:
                 iw,ih=img.size
                 x1r,y1r,x2r,y2r=rect
@@ -4565,9 +4701,11 @@ class TennisApp(tk.Tk):
             self.img_canvas.create_text(10,16,anchor="w",text=info,
                 fill="black",font=("Helvetica",13,"bold"))
         else:
-            rank     = self._rank()
-            n_peaks  = len(self.peaks)
-            pos      = self.peak_idx+1
+            current_peak=self.peaks[self.peak_idx]
+            rank     = self._display_no(current_peak)
+            audit_count=len(getattr(self,"_hp_candidate_audit",[]))
+            n_peaks  = audit_count or len(self.peaks)
+            pos      = rank
             pt       = self.peaks[self.peak_idx]["time"] if self.peaks else 0.0
             offset_f = self.frame_offset
             line1 = f"#{rank}  ({pos}/{n_peaks})"
@@ -4844,8 +4982,11 @@ class TennisApp(tk.Tk):
             view_lo=0.0; view_hi=duration
         view_span=max(view_hi-view_lo,1e-6)
         times=self.data["times"]
-        combined=(self.data["combined"] if self.audio_filter_enabled.get() else
-                  self.data.get("broadband",self.data["combined"]))
+        combined=audio_energy_series(self.data,self.audio_band_mode.get())
+        band_labels={"combined":"合成","racket":"ラケット帯 >2kHz",
+                     "wall":"壁帯 200–1500Hz","broadband":"広帯域"}
+        tl.create_text(cw-5,5,text=band_labels.get(self.audio_band_mode.get(),"合成"),
+                       fill="#333333",font=_tk_font(8,bold=True),anchor="ne")
         n=len(times)
 
         # 波形
@@ -4857,7 +4998,7 @@ class TennisApp(tk.Tk):
             y=int(ch-combined[j]*(ch-14)-4)
             pts.extend([x,max(4,y)])
         if len(pts)>=4:
-            tl.create_line(pts,fill=ACCENT2,width=2,smooth=True)
+            tl.create_line(pts,fill=audio_band_color(self.audio_band_mode.get()),width=2,smooth=True)
         energy_max=max(float(np.max(combined)),1e-6)
         threshold=float(self.sensitivity.get())
         threshold_y=int(np.clip(ch-threshold*(ch-14)-4,4,ch-4))
@@ -4891,7 +5032,7 @@ class TennisApp(tk.Tk):
             color="#7b8c82" if pending else (GOLD if is_sel else ACCENT2)
             lw=3 if is_sel else 1
             tl.create_line(x,12,x,ch,fill=color,width=lw,dash=(4,3) if pending else ())
-            tl.create_text(x,4,anchor="n",text=str(p["rank"]),fill=color,
+            tl.create_text(x,4,anchor="n",text=str(self._display_no(p)),fill=color,
                            font=("Helvetica",8,"bold" if is_sel else "normal"))
             if p["rank"] in badges:
                 tl.create_text(x,ch-2,anchor="s",text=badges[p["rank"]],
@@ -4942,12 +5083,18 @@ class TennisApp(tk.Tk):
         self._draw_timeline()
 
     def _toggle_audio_filter(self):
-        enabled=not bool(self.audio_filter_enabled.get()); self.audio_filter_enabled.set(enabled)
-        self.btn_audio_filter.configure(text=f"周波数フィルター {'ON' if enabled else 'OFF'}",
-                                        bg=GREEN if enabled else DARK2,
-                                        fg="white" if enabled else GOLD)
-        self.status_var.set("周波数フィルターを切り替えて候補を再判定中…")
-        self._start_fast_hp_pose_filter()
+        modes=("combined","racket","wall","broadband")
+        current=self.audio_band_mode.get()
+        mode=modes[(modes.index(current)+1)%len(modes)] if current in modes else "combined"
+        self.audio_band_mode.set(mode); self.audio_filter_enabled.set(mode!="broadband")
+        labels={"combined":"合成","racket":"ラケット帯","wall":"壁帯","broadband":"広帯域"}
+        self.btn_audio_filter.configure(text=f"音域: {labels[mode]}",
+                                        bg=audio_band_color(mode),fg="white")
+        # 表示比較専用。候補採否や姿勢解析を再実行しない。
+        self.status_var.set(f"表示音域: {labels[mode]}（姿勢・採否は変更しません）")
+        self._update_shot_list()
+        self._draw_timeline()
+        self._refresh_hp_detail()
 
     def _hide_timeline_tooltip(self):
         try:self.timeline.delete("candidate_tooltip")
@@ -5097,11 +5244,54 @@ class TennisApp(tk.Tk):
             self.peak_list.see(self.peak_idx)
             self._update_view()
 
+    def _log_hp_debug(self,message):
+        """赤点表示の診断ログ。動画と同じフォルダへ追記する。"""
+        try:
+            path=self.video_path.get().strip()
+            folder=os.path.dirname(path) if path else os.getcwd()
+            log_path=os.path.join(folder,"hit_moment_debug.log")
+            with open(log_path,"a",encoding="utf-8") as handle:
+                handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+        except Exception as exc:
+            print(f"[HP診断ログ失敗] {exc}")
+
+    def _show_rejected_main(self,candidate):
+        """除外候補も一覧タブのメイン画像へ確実に表示する。"""
+        no=self._display_no(candidate); audio_t=float(candidate.get("time",0))
+        try:delay=float(candidate.get("sound_delay_sec",self.camera_dist.get()/SOUND_SPEED))
+        except Exception:delay=0.0
+        frame_t=float(candidate.get("pose_center_time",max(0.0,audio_t-delay)))
+        rect=self._active_crop_rect(audio_t)
+        frame=grab_frame(self.video_path.get(),frame_t)
+        ok=frame is not None
+        self._log_hp_debug(
+            f"red_select no={no} audio={audio_t:.3f}s frame={frame_t:.3f}s "
+            f"frame_ok={ok} crop={rect} reason={candidate.get('reason','unknown')}")
+        if ok:
+            self._current_frame_time=frame_t
+            self._display_frame(frame,frame_t,info=f"除外候補 #{no}  {audio_t:.2f}s")
+        else:
+            self.img_canvas.delete("all")
+            self.img_canvas.create_text(
+                max(self.img_canvas.winfo_width()//2,200),max(self.img_canvas.winfo_height()//2,150),
+                text=f"除外候補 #{no} の画像を取得できません\n{frame_t:.3f}s",
+                fill=RED,font=_tk_font(12,bold=True))
+
     def _on_list_select(self,event):
         if getattr(self, "_suppress_list_select", False): return
         sel=self.peak_list.curselection()
         if not sel: return
         list_idx=sel[0]
+        row_items=getattr(self,"_list_row_items",[])
+        if list_idx<len(row_items) and row_items[list_idx].get("kind")=="rejected":
+            item=row_items[list_idx]; cand=item["candidate"]
+            cand.update({"rank":item["no"],"frame_time":float(cand.get("time",0)),
+                         "pose_reason":cand.get("reason"),"pose_backend":cand.get("backend")})
+            self._selected_rejected_candidate=cand
+            self._show_rejected_main(cand)
+            self._refresh_hp_detail()
+            return
+        self._selected_rejected_candidate=None
         # v24: 分類済フィルタで listbox→peaks のマッピングを使用
         if hasattr(self,"_list_to_peak_idx") and self._list_to_peak_idx:
             if list_idx>=len(self._list_to_peak_idx): return
@@ -5667,11 +5857,14 @@ class TennisApp(tk.Tk):
     # ══════════════════════════════════════════
     def _on_list_right_click(self,event):
         idx=self.peak_list.nearest(event.y)
-        if 0<=idx<len(self.peaks):
+        rows=getattr(self,"_list_row_items",[])
+        if idx<len(rows) and rows[idx].get("kind")!="accepted":return
+        peak_idx=rows[idx].get("peak_idx") if idx<len(rows) else idx
+        if peak_idx is not None and 0<=peak_idx<len(self.peaks):
             self.peak_list.selection_clear(0,"end")
             self.peak_list.selection_set(idx)
             self.peak_list.see(idx)  # v24
-            self.peak_idx=idx
+            self.peak_idx=peak_idx
             self._delete_current_checkpoint()
 
     def _delete_current_checkpoint(self):
@@ -5779,6 +5972,7 @@ class TennisApp(tk.Tk):
                 r=p["rank"]
                 if r==cur_rank or r not in existing_ranks:
                     targets.append(p)
+            add_crop(db_path,vf,0,float(self.peaks[self.peak_idx].get("time",0)),rect)
         else:  # 個別
             targets=[self.peaks[self.peak_idx]]
 
