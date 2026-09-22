@@ -3519,10 +3519,17 @@ class TennisApp(tk.Tk):
 
     def _finish_analysis(self):
         self._update_noise_summary()
-        # v77: 音声解析が終わった時点で波形と仮候補を即表示する。
+        # Experimental branch: audio/wall filtering first, then run the costly
+        # pose path for the strongest surviving sound only.
         candidates=self._current_audio_candidates()
         self._show_provisional_audio_candidates(candidates)
-        self._start_fast_hp_pose_filter(candidates)
+        strongest=select_sound_rank_one(candidates,self.data,self.audio_band_mode.get())
+        if strongest is None:
+            self._start_fast_hp_pose_filter([])
+            return
+        self.status_var.set(
+            f"実験モード: 音声候補{len(candidates)}件からサウンド1位だけ姿勢確認します")
+        self._start_fast_hp_pose_filter([strongest])
 
     def _current_audio_candidates(self):
         if self.data is None:return []
