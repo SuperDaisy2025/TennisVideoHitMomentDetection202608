@@ -347,10 +347,10 @@ def test_motion_summary_is_signed_horizontal_cm_delta_and_reports_ball():
     samples=[sample(0.6),sample(0.62),sample(0.65,True),sample(0.68),sample(0.7)]
     values,ball=TA.TennisApp._compute_hp_motion_cm(samples,(100,100),160)
     assert ball is True
-    # Uses -0.1s (x=.62) and +0.1s (x=.68): 6px * 2cm/px = +12cm.
-    assert all(abs(values[key]-12.0)<1e-6 for key in ("rw_x","lw_x","re_x","le_x"))
+    # ±0.1秒の12cmと、±0.2秒を同じ時間幅へ直した10cmの平均。
+    assert all(abs(values[key]-11.0)<1e-6 for key in ("rw_x","lw_x","re_x","le_x"))
     assert all(abs(values[key])<1e-6 for key in ("rw_y","lw_y","re_y","le_y"))
-    assert values["rw_d"]==12.0 and values["lw_d"]==12.0
+    assert values["rw_d"]==11.0 and values["lw_d"]==11.0
 
 
 def test_motion_summary_treats_image_right_as_positive():
@@ -360,7 +360,7 @@ def test_motion_summary_treats_image_right_as_positive():
         return {"kps":kps}
     values,_=TA.TennisApp._compute_hp_motion_cm(
         [sample(.5),sample(.7),sample(.6),sample(.4),sample(.5)],(100,100),160)
-    assert all(abs(values[key]+60.0)<1e-6 for key in ("rw_x","lw_x","re_x","le_x"))
+    assert all(abs(values[key]+30.0)<1e-6 for key in ("rw_x","lw_x","re_x","le_x"))
     assert all(abs(values[key])<1e-6 for key in ("rw_y","lw_y","re_y","le_y"))
 
 
@@ -371,8 +371,19 @@ def test_motion_summary_treats_image_down_as_positive_y():
         return {"kps":kps}
     values,_=TA.TennisApp._compute_hp_motion_cm(
         [sample(.5),sample(.3),sample(.4),sample(.5),sample(.4)],(100,100),160)
-    assert all(abs(values[key]-40.0)<1e-6 for key in ("rw_y","lw_y","re_y","le_y"))
-    assert values["rw_d"]==40.0 and values["lw_d"]==40.0
+    assert all(abs(values[key]-15.0)<1e-6 for key in ("rw_y","lw_y","re_y","le_y"))
+    assert values["rw_d"]==15.0 and values["lw_d"]==15.0
+
+
+def test_motion_summary_ignores_low_confidence_outer_outlier():
+    def sample(x,confidence=.9):
+        kps={"0":[.5,.1,.9],"15":[.5,.9,.9],"16":[.5,.9,.9]}
+        for index in (10,9,8,7):kps[str(index)]=[x,.4,confidence]
+        return {"kps":kps}
+    values,_=TA.TennisApp._compute_hp_motion_cm(
+        [sample(-.3,.3),sample(.4),sample(.5),sample(.6),sample(1.3,.3)],(100,100),160)
+    # 外側ペアは大きく低信頼なので、±0.1秒の値を採用する。
+    assert all(abs(values[key]-40.0)<1e-6 for key in ("rw_x","lw_x","re_x","le_x"))
 
 
 def test_motion_summary_uses_torso_scale_when_ankles_are_missing():
@@ -467,3 +478,90 @@ def test_crop_badges_use_clear_time_ordered_numbers():
     app._crops=[{"rank":8,"time":3.0},{"rank":4,"time":1.0},
                 {"rank":0,"time":0.5}]
     assert app._crop_badges()=={4:"C1",8:"C2"}
+
+
+def test_video_selection_opens_info_without_direction_estimation():
+    class Value:
+        def get(self): return __file__
+    app=object.__new__(TA.TennisApp)
+    app.video_path=Value(); app._cached_video_path=""
+    opened=[]
+    app._show_video_info_popup=lambda path:opened.append(path)
+    app._on_video_selected()
+    assert opened==[__file__]
+
+
+def test_global_crop_applies_at_rejected_candidate_times():
+    app=object.__new__(TA.TennisApp)
+    rect=(.1,.2,.8,.9)
+    app._crops=[{"rank":0,"time":3.0,"rect":rect}]
+    app.peaks=[]
+    assert app._crop_rect_for_time(12.5)==rect
+
+
+def test_legacy_uniform_all_crop_is_treated_as_global():
+    app=object.__new__(TA.TennisApp)
+    rect=(.1,.2,.8,.9)
+    app._crops=[{"rank":1,"time":3.0,"rect":rect},{"rank":2,"time":7.0,"rect":rect}]
+    app.peaks=[{"rank":1,"time":3.0},{"rank":2,"time":7.0}]
+    assert app._crop_rect_for_time(5.0)==rect
+
+
+def test_display_number_is_separate_from_database_rank():
+    assert TA.TennisApp._display_no({"rank":4,"_display_no":5})==5
+    assert TA.TennisApp._display_no({"rank":4})==4
+
+
+def test_rejected_candidate_has_dedicated_main_frame_path():
+    class Value:
+        def get(self):return "sample.mp4"
+    app=object.__new__(TA.TennisApp)
+    app.video_path=Value(); app.camera_dist=type("V",(),{"get":lambda self:3.0})()
+    app._active_crop_rect=lambda time:(.1,.1,.9,.9)
+    logs=[]; shown=[]
+    app._log_hp_debug=logs.append
+    app._display_frame=lambda frame,time,info=None:shown.append((time,info))
+    old=TA.grab_frame
+    try:
+        TA.grab_frame=lambda path,time:np.zeros((10,10,3),dtype=np.uint8)
+        app._show_rejected_main({"rank":5,"time":11.0,"pose_center_time":10.99,
+                                 "reason":"wall_gap"})
+    finally:TA.grab_frame=old
+    assert shown==[(10.99,"除外候補 #5  11.00s")]
+    assert "frame_ok=True" in logs[0] and "crop=(0.1, 0.1, 0.9, 0.9)" in logs[0]
+
+
+def test_audio_band_modes_select_expected_energy_series():
+    data={"combined":np.array([.1,.2]),"impact":np.array([.3,.4]),
+          "wall":np.array([.5,.6]),"broadband":np.array([.7,.8])}
+    assert np.array_equal(TA.audio_energy_series(data,"combined"),data["combined"])
+    assert np.array_equal(TA.audio_energy_series(data,"racket"),data["impact"])
+    assert np.array_equal(TA.audio_energy_series(data,"wall"),data["wall"])
+    assert np.array_equal(TA.audio_energy_series(data,"broadband"),data["broadband"])
+
+
+def test_audio_band_toggle_redraws_only_and_never_starts_pose():
+    class Value:
+        def __init__(self,value): self.value=value
+        def get(self): return self.value
+        def set(self,value): self.value=value
+    class Button:
+        def configure(self,**kwargs): self.kwargs=kwargs
+    app=object.__new__(TA.TennisApp)
+    app.audio_band_mode=Value("combined")
+    app.audio_filter_enabled=Value(True)
+    app.btn_audio_filter=Button()
+    app.status_var=Value("")
+    calls=[]
+    app._update_shot_list=lambda:calls.append("list")
+    app._draw_timeline=lambda:calls.append("timeline")
+    app._refresh_hp_detail=lambda:calls.append("detail")
+    app._start_fast_hp_pose_filter=lambda:(_ for _ in ()).throw(
+        AssertionError("pose analysis must not run for a display-only toggle"))
+
+    app._toggle_audio_filter()
+
+    assert app.audio_band_mode.get()=="racket"
+    assert calls==["list","timeline","detail"]
+    assert "姿勢・採否は変更しません" in app.status_var.get()
+    assert app.btn_audio_filter.kwargs["bg"]==TA.audio_band_color("racket")
