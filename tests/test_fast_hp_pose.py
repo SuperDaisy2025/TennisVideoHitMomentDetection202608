@@ -565,3 +565,24 @@ def test_audio_band_toggle_redraws_only_and_never_starts_pose():
     assert calls==["list","timeline","detail"]
     assert "姿勢・採否は変更しません" in app.status_var.get()
     assert app.btn_audio_filter.kwargs["bg"]==TA.audio_band_color("racket")
+
+
+def test_select_sound_rank_one_uses_surviving_candidates_only():
+    data={"times":np.array([0.,1.,2.]),"combined":np.array([.2,.9,.7])}
+    winner=TA.select_sound_rank_one([{"idx":0,"time":0.},{"idx":2,"time":2.}],data)
+    assert winner["idx"]==2
+    assert winner["sound_energy"]==.7
+
+
+def test_full_frame_contact_score_exposes_components_and_choice():
+    frames=[]
+    for i,t in enumerate((.90,.95,1.00,1.05,1.10)):
+        # Wrist accelerates into the center; ball changes direction there.
+        ball_x=(.8,.5,.1,.45,.75)[i]
+        frames.append({"time":t,"tracks":{"右手首":[i*.20,0.],
+            "左手首":[0.,0.],"ボール":[ball_x,0.],"重心":[0.,-.5]}})
+    scored,best=TA.score_full_frame_hit_candidates(frames,1.0)
+    assert len(scored)==5 and best is not None
+    assert sum(bool(row["selected"]) for row in scored)==1
+    assert {"score","audio_prior","right_speed","hand_change","ball_change","proximity"}.issubset(scored[best])
+    assert abs(scored[best]["time"]-1.0)<=.051

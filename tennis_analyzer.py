@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v106"; APP_VERSION_DESC = "音域表示の即時切替"
+APP_VERSION = "v107-exp"; APP_VERSION_DESC = "全フレーム打点検証"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -1060,6 +1060,70 @@ def audio_band_color(mode="combined"):
             "wall":"#d17a22","broadband":"#6b7280"}.get(str(mode),"#23845b")
 
 
+def select_sound_rank_one(candidates,data,mode="combined"):
+    """Return the strongest surviving audio candidate, without changing ranks."""
+    if not candidates or data is None:return None
+    times=np.asarray(data.get("times",[]),dtype=float)
+    energy=audio_energy_series(data,mode)
+    if not len(times) or not len(energy):return None
+    def level(candidate):
+        idx=int(candidate.get("idx",np.argmin(np.abs(times-float(candidate.get("time",0))))))
+        idx=max(0,min(idx,len(energy)-1))
+        return float(energy[idx])
+    winner=max(candidates,key=level)
+    result=dict(winner); result["sound_energy"]=level(winner)
+    return result
+
+
+def score_full_frame_hit_candidates(frames,audio_time,sigma=.08):
+    """Attach transparent experimental contact scores to frame records.
+
+    Tracks are person-relative (pelvis origin, shoulder-width scale). Missing
+    ball observations contribute zero instead of invalidating wrist evidence.
+    """
+    if not frames:return [],None
+    n=len(frames); eps=1e-6
+    times=np.asarray([float(f["time"]) for f in frames])
+    def track(name):
+        arr=np.full((n,2),np.nan)
+        for i,f in enumerate(frames):
+            value=f.get("tracks",{}).get(name)
+            if value is not None:arr[i]=value[:2]
+        return arr
+    rw,lw,ball=track("右手首"),track("左手首"),track("ボール")
+    def speed(arr):
+        out=np.zeros(n)
+        if n<2:return out
+        for i in range(1,n):
+            if np.isfinite(arr[i]).all() and np.isfinite(arr[i-1]).all():
+                out[i]=np.linalg.norm(arr[i]-arr[i-1])/max(times[i]-times[i-1],1e-4)
+        return out
+    rs,ls,bs=speed(rw),speed(lw),speed(ball)
+    hand_speed=np.maximum(rs,ls)
+    hand_change=np.abs(np.gradient(hand_speed,times)) if n>2 else np.zeros(n)
+    ball_change=np.abs(np.gradient(bs,times)) if n>2 else np.zeros(n)
+    proximity=np.zeros(n)
+    for i in range(n):
+        if np.isfinite(ball[i]).all():
+            distances=[np.linalg.norm(ball[i]-h[i]) for h in (rw,lw) if np.isfinite(h[i]).all()]
+            if distances:proximity[i]=math.exp(-min(distances)/.45)
+    def norm(values):
+        finite=np.asarray(values,dtype=float); top=float(np.nanpercentile(finite,90)) if len(finite) else 0
+        return np.clip(finite/max(top,eps),0,1)
+    audio=np.exp(-.5*((times-float(audio_time))/max(float(sigma),.01))**2)
+    ns,nc,nb=norm(hand_speed),norm(hand_change),norm(ball_change)
+    scores=.30*audio+.28*ns+.18*nc+.16*nb+.08*proximity
+    best=int(np.argmax(scores))
+    output=[]
+    for i,frame in enumerate(frames):
+        item=dict(frame); item.update({"right_speed":float(rs[i]),"left_speed":float(ls[i]),
+            "hand_change":float(hand_change[i]),"ball_change":float(ball_change[i]),
+            "proximity":float(proximity[i]),"audio_prior":float(audio[i]),
+            "score":float(scores[i]),"selected":i==best})
+        output.append(item)
+    return output,best
+
+
 def detect_peaks(data, sensitivity=0.5, min_gap=1.0, wall_mode=False,
                  use_frequency_filter=True,return_rejected=False,frequency_mode=None):
     """ピーク検出。
@@ -1794,6 +1858,8 @@ class TennisApp(tk.Tk):
         self._hp_candidate_audit = []
         self._timeline_zoomed = False
         self._timeline_candidate_markers = []
+        self._experiment_frames = []
+        self._experiment_running = False
         try:self.noise_summary_var.set("音響混雑度: 解析中…")
         except Exception:pass
 
@@ -1874,6 +1940,8 @@ class TennisApp(tk.Tk):
         self._hp_candidate_audit = []
         self._timeline_zoomed = False
         self._timeline_candidate_markers = []
+        self._experiment_frames = []
+        self._experiment_running = False
         try:self.noise_summary_var.set("音響混雑度: 解析中…")
         except Exception:pass
         try:
@@ -2180,14 +2248,17 @@ class TennisApp(tk.Tk):
 
         self.tab_main    = tk.Frame(self.tabs,bg=BG)
         self.tab_hp_detail = tk.Frame(self.tabs,bg=BG)
+        self.tab_frame_validation = tk.Frame(self.tabs,bg=BG)
         self.tab_truth_summary = tk.Frame(self.tabs,bg=BG)
         self.tabs.add(self.tab_main,   text="ヒットポイント一覧")
         self.tabs.add(self.tab_hp_detail, text="ヒットポイント詳細")
+        self.tabs.add(self.tab_frame_validation, text="フレーム検証（実験）")
         self.tabs.add(self.tab_truth_summary, text="正解DBサマリ")
         self.tabs.bind("<<NotebookTabChanged>>",self._on_tab_changed)
 
         self._build_tab_main(self.tab_main)
         self._build_tab_hp_detail(self.tab_hp_detail)
+        self._build_tab_frame_validation(self.tab_frame_validation)
         self._build_tab_truth_summary(self.tab_truth_summary)
         # v63: 今回の画面はヒットポイント検出に限定する。
         self.refiner = None
@@ -2364,6 +2435,42 @@ class TennisApp(tk.Tk):
         tk.Label(parent,textvariable=self._hp_rejected_reason_var,bg="#fff4f4",fg="#8b1a1a",
                  font=_tk_font(9),anchor="w",justify="left",wraplength=1200
                  ).pack(fill="x",padx=14,pady=(0,5),ipadx=6,ipady=3)
+
+    def _build_tab_frame_validation(self,parent):
+        """Experimental, inspectable full-frame contact validation screen."""
+        head=tk.Frame(parent,bg=PANEL); head.pack(fill="x",padx=8,pady=(8,4))
+        self._experiment_status=tk.StringVar(value="音声解析後、壁音除外後のサウンド1位を自動解析します")
+        tk.Label(head,text="サウンド1位・全フレーム検証",bg=PANEL,fg=ACCENT2,
+                 font=_tk_font(14,bold=True)).pack(side="left",padx=8,pady=6)
+        tk.Button(head,text="再解析",bg=ACCENT2,fg="white",relief="flat",
+                  font=_tk_font(10,bold=True),command=self._start_experiment_validation
+                  ).pack(side="right",padx=6,ipadx=10,ipady=3)
+        tk.Label(head,textvariable=self._experiment_status,bg=PANEL,fg=TEXT,
+                 font=_tk_font(9),anchor="w").pack(side="left",fill="x",expand=True,padx=12)
+
+        photo_outer=tk.Frame(parent,bg=BG); photo_outer.pack(fill="x",padx=8,pady=3)
+        self._experiment_photo_canvas=tk.Canvas(photo_outer,bg="#173128",height=245,
+                                                 highlightthickness=0)
+        sx=tk.Scrollbar(photo_outer,orient="horizontal",command=self._experiment_photo_canvas.xview)
+        self._experiment_photo_canvas.configure(xscrollcommand=sx.set)
+        self._experiment_photo_canvas.pack(fill="x",expand=True); sx.pack(fill="x")
+        self._experiment_photo_inner=tk.Frame(self._experiment_photo_canvas,bg="#173128")
+        self._experiment_photo_window=self._experiment_photo_canvas.create_window(
+            (0,0),window=self._experiment_photo_inner,anchor="nw")
+        self._experiment_photo_inner.bind("<Configure>",lambda e:
+            self._experiment_photo_canvas.configure(scrollregion=self._experiment_photo_canvas.bbox("all")))
+        self._experiment_photo_refs=[]
+
+        graph=tk.Frame(parent,bg="white"); graph.pack(fill="both",expand=True,padx=8,pady=(3,5))
+        self._experiment_fig,self._experiment_axes=plt.subplots(2,1,sharex=True,figsize=(11,4.4))
+        self._experiment_fig.patch.set_facecolor("white")
+        self._experiment_fig.subplots_adjust(left=.07,right=.98,top=.93,bottom=.13,hspace=.22)
+        self._experiment_chart=FigureCanvasTkAgg(self._experiment_fig,master=graph)
+        self._experiment_chart.get_tk_widget().pack(fill="both",expand=True)
+        self._experiment_metrics=tk.StringVar(value="判定式: 音声30% + 手首速度28% + 速度変化18% + ボール変化16% + 近接8%")
+        tk.Label(parent,textvariable=self._experiment_metrics,bg=PANEL2,fg=TEXT,
+                 font=("Consolas",9),anchor="w",justify="left",wraplength=1300
+                 ).pack(fill="x",padx=8,pady=(0,7),ipadx=7,ipady=4)
 
     def _build_tab_truth_summary(self,parent):
         head=tk.Frame(parent,bg=PANEL); head.pack(fill="x",padx=12,pady=(10,6))
@@ -3787,6 +3894,144 @@ class TennisApp(tk.Tk):
         self._hp_candidate_audit=list(audit)+list(
             getattr(self,"_wall_gap_rejected_candidates",[]))
         self._refresh_peaks(refined_candidates=accepted,pose_rejected=rejected)
+        # Experimental branch: inspect only the strongest candidate that
+        # survived wall/no-motion filtering. Keep this independent of normal UI.
+        self.after(80,lambda:self._start_experiment_validation(accepted))
+
+    def _start_experiment_validation(self,candidates=None):
+        if self._experiment_running or self.data is None:return
+        candidates=list(candidates if candidates is not None else self.peaks)
+        target=select_sound_rank_one(candidates,self.data,self.audio_band_mode.get())
+        if target is None:
+            self._experiment_status.set("解析対象なし（壁音除外後に採用候補がありません）")
+            return
+        path=self.video_path.get().strip(); gen=self._gen
+        if not path or not os.path.exists(path):return
+        self._experiment_running=True
+        self._experiment_status.set(
+            f"準備中: 音1位 {float(target['time']):.3f}s / energy {target['sound_energy']:.3f}")
+
+        def _worker():
+            cap=None
+            try:
+                import onnxruntime as ort
+                from rtmlib import Body
+                from ultralytics import YOLO
+                device="cuda" if "CUDAExecutionProvider" in ort.get_available_providers() else "cpu"
+                pose=Body(to_openpose=False,mode="lightweight",backend="onnxruntime",device=device)
+                ball_model=YOLO("yolov8n.pt")
+                cap=cv2.VideoCapture(path); fps=cap.get(cv2.CAP_PROP_FPS) or 30.0
+                frame_count=int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                try:distance=float(self.camera_dist.get())
+                except Exception:distance=3.0
+                corrected=max(0.0,float(target["time"])-distance/SOUND_SPEED)
+                first=max(0,int(math.floor((corrected-.2)*fps)))
+                last=min(max(0,frame_count-1),int(math.ceil((corrected+.2)*fps)))
+                frames=[]; total=max(1,last-first+1)
+                for order,frame_no in enumerate(range(first,last+1),1):
+                    if self._gen!=gen:return
+                    cap.set(cv2.CAP_PROP_POS_FRAMES,frame_no); ok,bgr=cap.read()
+                    if not ok:continue
+                    h,w=bgr.shape[:2]; keypoints,scores=pose(bgr)
+                    kps=rtmpose_result_to_coco(keypoints,scores,w,h)
+                    obj=ball_model.predict(bgr,verbose=False,conf=.06,imgsz=1280,classes=[32])[0]
+                    if obj.boxes is not None and len(obj.boxes)>0:
+                        confs=obj.boxes.conf.cpu().numpy(); boxes=obj.boxes.xyxy.cpu().numpy()
+                        wrists=[kps.get("9"),kps.get("10")]
+                        centers=np.column_stack(((boxes[:,0]+boxes[:,2])*.5/w,
+                                                 (boxes[:,1]+boxes[:,3])*.5/h))
+                        valid_wrists=[np.asarray(v[:2]) for v in wrists if v and float(v[2])>=.15]
+                        if valid_wrists:
+                            d=np.min(np.stack([np.linalg.norm(centers-wr,axis=1)
+                                               for wr in valid_wrists]),axis=0)
+                            bi=int(np.argmin(d-.06*confs))
+                        else:bi=int(np.argmax(confs))
+                        box=boxes[bi]; kps["18"]=[float((box[0]+box[2])*.5/w),
+                            float((box[1]+box[3])*.5/h),float(confs[bi])]
+                    valid=lambda v:bool(v and len(v)>=3 and float(v[2])>=.20)
+                    hips=[kps.get("11"),kps.get("12")]; shoulders=[kps.get("5"),kps.get("6")]
+                    vh=[v for v in hips if valid(v)]; vs=[v for v in shoulders if valid(v)]
+                    pelvis=np.mean([v[:2] for v in vh],axis=0) if vh else None
+                    sw=(np.linalg.norm(np.asarray(vs[0][:2])-np.asarray(vs[1][:2]))
+                        if len(vs)==2 else .15)
+                    tracks={}
+                    if pelvis is not None and sw>.015:
+                        for name,ki in (("右手首","10"),("左手首","9"),("ボール","18")):
+                            v=kps.get(ki)
+                            if valid(v):tracks[name]=((np.asarray(v[:2])-pelvis)/sw).tolist()
+                        torso=[v[:2] for v in vh+vs]
+                        if torso:
+                            center=np.mean(torso,axis=0)
+                            tracks["重心"]=((center-pelvis)/sw).tolist()
+                    good,encoded=cv2.imencode(".jpg",bgr,[cv2.IMWRITE_JPEG_QUALITY,90])
+                    frames.append({"time":frame_no/fps,"frame_no":frame_no,"kps":kps,
+                                   "tracks":tracks,"frame_jpeg":encoded.tobytes() if good else None})
+                    self.after(0,lambda o=order,t=total:self._experiment_status.set(
+                        f"全フレーム解析中… {o}/{t}"))
+                scored,best=score_full_frame_hit_candidates(frames,corrected)
+                if self._gen==gen:self.after(0,lambda:self._show_experiment_results(
+                    scored,best,target,corrected,fps))
+            except Exception as e:
+                err=str(e); print("[実験フレーム検証エラー]",err)
+                self.after(0,lambda e=err:self._experiment_status.set(f"解析エラー: {e}"))
+            finally:
+                if cap is not None:cap.release()
+                self._experiment_running=False
+        threading.Thread(target=_worker,daemon=True).start()
+
+    def _show_experiment_results(self,frames,best,target,corrected,fps):
+        self._experiment_frames=list(frames); self._experiment_photo_refs=[]
+        for child in self._experiment_photo_inner.winfo_children():child.destroy()
+        if not frames or best is None:
+            self._experiment_status.set("解析できるフレームがありません")
+            return
+        for i,frame in enumerate(frames):
+            selected=i==best; card=tk.Frame(self._experiment_photo_inner,
+                bg="#fff3be" if selected else PANEL2,bd=2,relief="solid")
+            card.pack(side="left",padx=3,pady=4)
+            rel=float(frame["time"])-corrected
+            tk.Label(card,text=f"F{frame['frame_no']}  {frame['time']:.3f}s  ({rel:+.3f}s)",
+                     bg=card["bg"],fg=GOLD if selected else TEXT,
+                     font=_tk_font(8,bold=True)).pack(fill="x")
+            raw=cv2.imdecode(np.frombuffer(frame["frame_jpeg"],dtype=np.uint8),cv2.IMREAD_COLOR)
+            image=Image.fromarray(cv2.cvtColor(raw,cv2.COLOR_BGR2RGB)); iw,ih=image.size
+            draw=ImageDraw.Draw(image,"RGBA"); radius=max(4,int(min(iw,ih)*.008))
+            for key,value in frame.get("kps",{}).items():
+                try:
+                    ki=int(key)
+                    if float(value[2])>=.15:
+                        _draw_kp_shape_pil(draw,KP_SHAPES[ki],float(value[0])*iw,
+                                           float(value[1])*ih,radius,KP_COLORS[ki],"white",1)
+                except Exception:pass
+            image.thumbnail((185,155),Image.LANCZOS); photo=ImageTk.PhotoImage(image)
+            self._experiment_photo_refs.append(photo)
+            tk.Label(card,image=photo,bg=card["bg"]).pack()
+            ball="有" if "ボール" in frame.get("tracks",{}) else "無"
+            text=(f"score {frame['score']:.3f}  ball {ball}\n"
+                  f"音 {frame['audio_prior']:.2f}  手速 {max(frame['right_speed'],frame['left_speed']):.2f}\n"
+                  f"手変 {frame['hand_change']:.2f}  球変 {frame['ball_change']:.2f}  近 {frame['proximity']:.2f}")
+            tk.Label(card,text=text,bg=card["bg"],fg=TEXT,justify="left",
+                     font=("Consolas",8)).pack(fill="x",padx=3,pady=2)
+        colors={"右手首":"#e74c3c","左手首":"#2980b9","ボール":"#d19a00","重心":"#23835b"}
+        rel_times=np.asarray([f["time"]-corrected for f in frames])
+        for axis,coord,title in zip(self._experiment_axes,(0,1),("X（腰中心=0、右＋）","Y（腰中心=0、下＋）")):
+            axis.clear(); axis.set_facecolor("white")
+            for name,color in colors.items():
+                values=[f.get("tracks",{}).get(name,[np.nan,np.nan])[coord] for f in frames]
+                axis.plot(rel_times,values,"o-",label=name,color=color,linewidth=1.5,markersize=4)
+            axis.axvline(0,color="#777",linestyle="--",linewidth=1,label="音声補正時刻")
+            axis.axvline(rel_times[best],color="#ff8c00",linewidth=2,label="自動判定")
+            axis.set_ylabel(title); axis.grid(True,alpha=.25); axis.legend(loc="upper left",ncol=6,fontsize=8)
+        self._experiment_axes[-1].set_xlabel("音声補正時刻からの秒数 / 各点は実フレーム")
+        self._experiment_chart.draw_idle()
+        chosen=frames[best]
+        self._experiment_status.set(
+            f"完了: 音1位 {float(target['time']):.3f}s → 音速補正 {corrected:.3f}s / 自動候補 F{chosen['frame_no']} {chosen['time']:.3f}s")
+        self._experiment_metrics.set(
+            f"選択 score={chosen['score']:.3f} | 音声={chosen['audio_prior']:.3f} "
+            f"右手速={chosen['right_speed']:.3f} 左手速={chosen['left_speed']:.3f} "
+            f"手速度変化={chosen['hand_change']:.3f} ボール変化={chosen['ball_change']:.3f} "
+            f"手球近接={chosen['proximity']:.3f} | 重み: 音30 手速28 手変18 球変16 近接8%")
 
     def _render_hp_detail_photo(self,canvas,sample,slot):
         canvas.delete("all"); path=self.video_path.get()
