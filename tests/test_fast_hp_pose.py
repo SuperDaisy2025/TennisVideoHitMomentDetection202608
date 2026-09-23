@@ -605,3 +605,10 @@ def test_experiment_absolute_tracks_use_normalized_keypoint_values():
         "5":[.4,.3,.9],"6":[.6,.3,.9],"11":[.45,.7,.9],"12":[.55,.7,.9]}})
     assert tracks["右手首"]==[.75,.25]
     assert np.allclose(tracks["重心"],[.5,.5])
+
+
+def test_experiment_confidence_text_uses_pose_and_ball_scores():
+    text=TA.experiment_confidence_text({"10":[.2,.3,.876],"9":[.1,.4,.654],
+                                        "18":[.8,.2,.432]})
+    assert text=="Conf  RW 0.88  LW 0.65  Ball 0.43"
+    assert TA.experiment_confidence_text({})=="Conf  RW --  LW --  Ball --"

@@ -234,7 +234,7 @@ warnings.filterwarnings("ignore")
 import contextlib
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 
 import cv2, ffmpeg, librosa
 import numpy as np
@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v109-exp"; APP_VERSION_DESC = "検証座標・選択同期"
+APP_VERSION = "v110-exp"; APP_VERSION_DESC = "検証信頼度・重心表示"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -1114,6 +1114,15 @@ def build_person_relative_tracks(frames,min_conf=.05):
         item["reference_borrowed"]=bool(ai!=i or si!=i)
         output.append(item)
     return output
+
+
+def experiment_confidence_text(kps):
+    """Compact RTMPose/YOLO confidence text for experimental photos."""
+    def value(key):
+        point=(kps or {}).get(str(key))
+        try:return f"{float(point[2]):.2f}" if point and len(point)>=3 else "--"
+        except Exception:return "--"
+    return f"Conf  RW {value(10)}  LW {value(9)}  Ball {value(18)}"
 
 
 def score_full_frame_hit_candidates(frames,audio_time,sigma=.08):
@@ -4112,7 +4121,7 @@ class TennisApp(tk.Tk):
             axis.axvline(rel_times[selected],color="#1976d2",linewidth=1.8,
                          linestyle=(0,(3,3)),label="写真選択")
             axis.set_ylabel(title); axis.grid(True,alpha=.25)
-            axis.legend(loc="upper left",ncol=4,fontsize=8)
+            axis.legend(loc="lower left",ncol=2,fontsize=8)
             axis.tick_params(axis="x",which="both",labelbottom=True)
             axis.set_xlabel("音声補正時刻からの秒数")
         self._experiment_chart.draw_idle()
@@ -4128,9 +4137,29 @@ class TennisApp(tk.Tk):
                     _draw_kp_shape_pil(draw,KP_SHAPES[ki],float(value[0])*iw,
                                        float(value[1])*ih,radius,KP_COLORS[ki],"white",1)
             except Exception:pass
+        valid=lambda v:bool(v and len(v)>=3 and float(v[2])>=.05)
+        torso=[v[:2] for v in (frame.get("kps",{}).get("5"),frame.get("kps",{}).get("6"),
+                                frame.get("kps",{}).get("11"),frame.get("kps",{}).get("12")) if valid(v)]
+        if torso:
+            gx,gy=np.mean(torso,axis=0); gx*=iw; gy*=ih
+            r=max(radius+2,int(min(iw,ih)*.012)); color="#075c36"
+            draw.line((gx-r,gy-r,gx+r,gy+r),fill=color,width=max(3,r//3))
+            draw.line((gx-r,gy+r,gx+r,gy-r),fill=color,width=max(3,r//3))
         if self._experiment_autocrop.get() and self._experiment_crop_rect:
             x1,y1,x2,y2=self._experiment_crop_rect
             image=image.crop((int(x1*iw),int(y1*ih),int(x2*iw),int(y2*ih)))
+        # Confidence is painted after cropping so it always stays at the
+        # bottom-left of both the large photo and every thumbnail.
+        draw=ImageDraw.Draw(image,"RGBA"); text=experiment_confidence_text(frame.get("kps",{}))
+        font_size=max(14,int(min(image.size)*.027))
+        try:font=ImageFont.truetype("arial.ttf",font_size)
+        except Exception:font=ImageFont.load_default()
+        try:box=draw.textbbox((0,0),text,font=font,stroke_width=0)
+        except Exception:box=(0,0,len(text)*font_size*.6,font_size)
+        tw=max(1,int(box[2]-box[0])); th=max(1,int(box[3]-box[1])); x=7; y=max(4,image.height-th-10)
+        draw.rounded_rectangle((x-4,y-3,x+tw+5,y+th+4),radius=4,fill=(255,255,255,215),
+                               outline=(7,92,54,230),width=2)
+        draw.text((x,y),text,font=font,fill=(0,0,0,255))
         return image
 
     def _rerender_experiment_images(self):
