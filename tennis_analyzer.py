@@ -234,7 +234,7 @@ warnings.filterwarnings("ignore")
 import contextlib
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
-from PIL import Image, ImageTk, ImageDraw, ImageFont
+from PIL import Image, ImageTk, ImageDraw
 
 import cv2, ffmpeg, librosa
 import numpy as np
@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v112-exp"; APP_VERSION_DESC = "検証数値表示整理"
+APP_VERSION = "v113-exp"; APP_VERSION_DESC = "Confidence固定表示"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -2527,6 +2527,14 @@ class TennisApp(tk.Tk):
         large_y.pack(side="right",fill="y"); large_x.pack(side="bottom",fill="x")
         self._experiment_large_canvas.pack(fill="both",expand=True)
         self._experiment_large_canvas.bind("<Configure>",lambda e:self._render_experiment_large())
+        self._experiment_confidence_var=tk.StringVar(value="Confidence\nRW   --\nLW   --\nBall --")
+        self._experiment_confidence_label=tk.Label(
+            self._experiment_large_canvas,textvariable=self._experiment_confidence_var,
+            bg="#ffffff",fg="#000000",font=("Arial",20,"bold"),justify="left",
+            anchor="w",relief="solid",bd=2,padx=8,pady=5)
+        # `place` is viewport-relative, unlike Canvas items, so scrolling the
+        # image never clips or moves this diagnostic overlay.
+        self._experiment_confidence_label.place(x=8,rely=1.0,y=-8,anchor="sw")
 
         photo_outer=tk.Frame(right,bg=BG,height=205); photo_outer.pack(fill="x",pady=(5,0))
         self._experiment_photo_canvas=tk.Canvas(photo_outer,bg="#173128",height=178,
@@ -4150,24 +4158,6 @@ class TennisApp(tk.Tk):
             image=image.crop((int(x1*iw),int(y1*ih),int(x2*iw),int(y2*ih)))
         return image
 
-    @staticmethod
-    def _paint_experiment_confidence(image,kps):
-        """Paint all three confidence values on the final large image only."""
-        draw=ImageDraw.Draw(image,"RGBA"); text=experiment_confidence_text(kps)
-        font_size=max(20,min(34,int(min(image.size)*.055)))
-        try:font=ImageFont.truetype("arialbd.ttf",font_size)
-        except Exception:
-            try:font=ImageFont.truetype("arial.ttf",font_size)
-            except Exception:font=ImageFont.load_default()
-        spacing=max(2,font_size//7)
-        try:box=draw.multiline_textbbox((0,0),text,font=font,spacing=spacing)
-        except Exception:box=(0,0,8*font_size*.65,font_size*4+spacing*3)
-        tw=int(box[2]-box[0]); th=int(box[3]-box[1]); x=9; y=max(5,image.height-th-12)
-        draw.rounded_rectangle((x-5,y-4,min(image.width-2,x+tw+7),y+th+5),radius=5,
-                               fill=(255,255,255,225),outline=(7,92,54,240),width=2)
-        draw.multiline_text((x,y),text,font=font,fill=(0,0,0,255),spacing=spacing)
-        return image
-
     def _rerender_experiment_images(self):
         if not hasattr(self,"_experiment_photo_inner"):return
         for child in self._experiment_photo_inner.winfo_children():child.destroy()
@@ -4209,13 +4199,14 @@ class TennisApp(tk.Tk):
         scale=max(.1,(vh-42)/max(image.height,1))
         size=(max(1,int(image.width*scale)),max(1,int(image.height*scale)))
         image=image.resize(size,Image.LANCZOS)
-        image=self._paint_experiment_confidence(image,frame.get("kps",{}))
         self._experiment_large_ref=ImageTk.PhotoImage(image)
         x0=max(0,(vw-size[0])//2); y0=28+max(0,(vh-32-size[1])//2)
         cv.create_image(x0,y0,image=self._experiment_large_ref,anchor="nw")
         borrowed="（身体基準は前後フレームから補間）" if frame.get("reference_borrowed") else ""
         cv.create_text(8,5,text=f"F{frame['frame_no']}  {frame['time']:.3f}s  KP {frame.get('pose_points',0)} {borrowed}",
                        fill="white",font=_tk_font(10,bold=True),anchor="nw")
+        self._experiment_confidence_var.set(experiment_confidence_text(frame.get("kps",{})))
+        self._experiment_confidence_label.lift()
         total_w=max(vw,size[0]); total_h=max(vh,size[1]+32)
         cv.configure(scrollregion=(0,0,total_w,total_h))
         # Default viewport follows the player's median KP position. The user can
