@@ -597,3 +597,11 @@ def test_relative_tracks_keep_visible_wrist_when_torso_reference_flickers():
     assert "右手首" in tracked[1]["tracks"]
     assert tracked[1]["reference_borrowed"] is True
     assert tracked[1]["pose_points"]==1
+
+
+def test_experiment_absolute_tracks_use_normalized_keypoint_values():
+    app=object.__new__(TA.TennisApp)
+    tracks=app._experiment_absolute_tracks({"kps":{"10":[.75,.25,.8],
+        "5":[.4,.3,.9],"6":[.6,.3,.9],"11":[.45,.7,.9],"12":[.55,.7,.9]}})
+    assert tracks["右手首"]==[.75,.25]
+    assert np.allclose(tracks["重心"],[.5,.5])

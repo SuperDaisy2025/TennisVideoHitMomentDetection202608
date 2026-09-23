@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v108-exp"; APP_VERSION_DESC = "全フレーム検証UI改良"
+APP_VERSION = "v109-exp"; APP_VERSION_DESC = "検証座標・選択同期"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -2493,11 +2493,17 @@ class TennisApp(tk.Tk):
         tk.Checkbutton(head,text="自動クロップ ON/OFF",variable=self._experiment_autocrop,
                        bg=PANEL,fg=TEXT,selectcolor=DARK2,font=_tk_font(9,bold=True),
                        command=self._rerender_experiment_images).pack(side="right",padx=8)
+        self._experiment_coordinate_mode=tk.StringVar(value="relative")
+        self._experiment_coordinate_button=tk.Button(head,text="座標: 相対",bg=DARK2,fg=TEXT,
+                  relief="flat",font=_tk_font(9,bold=True),command=self._toggle_experiment_coordinates)
+        self._experiment_coordinate_button.pack(side="right",padx=4,ipadx=6)
         split=tk.PanedWindow(parent,orient="horizontal",bg=BG,sashwidth=7,
                              sashrelief="flat",showhandle=False)
+        self._experiment_split=split; self._experiment_split_initialized=False
         split.pack(fill="both",expand=True,padx=8,pady=(2,5))
-        graph=tk.Frame(split,bg="white",width=660); split.add(graph,minsize=460,stretch="always")
-        right=tk.Frame(split,bg=BG,width=620); split.add(right,minsize=420,stretch="always")
+        graph=tk.Frame(split,bg="white",width=600); split.add(graph,minsize=420,stretch="always")
+        right=tk.Frame(split,bg=BG,width=600); split.add(right,minsize=420,stretch="always")
+        split.bind("<Configure>",lambda e:self._initialize_experiment_split())
         self._experiment_fig,self._experiment_axes=plt.subplots(2,1,sharex=True,figsize=(11,4.4))
         self._experiment_fig.patch.set_facecolor("white")
         self._experiment_fig.subplots_adjust(left=.07,right=.98,top=.93,bottom=.13,hspace=.22)
@@ -2530,6 +2536,21 @@ class TennisApp(tk.Tk):
         tk.Label(parent,textvariable=self._experiment_metrics,bg=PANEL2,fg=TEXT,
                  font=("Consolas",9),anchor="w",justify="left",wraplength=1300
                  ).pack(fill="x",padx=8,pady=(0,7),ipadx=7,ipady=4)
+
+    def _initialize_experiment_split(self):
+        if self._experiment_split_initialized:return
+        width=self._experiment_split.winfo_width()
+        if width<850:return
+        self._experiment_split.sash_place(0,width//2,1)
+        self._experiment_split_initialized=True
+
+    def _toggle_experiment_coordinates(self):
+        mode="absolute" if self._experiment_coordinate_mode.get()=="relative" else "relative"
+        self._experiment_coordinate_mode.set(mode)
+        self._experiment_coordinate_button.configure(text="座標: 絶対" if mode=="absolute" else "座標: 相対",
+                                                     bg=ACCENT2 if mode=="absolute" else DARK2,
+                                                     fg="white" if mode=="absolute" else TEXT)
+        self._draw_experiment_graphs()
 
     def _build_tab_truth_summary(self,parent):
         head=tk.Frame(parent,bg=PANEL); head.pack(fill="x",padx=12,pady=(10,6))
@@ -4050,18 +4071,7 @@ class TennisApp(tk.Tk):
                                         min(1,max(xs)+pad_x),min(1,max(ys)+pad_y))
         else:self._experiment_crop_rect=None
         self._rerender_experiment_images()
-        colors={"右手首":"#e74c3c","左手首":"#2980b9","ボール":"#d19a00","重心":"#23835b"}
-        rel_times=np.asarray([f["time"]-corrected for f in frames])
-        for axis,coord,title in zip(self._experiment_axes,(0,1),("X（腰中心=0、右＋）","Y（腰中心=0、下＋）")):
-            axis.clear(); axis.set_facecolor("white")
-            for name,color in colors.items():
-                values=[f.get("tracks",{}).get(name,[np.nan,np.nan])[coord] for f in frames]
-                axis.plot(rel_times,values,"o-",label=name,color=color,linewidth=1.5,markersize=4)
-            axis.axvline(0,color="#777",linestyle="--",linewidth=1,label="音声補正時刻")
-            axis.axvline(rel_times[best],color="#ff8c00",linewidth=2,label="自動判定")
-            axis.set_ylabel(title); axis.grid(True,alpha=.25); axis.legend(loc="upper left",ncol=6,fontsize=8)
-        self._experiment_axes[-1].set_xlabel("音声補正時刻からの秒数 / 各点は実フレーム")
-        self._experiment_chart.draw_idle()
+        self._draw_experiment_graphs()
         chosen=frames[best]
         self._experiment_status.set(
             f"完了: 音1位 {float(target['time']):.3f}s → 音速補正 {corrected:.3f}s / 自動候補 F{chosen['frame_no']} {chosen['time']:.3f}s")
@@ -4070,6 +4080,42 @@ class TennisApp(tk.Tk):
             f"右手速={chosen['right_speed']:.3f} 左手速={chosen['left_speed']:.3f} "
             f"手速度変化={chosen['hand_change']:.3f} ボール変化={chosen['ball_change']:.3f} "
             f"手球近接={chosen['proximity']:.3f} | 重み: 音30 手速28 手変18 球変16 近接8%")
+
+    def _experiment_absolute_tracks(self,frame):
+        kps=frame.get("kps",{}); valid=lambda v:bool(v and len(v)>=3 and float(v[2])>=.05)
+        tracks={}
+        for name,ki in (("右手首","10"),("左手首","9"),("ボール","18")):
+            value=kps.get(ki)
+            if valid(value):tracks[name]=[float(value[0]),float(value[1])]
+        torso=[v[:2] for v in (kps.get("5"),kps.get("6"),kps.get("11"),kps.get("12")) if valid(v)]
+        if torso:tracks["重心"]=np.mean(torso,axis=0).tolist()
+        return tracks
+
+    def _draw_experiment_graphs(self):
+        if not getattr(self,"_experiment_frames",None):return
+        frames=self._experiment_frames; center=float(getattr(self,"_experiment_audio_center",frames[0]["time"]))
+        rel_times=np.asarray([float(f["time"])-center for f in frames])
+        mode=self._experiment_coordinate_mode.get()
+        source=[self._experiment_absolute_tracks(f) for f in frames] if mode=="absolute" else [f.get("tracks",{}) for f in frames]
+        colors={"右手首":"#e74c3c","左手首":"#2980b9","ボール":"#d19a00","重心":"#23835b"}
+        titles=("X 絶対位置（画像左=0、右=1）","Y 絶対位置（画像上=0、下=1）") if mode=="absolute" else (
+                "X 相対位置（腰中心=0、右＋ / 肩幅単位）","Y 相対位置（腰中心=0、下＋ / 肩幅単位）")
+        auto=next((i for i,f in enumerate(frames) if f.get("selected")),0)
+        selected=max(0,min(int(getattr(self,"_experiment_selected_frame",auto)),len(frames)-1))
+        for axis,coord,title in zip(self._experiment_axes,(0,1),titles):
+            axis.clear(); axis.set_facecolor("white")
+            for name,color in colors.items():
+                values=[track.get(name,[np.nan,np.nan])[coord] for track in source]
+                axis.plot(rel_times,values,"o-",label=name,color=color,linewidth=1.5,markersize=4)
+            axis.axvline(0,color="#777",linestyle="--",linewidth=1,label="音声補正時刻")
+            axis.axvline(rel_times[auto],color="#ff8c00",linewidth=2,label="自動判定")
+            axis.axvline(rel_times[selected],color="#1976d2",linewidth=1.8,
+                         linestyle=(0,(3,3)),label="写真選択")
+            axis.set_ylabel(title); axis.grid(True,alpha=.25)
+            axis.legend(loc="upper left",ncol=4,fontsize=8)
+            axis.tick_params(axis="x",which="both",labelbottom=True)
+            axis.set_xlabel("音声補正時刻からの秒数")
+        self._experiment_chart.draw_idle()
 
     def _experiment_annotated_image(self,frame):
         raw=cv2.imdecode(np.frombuffer(frame["frame_jpeg"],dtype=np.uint8),cv2.IMREAD_COLOR)
@@ -4110,6 +4156,7 @@ class TennisApp(tk.Tk):
     def _select_experiment_frame(self,index):
         self._experiment_selected_frame=max(0,min(int(index),len(self._experiment_frames)-1))
         self._rerender_experiment_images()
+        self._draw_experiment_graphs()
         frame=self._experiment_frames[self._experiment_selected_frame]
         self._experiment_metrics.set(
             f"選択 F{frame['frame_no']} {frame['time']:.3f}s | score={frame['score']:.3f} "
@@ -4126,11 +4173,27 @@ class TennisApp(tk.Tk):
         scale=max(.1,(vh-42)/max(image.height,1))
         size=(max(1,int(image.width*scale)),max(1,int(image.height*scale)))
         image=image.resize(size,Image.LANCZOS); self._experiment_large_ref=ImageTk.PhotoImage(image)
-        cv.create_image(0,28,image=self._experiment_large_ref,anchor="nw")
+        x0=max(0,(vw-size[0])//2); y0=28+max(0,(vh-32-size[1])//2)
+        cv.create_image(x0,y0,image=self._experiment_large_ref,anchor="nw")
         borrowed="（身体基準は前後フレームから補間）" if frame.get("reference_borrowed") else ""
         cv.create_text(8,5,text=f"F{frame['frame_no']}  {frame['time']:.3f}s  KP {frame.get('pose_points',0)} {borrowed}",
                        fill="white",font=_tk_font(10,bold=True),anchor="nw")
-        cv.configure(scrollregion=(0,0,max(vw,size[0]),max(vh,size[1]+32)))
+        total_w=max(vw,size[0]); total_h=max(vh,size[1]+32)
+        cv.configure(scrollregion=(0,0,total_w,total_h))
+        # Default viewport follows the player's median KP position. The user can
+        # still move away with the horizontal/vertical scrollbars.
+        person=[]
+        for key,value in frame.get("kps",{}).items():
+            try:
+                if int(key)<=16 and float(value[2])>=.05:person.append((float(value[0]),float(value[1])))
+            except Exception:pass
+        if person and size[0]>vw:
+            px=float(np.median([p[0] for p in person]))
+            if self._experiment_autocrop.get() and self._experiment_crop_rect:
+                x1,_,x2,_=self._experiment_crop_rect; px=(px-x1)/max(x2-x1,1e-6)
+            start=np.clip(px*size[0]-vw/2,0,max(0,size[0]-vw))
+            cv.xview_moveto(float(start/max(total_w,1)))
+        else:cv.xview_moveto(0)
 
     def _render_hp_detail_photo(self,canvas,sample,slot):
         canvas.delete("all"); path=self.video_path.get()
