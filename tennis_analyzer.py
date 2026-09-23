@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v107-exp"; APP_VERSION_DESC = "全フレーム打点検証"
+APP_VERSION = "v108-exp"; APP_VERSION_DESC = "全フレーム検証UI改良"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -1073,6 +1073,47 @@ def select_sound_rank_one(candidates,data,mode="combined"):
     winner=max(candidates,key=level)
     result=dict(winner); result["sound_energy"]=level(winner)
     return result
+
+
+def build_person_relative_tracks(frames,min_conf=.05):
+    """Build tracks without discarding visible wrists when torso KP flickers.
+
+    A missing pelvis/shoulder reference borrows the nearest valid frame's
+    reference. The actual KP confidence is never fabricated.
+    """
+    if not frames:return []
+    anchors=[]; scales=[]
+    valid=lambda v:bool(v and len(v)>=3 and float(v[2])>=min_conf)
+    for frame in frames:
+        kps=frame.get("kps",{})
+        hips=[v for v in (kps.get("11"),kps.get("12")) if valid(v)]
+        shoulders=[v for v in (kps.get("5"),kps.get("6")) if valid(v)]
+        anchors.append(np.mean([v[:2] for v in hips],axis=0) if hips else None)
+        scales.append(float(np.linalg.norm(np.asarray(shoulders[0][:2])-
+                                           np.asarray(shoulders[1][:2])))
+                      if len(shoulders)==2 else None)
+    good_anchor=[i for i,v in enumerate(anchors) if v is not None]
+    good_scale=[i for i,v in enumerate(scales) if v is not None and v>.015]
+    median_scale=float(np.median([scales[i] for i in good_scale])) if good_scale else .15
+    output=[]
+    for i,frame in enumerate(frames):
+        item=dict(frame); kps=item.get("kps",{})
+        ai=i if anchors[i] is not None else (min(good_anchor,key=lambda j:abs(j-i)) if good_anchor else None)
+        si=i if scales[i] is not None and scales[i]>.015 else (
+            min(good_scale,key=lambda j:abs(j-i)) if good_scale else None)
+        anchor=anchors[ai] if ai is not None else np.array([.5,.6])
+        scale=scales[si] if si is not None else median_scale
+        tracks={}; detected=0
+        for name,ki in (("右手首","10"),("左手首","9"),("ボール","18")):
+            value=kps.get(ki)
+            if valid(value):
+                tracks[name]=((np.asarray(value[:2])-anchor)/max(scale,.015)).tolist(); detected+=1
+        torso=[v[:2] for v in (kps.get("5"),kps.get("6"),kps.get("11"),kps.get("12")) if valid(v)]
+        if torso:tracks["重心"]=((np.mean(torso,axis=0)-anchor)/max(scale,.015)).tolist()
+        item["tracks"]=tracks; item["pose_points"]=sum(valid(v) for v in kps.values() if v is not None)
+        item["reference_borrowed"]=bool(ai!=i or si!=i)
+        output.append(item)
+    return output
 
 
 def score_full_frame_hit_candidates(frames,audio_time,sigma=.08):
@@ -2448,8 +2489,32 @@ class TennisApp(tk.Tk):
         tk.Label(head,textvariable=self._experiment_status,bg=PANEL,fg=TEXT,
                  font=_tk_font(9),anchor="w").pack(side="left",fill="x",expand=True,padx=12)
 
-        photo_outer=tk.Frame(parent,bg=BG); photo_outer.pack(fill="x",padx=8,pady=3)
-        self._experiment_photo_canvas=tk.Canvas(photo_outer,bg="#173128",height=245,
+        self._experiment_autocrop=tk.BooleanVar(value=True)
+        tk.Checkbutton(head,text="自動クロップ ON/OFF",variable=self._experiment_autocrop,
+                       bg=PANEL,fg=TEXT,selectcolor=DARK2,font=_tk_font(9,bold=True),
+                       command=self._rerender_experiment_images).pack(side="right",padx=8)
+        split=tk.PanedWindow(parent,orient="horizontal",bg=BG,sashwidth=7,
+                             sashrelief="flat",showhandle=False)
+        split.pack(fill="both",expand=True,padx=8,pady=(2,5))
+        graph=tk.Frame(split,bg="white",width=660); split.add(graph,minsize=460,stretch="always")
+        right=tk.Frame(split,bg=BG,width=620); split.add(right,minsize=420,stretch="always")
+        self._experiment_fig,self._experiment_axes=plt.subplots(2,1,sharex=True,figsize=(11,4.4))
+        self._experiment_fig.patch.set_facecolor("white")
+        self._experiment_fig.subplots_adjust(left=.07,right=.98,top=.93,bottom=.13,hspace=.22)
+        self._experiment_chart=FigureCanvasTkAgg(self._experiment_fig,master=graph)
+        self._experiment_chart.get_tk_widget().pack(fill="both",expand=True)
+
+        large_box=tk.Frame(right,bg="#173128"); large_box.pack(fill="both",expand=True)
+        self._experiment_large_canvas=tk.Canvas(large_box,bg="#173128",highlightthickness=0)
+        large_x=tk.Scrollbar(large_box,orient="horizontal",command=self._experiment_large_canvas.xview)
+        large_y=tk.Scrollbar(large_box,orient="vertical",command=self._experiment_large_canvas.yview)
+        self._experiment_large_canvas.configure(xscrollcommand=large_x.set,yscrollcommand=large_y.set)
+        large_y.pack(side="right",fill="y"); large_x.pack(side="bottom",fill="x")
+        self._experiment_large_canvas.pack(fill="both",expand=True)
+        self._experiment_large_canvas.bind("<Configure>",lambda e:self._render_experiment_large())
+
+        photo_outer=tk.Frame(right,bg=BG,height=205); photo_outer.pack(fill="x",pady=(5,0))
+        self._experiment_photo_canvas=tk.Canvas(photo_outer,bg="#173128",height=178,
                                                  highlightthickness=0)
         sx=tk.Scrollbar(photo_outer,orient="horizontal",command=self._experiment_photo_canvas.xview)
         self._experiment_photo_canvas.configure(xscrollcommand=sx.set)
@@ -2459,14 +2524,8 @@ class TennisApp(tk.Tk):
             (0,0),window=self._experiment_photo_inner,anchor="nw")
         self._experiment_photo_inner.bind("<Configure>",lambda e:
             self._experiment_photo_canvas.configure(scrollregion=self._experiment_photo_canvas.bbox("all")))
-        self._experiment_photo_refs=[]
-
-        graph=tk.Frame(parent,bg="white"); graph.pack(fill="both",expand=True,padx=8,pady=(3,5))
-        self._experiment_fig,self._experiment_axes=plt.subplots(2,1,sharex=True,figsize=(11,4.4))
-        self._experiment_fig.patch.set_facecolor("white")
-        self._experiment_fig.subplots_adjust(left=.07,right=.98,top=.93,bottom=.13,hspace=.22)
-        self._experiment_chart=FigureCanvasTkAgg(self._experiment_fig,master=graph)
-        self._experiment_chart.get_tk_widget().pack(fill="both",expand=True)
+        self._experiment_photo_refs=[]; self._experiment_large_ref=None
+        self._experiment_selected_frame=0; self._experiment_crop_rect=None
         self._experiment_metrics=tk.StringVar(value="判定式: 音声30% + 手首速度28% + 速度変化18% + ボール変化16% + 近接8%")
         tk.Label(parent,textvariable=self._experiment_metrics,bg=PANEL2,fg=TEXT,
                  font=("Consolas",9),anchor="w",justify="left",wraplength=1300
@@ -3955,26 +4014,12 @@ class TennisApp(tk.Tk):
                         else:bi=int(np.argmax(confs))
                         box=boxes[bi]; kps["18"]=[float((box[0]+box[2])*.5/w),
                             float((box[1]+box[3])*.5/h),float(confs[bi])]
-                    valid=lambda v:bool(v and len(v)>=3 and float(v[2])>=.20)
-                    hips=[kps.get("11"),kps.get("12")]; shoulders=[kps.get("5"),kps.get("6")]
-                    vh=[v for v in hips if valid(v)]; vs=[v for v in shoulders if valid(v)]
-                    pelvis=np.mean([v[:2] for v in vh],axis=0) if vh else None
-                    sw=(np.linalg.norm(np.asarray(vs[0][:2])-np.asarray(vs[1][:2]))
-                        if len(vs)==2 else .15)
-                    tracks={}
-                    if pelvis is not None and sw>.015:
-                        for name,ki in (("右手首","10"),("左手首","9"),("ボール","18")):
-                            v=kps.get(ki)
-                            if valid(v):tracks[name]=((np.asarray(v[:2])-pelvis)/sw).tolist()
-                        torso=[v[:2] for v in vh+vs]
-                        if torso:
-                            center=np.mean(torso,axis=0)
-                            tracks["重心"]=((center-pelvis)/sw).tolist()
                     good,encoded=cv2.imencode(".jpg",bgr,[cv2.IMWRITE_JPEG_QUALITY,90])
                     frames.append({"time":frame_no/fps,"frame_no":frame_no,"kps":kps,
-                                   "tracks":tracks,"frame_jpeg":encoded.tobytes() if good else None})
+                                   "frame_jpeg":encoded.tobytes() if good else None})
                     self.after(0,lambda o=order,t=total:self._experiment_status.set(
                         f"全フレーム解析中… {o}/{t}"))
+                frames=build_person_relative_tracks(frames,min_conf=.05)
                 scored,best=score_full_frame_hit_candidates(frames,corrected)
                 if self._gen==gen:self.after(0,lambda:self._show_experiment_results(
                     scored,best,target,corrected,fps))
@@ -3988,37 +4033,23 @@ class TennisApp(tk.Tk):
 
     def _show_experiment_results(self,frames,best,target,corrected,fps):
         self._experiment_frames=list(frames); self._experiment_photo_refs=[]
-        for child in self._experiment_photo_inner.winfo_children():child.destroy()
         if not frames or best is None:
             self._experiment_status.set("解析できるフレームがありません")
             return
-        for i,frame in enumerate(frames):
-            selected=i==best; card=tk.Frame(self._experiment_photo_inner,
-                bg="#fff3be" if selected else PANEL2,bd=2,relief="solid")
-            card.pack(side="left",padx=3,pady=4)
-            rel=float(frame["time"])-corrected
-            tk.Label(card,text=f"F{frame['frame_no']}  {frame['time']:.3f}s  ({rel:+.3f}s)",
-                     bg=card["bg"],fg=GOLD if selected else TEXT,
-                     font=_tk_font(8,bold=True)).pack(fill="x")
-            raw=cv2.imdecode(np.frombuffer(frame["frame_jpeg"],dtype=np.uint8),cv2.IMREAD_COLOR)
-            image=Image.fromarray(cv2.cvtColor(raw,cv2.COLOR_BGR2RGB)); iw,ih=image.size
-            draw=ImageDraw.Draw(image,"RGBA"); radius=max(4,int(min(iw,ih)*.008))
-            for key,value in frame.get("kps",{}).items():
+        self._experiment_audio_center=float(corrected)
+        self._experiment_selected_frame=int(best)
+        xs=[]; ys=[]
+        for frame in frames:
+            for value in frame.get("kps",{}).values():
                 try:
-                    ki=int(key)
-                    if float(value[2])>=.15:
-                        _draw_kp_shape_pil(draw,KP_SHAPES[ki],float(value[0])*iw,
-                                           float(value[1])*ih,radius,KP_COLORS[ki],"white",1)
+                    if float(value[2])>=.05:xs.append(float(value[0])); ys.append(float(value[1]))
                 except Exception:pass
-            image.thumbnail((185,155),Image.LANCZOS); photo=ImageTk.PhotoImage(image)
-            self._experiment_photo_refs.append(photo)
-            tk.Label(card,image=photo,bg=card["bg"]).pack()
-            ball="有" if "ボール" in frame.get("tracks",{}) else "無"
-            text=(f"score {frame['score']:.3f}  ball {ball}\n"
-                  f"音 {frame['audio_prior']:.2f}  手速 {max(frame['right_speed'],frame['left_speed']):.2f}\n"
-                  f"手変 {frame['hand_change']:.2f}  球変 {frame['ball_change']:.2f}  近 {frame['proximity']:.2f}")
-            tk.Label(card,text=text,bg=card["bg"],fg=TEXT,justify="left",
-                     font=("Consolas",8)).pack(fill="x",padx=3,pady=2)
+        if xs and ys:
+            pad_x=max(.04,(max(xs)-min(xs))*.16); pad_y=max(.04,(max(ys)-min(ys))*.16)
+            self._experiment_crop_rect=(max(0,min(xs)-pad_x),max(0,min(ys)-pad_y),
+                                        min(1,max(xs)+pad_x),min(1,max(ys)+pad_y))
+        else:self._experiment_crop_rect=None
+        self._rerender_experiment_images()
         colors={"右手首":"#e74c3c","左手首":"#2980b9","ボール":"#d19a00","重心":"#23835b"}
         rel_times=np.asarray([f["time"]-corrected for f in frames])
         for axis,coord,title in zip(self._experiment_axes,(0,1),("X（腰中心=0、右＋）","Y（腰中心=0、下＋）")):
@@ -4039,6 +4070,67 @@ class TennisApp(tk.Tk):
             f"右手速={chosen['right_speed']:.3f} 左手速={chosen['left_speed']:.3f} "
             f"手速度変化={chosen['hand_change']:.3f} ボール変化={chosen['ball_change']:.3f} "
             f"手球近接={chosen['proximity']:.3f} | 重み: 音30 手速28 手変18 球変16 近接8%")
+
+    def _experiment_annotated_image(self,frame):
+        raw=cv2.imdecode(np.frombuffer(frame["frame_jpeg"],dtype=np.uint8),cv2.IMREAD_COLOR)
+        image=Image.fromarray(cv2.cvtColor(raw,cv2.COLOR_BGR2RGB)); iw,ih=image.size
+        draw=ImageDraw.Draw(image,"RGBA"); radius=max(5,int(min(iw,ih)*.009))
+        for key,value in frame.get("kps",{}).items():
+            try:
+                ki=int(key)
+                if float(value[2])>=.05:
+                    _draw_kp_shape_pil(draw,KP_SHAPES[ki],float(value[0])*iw,
+                                       float(value[1])*ih,radius,KP_COLORS[ki],"white",1)
+            except Exception:pass
+        if self._experiment_autocrop.get() and self._experiment_crop_rect:
+            x1,y1,x2,y2=self._experiment_crop_rect
+            image=image.crop((int(x1*iw),int(y1*ih),int(x2*iw),int(y2*ih)))
+        return image
+
+    def _rerender_experiment_images(self):
+        if not hasattr(self,"_experiment_photo_inner"):return
+        for child in self._experiment_photo_inner.winfo_children():child.destroy()
+        self._experiment_photo_refs=[]
+        for i,frame in enumerate(self._experiment_frames):
+            selected=i==self._experiment_selected_frame; bg="#fff3be" if selected else PANEL2
+            card=tk.Frame(self._experiment_photo_inner,bg=bg,bd=2,relief="solid")
+            card.pack(side="left",padx=3,pady=3)
+            rel=float(frame["time"])-float(getattr(self,"_experiment_audio_center",frame["time"]))
+            tk.Label(card,text=f"F{frame['frame_no']} {rel:+.3f}s  KP{frame.get('pose_points',0)}",
+                     bg=bg,fg=GOLD if selected else TEXT,font=_tk_font(8,bold=True)).pack(fill="x")
+            image=self._experiment_annotated_image(frame); image.thumbnail((150,115),Image.LANCZOS)
+            photo=ImageTk.PhotoImage(image); self._experiment_photo_refs.append(photo)
+            label=tk.Label(card,image=photo,bg=bg,cursor="hand2"); label.pack()
+            label.bind("<Button-1>",lambda e,index=i:self._select_experiment_frame(index))
+            borrowed=" 基準補間" if frame.get("reference_borrowed") else ""
+            tk.Label(card,text=f"score {frame['score']:.3f}{borrowed}",bg=bg,fg=TEXT,
+                     font=("Consolas",8)).pack(fill="x")
+        self._render_experiment_large()
+
+    def _select_experiment_frame(self,index):
+        self._experiment_selected_frame=max(0,min(int(index),len(self._experiment_frames)-1))
+        self._rerender_experiment_images()
+        frame=self._experiment_frames[self._experiment_selected_frame]
+        self._experiment_metrics.set(
+            f"選択 F{frame['frame_no']} {frame['time']:.3f}s | score={frame['score']:.3f} "
+            f"KP={frame.get('pose_points',0)} 音={frame['audio_prior']:.3f} "
+            f"右手速={frame['right_speed']:.3f} 左手速={frame['left_speed']:.3f} "
+            f"手変={frame['hand_change']:.3f} 球変={frame['ball_change']:.3f} 近接={frame['proximity']:.3f}")
+
+    def _render_experiment_large(self):
+        if not hasattr(self,"_experiment_large_canvas") or not self._experiment_frames:return
+        index=max(0,min(self._experiment_selected_frame,len(self._experiment_frames)-1))
+        frame=self._experiment_frames[index]; image=self._experiment_annotated_image(frame)
+        cv=self._experiment_large_canvas; cv.delete("all")
+        vw=max(500,cv.winfo_width()); vh=max(330,cv.winfo_height())
+        scale=max(.1,(vh-42)/max(image.height,1))
+        size=(max(1,int(image.width*scale)),max(1,int(image.height*scale)))
+        image=image.resize(size,Image.LANCZOS); self._experiment_large_ref=ImageTk.PhotoImage(image)
+        cv.create_image(0,28,image=self._experiment_large_ref,anchor="nw")
+        borrowed="（身体基準は前後フレームから補間）" if frame.get("reference_borrowed") else ""
+        cv.create_text(8,5,text=f"F{frame['frame_no']}  {frame['time']:.3f}s  KP {frame.get('pose_points',0)} {borrowed}",
+                       fill="white",font=_tk_font(10,bold=True),anchor="nw")
+        cv.configure(scrollregion=(0,0,max(vw,size[0]),max(vh,size[1]+32)))
 
     def _render_hp_detail_photo(self,canvas,sample,slot):
         canvas.delete("all"); path=self.video_path.get()
@@ -6315,6 +6407,16 @@ class TennisApp(tk.Tk):
     #  タブ切替時のハンドラ
     # ══════════════════════════════════════════
     def _on_tab_changed(self,event=None):
+        try:selected=str(self.tabs.select())
+        except Exception:selected=""
+        experiment=selected==str(getattr(self,"tab_frame_validation",""))
+        if experiment and self.left.winfo_manager():
+            self.left.pack_forget(); self.main.pack_forget()
+            self.main.pack(fill="both",expand=True)
+        elif not experiment and not self.left.winfo_manager():
+            self.main.pack_forget()
+            self.left.pack(side="left",fill="y")
+            self.main.pack(side="right",fill="both",expand=True)
         self._refresh_active_tab()
 
     def _refresh_truth_summary(self):
@@ -6362,30 +6464,14 @@ class TennisApp(tk.Tk):
             self._truth_summary_info.set(f"正解DBを読み込めませんでした: {e}")
 
     def _refresh_active_tab(self):
-        try: idx=self.tabs.index(self.tabs.select())
+        try: selected=str(self.tabs.select())
         except Exception: return
-        if idx==1:
+        if selected==str(self.tab_hp_detail):
             self._refresh_hp_detail()
-        elif idx==2:
+        elif selected==str(self.tab_frame_validation):
+            self._rerender_experiment_images()
+        elif selected==str(self.tab_truth_summary):
             self._refresh_truth_summary()
-        elif idx==3:
-            # v18: クロス比較を統合したので同タイミング比較は idx 3 に繰上
-            if not self.peaks: return
-            self._update_c2_dropdowns()
-            if hasattr(self,"_c2_regen"): self._c2_regen()
-        elif idx==4:
-            # v46: Refiner
-            self._activate_refiner_tab()
-        elif idx==5:
-            if self.refiner:
-                try: self.refiner._3d_render_frame(self.refiner._mp3d_cur_idx)
-                except Exception: pass
-        elif idx==6:
-            # v62: MP-YOLO比較タブ
-            try: self._refresh_compare_tab()
-            except Exception: pass
-        elif idx==7:
-            self._refresh_history_tab()
 
     def _update_cs_dropdowns(self):
         if not hasattr(self,"cs_peak_sel"): return

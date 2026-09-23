@@ -586,3 +586,14 @@ def test_full_frame_contact_score_exposes_components_and_choice():
     assert sum(bool(row["selected"]) for row in scored)==1
     assert {"score","audio_prior","right_speed","hand_change","ball_change","proximity"}.issubset(scored[best])
     assert abs(scored[best]["time"]-1.0)<=.051
+
+
+def test_relative_tracks_keep_visible_wrist_when_torso_reference_flickers():
+    torso={"5":[.4,.3,.9],"6":[.6,.3,.9],"11":[.45,.6,.9],"12":[.55,.6,.9]}
+    frames=[{"time":0.,"kps":{**torso,"10":[.7,.4,.9]}},
+            {"time":.03,"kps":{"10":[.8,.4,.12]}},
+            {"time":.06,"kps":{**torso,"10":[.9,.4,.9]}}]
+    tracked=TA.build_person_relative_tracks(frames,min_conf=.05)
+    assert "右手首" in tracked[1]["tracks"]
+    assert tracked[1]["reference_borrowed"] is True
+    assert tracked[1]["pose_points"]==1
