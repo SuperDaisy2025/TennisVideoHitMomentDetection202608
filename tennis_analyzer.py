@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v110-exp"; APP_VERSION_DESC = "検証信頼度・重心表示"
+APP_VERSION = "v111-exp"; APP_VERSION_DESC = "検証信頼度拡大表示"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -1120,9 +1120,9 @@ def experiment_confidence_text(kps):
     """Compact RTMPose/YOLO confidence text for experimental photos."""
     def value(key):
         point=(kps or {}).get(str(key))
-        try:return f"{float(point[2]):.2f}" if point and len(point)>=3 else "--"
+        try:return f"{float(point[2])*100:.0f}%" if point and len(point)>=3 else "--"
         except Exception:return "--"
-    return f"Conf  RW {value(10)}  LW {value(9)}  Ball {value(18)}"
+    return f"Confidence\nRW {value(10)}   LW {value(9)}\nBall {value(18)}"
 
 
 def score_full_frame_hit_candidates(frames,audio_time,sigma=.08):
@@ -4151,15 +4151,18 @@ class TennisApp(tk.Tk):
         # Confidence is painted after cropping so it always stays at the
         # bottom-left of both the large photo and every thumbnail.
         draw=ImageDraw.Draw(image,"RGBA"); text=experiment_confidence_text(frame.get("kps",{}))
-        font_size=max(14,int(min(image.size)*.027))
-        try:font=ImageFont.truetype("arial.ttf",font_size)
-        except Exception:font=ImageFont.load_default()
-        try:box=draw.textbbox((0,0),text,font=font,stroke_width=0)
-        except Exception:box=(0,0,len(text)*font_size*.6,font_size)
+        font_size=max(36,int(min(image.size)*.075))
+        try:font=ImageFont.truetype("arialbd.ttf",font_size)
+        except Exception:
+            try:font=ImageFont.truetype("arial.ttf",font_size)
+            except Exception:font=ImageFont.load_default()
+        spacing=max(3,font_size//7)
+        try:box=draw.multiline_textbbox((0,0),text,font=font,spacing=spacing,stroke_width=0)
+        except Exception:box=(0,0,12*font_size*.6,font_size*3+spacing*2)
         tw=max(1,int(box[2]-box[0])); th=max(1,int(box[3]-box[1])); x=7; y=max(4,image.height-th-10)
         draw.rounded_rectangle((x-4,y-3,x+tw+5,y+th+4),radius=4,fill=(255,255,255,215),
                                outline=(7,92,54,230),width=2)
-        draw.text((x,y),text,font=font,fill=(0,0,0,255))
+        draw.multiline_text((x,y),text,font=font,fill=(0,0,0,255),spacing=spacing)
         return image
 
     def _rerender_experiment_images(self):
