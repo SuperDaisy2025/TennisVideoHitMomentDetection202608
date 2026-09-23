@@ -610,5 +610,5 @@ def test_experiment_absolute_tracks_use_normalized_keypoint_values():
 def test_experiment_confidence_text_uses_pose_and_ball_scores():
     text=TA.experiment_confidence_text({"10":[.2,.3,.876],"9":[.1,.4,.654],
                                         "18":[.8,.2,.432]})
-    assert text=="Confidence\nRW 88%   LW 65%\nBall 43%"
-    assert TA.experiment_confidence_text({})=="Confidence\nRW --   LW --\nBall --"
+    assert text=="Confidence\nRW   88%\nLW   65%\nBall 43%"
+    assert TA.experiment_confidence_text({})=="Confidence\nRW   --\nLW   --\nBall --"

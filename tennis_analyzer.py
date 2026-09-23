@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v111-exp"; APP_VERSION_DESC = "検証信頼度拡大表示"
+APP_VERSION = "v112-exp"; APP_VERSION_DESC = "検証数値表示整理"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -1122,7 +1122,7 @@ def experiment_confidence_text(kps):
         point=(kps or {}).get(str(key))
         try:return f"{float(point[2])*100:.0f}%" if point and len(point)>=3 else "--"
         except Exception:return "--"
-    return f"Confidence\nRW {value(10)}   LW {value(9)}\nBall {value(18)}"
+    return f"Confidence\nRW   {value(10)}\nLW   {value(9)}\nBall {value(18)}"
 
 
 def score_full_frame_hit_candidates(frames,audio_time,sigma=.08):
@@ -2543,8 +2543,8 @@ class TennisApp(tk.Tk):
         self._experiment_selected_frame=0; self._experiment_crop_rect=None
         self._experiment_metrics=tk.StringVar(value="判定式: 音声30% + 手首速度28% + 速度変化18% + ボール変化16% + 近接8%")
         tk.Label(parent,textvariable=self._experiment_metrics,bg=PANEL2,fg=TEXT,
-                 font=("Consolas",9),anchor="w",justify="left",wraplength=1300
-                 ).pack(fill="x",padx=8,pady=(0,7),ipadx=7,ipady=4)
+                 font=("Meiryo UI",20,"bold"),anchor="w",justify="left",wraplength=1500
+                 ).pack(fill="x",padx=8,pady=(0,7),ipadx=9,ipady=7)
 
     def _initialize_experiment_split(self):
         if self._experiment_split_initialized:return
@@ -4085,10 +4085,10 @@ class TennisApp(tk.Tk):
         self._experiment_status.set(
             f"完了: 音1位 {float(target['time']):.3f}s → 音速補正 {corrected:.3f}s / 自動候補 F{chosen['frame_no']} {chosen['time']:.3f}s")
         self._experiment_metrics.set(
-            f"選択 score={chosen['score']:.3f} | 音声={chosen['audio_prior']:.3f} "
-            f"右手速={chosen['right_speed']:.3f} 左手速={chosen['left_speed']:.3f} "
-            f"手速度変化={chosen['hand_change']:.3f} ボール変化={chosen['ball_change']:.3f} "
-            f"手球近接={chosen['proximity']:.3f} | 重み: 音30 手速28 手変18 球変16 近接8%")
+            f"選択 score={chosen['score']:.3f}　音声={chosen['audio_prior']:.3f}　"
+            f"右手速={chosen['right_speed']:.3f}　左手速={chosen['left_speed']:.3f}\n"
+            f"手速度変化={chosen['hand_change']:.3f}　ボール変化={chosen['ball_change']:.3f}　"
+            f"手球近接={chosen['proximity']:.3f}\n重み: 音30%　手速28%　手変18%　球変16%　近接8%")
 
     def _experiment_absolute_tracks(self,frame):
         kps=frame.get("kps",{}); valid=lambda v:bool(v and len(v)>=3 and float(v[2])>=.05)
@@ -4148,20 +4148,23 @@ class TennisApp(tk.Tk):
         if self._experiment_autocrop.get() and self._experiment_crop_rect:
             x1,y1,x2,y2=self._experiment_crop_rect
             image=image.crop((int(x1*iw),int(y1*ih),int(x2*iw),int(y2*ih)))
-        # Confidence is painted after cropping so it always stays at the
-        # bottom-left of both the large photo and every thumbnail.
-        draw=ImageDraw.Draw(image,"RGBA"); text=experiment_confidence_text(frame.get("kps",{}))
-        font_size=max(36,int(min(image.size)*.075))
+        return image
+
+    @staticmethod
+    def _paint_experiment_confidence(image,kps):
+        """Paint all three confidence values on the final large image only."""
+        draw=ImageDraw.Draw(image,"RGBA"); text=experiment_confidence_text(kps)
+        font_size=max(20,min(34,int(min(image.size)*.055)))
         try:font=ImageFont.truetype("arialbd.ttf",font_size)
         except Exception:
             try:font=ImageFont.truetype("arial.ttf",font_size)
             except Exception:font=ImageFont.load_default()
-        spacing=max(3,font_size//7)
-        try:box=draw.multiline_textbbox((0,0),text,font=font,spacing=spacing,stroke_width=0)
-        except Exception:box=(0,0,12*font_size*.6,font_size*3+spacing*2)
-        tw=max(1,int(box[2]-box[0])); th=max(1,int(box[3]-box[1])); x=7; y=max(4,image.height-th-10)
-        draw.rounded_rectangle((x-4,y-3,x+tw+5,y+th+4),radius=4,fill=(255,255,255,215),
-                               outline=(7,92,54,230),width=2)
+        spacing=max(2,font_size//7)
+        try:box=draw.multiline_textbbox((0,0),text,font=font,spacing=spacing)
+        except Exception:box=(0,0,8*font_size*.65,font_size*4+spacing*3)
+        tw=int(box[2]-box[0]); th=int(box[3]-box[1]); x=9; y=max(5,image.height-th-12)
+        draw.rounded_rectangle((x-5,y-4,min(image.width-2,x+tw+7),y+th+5),radius=5,
+                               fill=(255,255,255,225),outline=(7,92,54,240),width=2)
         draw.multiline_text((x,y),text,font=font,fill=(0,0,0,255),spacing=spacing)
         return image
 
@@ -4191,10 +4194,11 @@ class TennisApp(tk.Tk):
         self._draw_experiment_graphs()
         frame=self._experiment_frames[self._experiment_selected_frame]
         self._experiment_metrics.set(
-            f"選択 F{frame['frame_no']} {frame['time']:.3f}s | score={frame['score']:.3f} "
-            f"KP={frame.get('pose_points',0)} 音={frame['audio_prior']:.3f} "
-            f"右手速={frame['right_speed']:.3f} 左手速={frame['left_speed']:.3f} "
-            f"手変={frame['hand_change']:.3f} 球変={frame['ball_change']:.3f} 近接={frame['proximity']:.3f}")
+            f"選択 F{frame['frame_no']}　{frame['time']:.3f}s　score={frame['score']:.3f}　"
+            f"KP={frame.get('pose_points',0)}　音={frame['audio_prior']:.3f}\n"
+            f"右手速={frame['right_speed']:.3f}　左手速={frame['left_speed']:.3f}　"
+            f"手変={frame['hand_change']:.3f}\n"
+            f"球変={frame['ball_change']:.3f}　近接={frame['proximity']:.3f}")
 
     def _render_experiment_large(self):
         if not hasattr(self,"_experiment_large_canvas") or not self._experiment_frames:return
@@ -4204,7 +4208,9 @@ class TennisApp(tk.Tk):
         vw=max(500,cv.winfo_width()); vh=max(330,cv.winfo_height())
         scale=max(.1,(vh-42)/max(image.height,1))
         size=(max(1,int(image.width*scale)),max(1,int(image.height*scale)))
-        image=image.resize(size,Image.LANCZOS); self._experiment_large_ref=ImageTk.PhotoImage(image)
+        image=image.resize(size,Image.LANCZOS)
+        image=self._paint_experiment_confidence(image,frame.get("kps",{}))
+        self._experiment_large_ref=ImageTk.PhotoImage(image)
         x0=max(0,(vw-size[0])//2); y0=28+max(0,(vh-32-size[1])//2)
         cv.create_image(x0,y0,image=self._experiment_large_ref,anchor="nw")
         borrowed="（身体基準は前後フレームから補間）" if frame.get("reference_borrowed") else ""
