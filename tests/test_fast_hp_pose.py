@@ -12,6 +12,28 @@ TA = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(TA)
 
 
+def test_select_sound_top_candidates_keeps_three_strongest():
+    data={"times":np.array([0.,1.,2.,3.]),"combined":np.array([.2,.9,.5,.7])}
+    candidates=[{"idx":i,"time":float(i)} for i in range(4)]
+    result=TA.select_sound_top_candidates(candidates,data,limit=3)
+    assert [item["idx"] for item in result]==[1,3,2]
+    assert [item["sound_energy"] for item in result]==[.9,.7,.5]
+
+
+def test_motion_target_prefers_wrist_travel_over_sound():
+    data={"times":np.array([0.,1.]),"combined":np.array([.95,.50])}
+    candidates=[{"idx":0,"time":0.,"pose_travel":.2},
+                {"idx":1,"time":1.,"pose_travel":.8}]
+    assert TA.select_motion_validation_target(candidates,data)["idx"]==1
+
+
+def test_candidate_marker_palette():
+    assert TA.candidate_marker_color({"selected":None})=="#8a958e"
+    assert TA.candidate_marker_color({"selected":False})=="#ff5252"
+    assert TA.candidate_marker_color({"selected":True})=="#26c281"
+    assert TA.candidate_marker_color({"selected":True,"full_frame_target":True})=="#1976d2"
+
+
 def feat(x, y, serve=False, stroke=False, angle=120.0):
     return {
         "rw": np.array([x, y], dtype=float),

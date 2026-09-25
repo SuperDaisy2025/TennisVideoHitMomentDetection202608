@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v113-exp"; APP_VERSION_DESC = "Confidence固定表示"
+APP_VERSION = "v114-exp"; APP_VERSION_DESC = "音声上位3件・手首移動選択"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -1075,6 +1075,37 @@ def select_sound_rank_one(candidates,data,mode="combined"):
     return result
 
 
+def select_sound_top_candidates(candidates,data,mode="combined",limit=3):
+    """Return the strongest audio candidates while retaining their source data."""
+    if not candidates or data is None or limit<=0:return []
+    times=np.asarray(data.get("times",[]),dtype=float)
+    energy=audio_energy_series(data,mode)
+    if not len(times) or not len(energy):return []
+    ranked=[]
+    for candidate in candidates:
+        item=dict(candidate)
+        idx=int(item.get("idx",np.argmin(np.abs(times-float(item.get("time",0))))))
+        idx=max(0,min(idx,len(energy)-1)); item["sound_energy"]=float(energy[idx])
+        ranked.append(item)
+    return sorted(ranked,key=lambda item:item["sound_energy"],reverse=True)[:int(limit)]
+
+
+def select_motion_validation_target(candidates,data=None,mode="combined"):
+    """Choose the largest reliable wrist movement, falling back to sound level."""
+    if not candidates:return None
+    measurable=[c for c in candidates if c.get("pose_travel") is not None]
+    if measurable:return dict(max(measurable,key=lambda c:float(c.get("pose_travel",0))))
+    return select_sound_rank_one(candidates,data,mode)
+
+
+def candidate_marker_color(candidate):
+    """Shared audit marker palette: blue target, green accepted, red rejected, gray pending."""
+    if candidate.get("full_frame_target") or candidate.get("reason")=="full_frame_target":
+        return "#1976d2"
+    selected=candidate.get("selected")
+    return "#8a958e" if selected is None else ("#26c281" if selected else "#ff5252")
+
+
 def build_person_relative_tracks(frames,min_conf=.05):
     """Build tracks without discarding visible wrists when torso KP flickers.
 
@@ -1209,11 +1240,14 @@ def detect_peaks(data, sensitivity=0.5, min_gap=1.0, wall_mode=False,
         rejected=np.array(sorted(suppressed|gap_rejected,key=lambda i:times[i]),dtype=int)
         base=(np.array(filtered,dtype=int),len(rejected))
         return (*base,rejected) if return_rejected else base
+    gap_rejected=[]
     for idx in raw:
         t=times[idx]
         if t-last_t>=min_gap: filtered.append(idx); last_t=t
-    base=(np.array(filtered,dtype=int),0)
-    return (*base,np.array([],dtype=int)) if return_rejected else base
+        else:gap_rejected.append(idx)
+    rejected=np.array(gap_rejected,dtype=int)
+    base=(np.array(filtered,dtype=int),len(rejected))
+    return (*base,rejected) if return_rejected else base
 
 def grab_frame(video_path, time_sec):
     cap=cv2.VideoCapture(video_path)
@@ -3616,17 +3650,18 @@ class TennisApp(tk.Tk):
 
     def _finish_analysis(self):
         self._update_noise_summary()
-        # Experimental branch: audio/wall filtering first, then run the costly
-        # pose path for the strongest surviving sound only.
+        # Keep every threshold-crossing peak visible, but limit the lightweight
+        # pose pass to the strongest three to avoid multiplying model cost.
         candidates=self._current_audio_candidates()
+        self._experiment_all_audio_candidates=list(candidates)
         self._show_provisional_audio_candidates(candidates)
-        strongest=select_sound_rank_one(candidates,self.data,self.audio_band_mode.get())
-        if strongest is None:
+        top=select_sound_top_candidates(candidates,self.data,self.audio_band_mode.get(),3)
+        if not top:
             self._start_fast_hp_pose_filter([])
             return
         self.status_var.set(
-            f"実験モード: 音声候補{len(candidates)}件からサウンド1位だけ姿勢確認します")
-        self._start_fast_hp_pose_filter([strongest])
+            f"実験モード: 音声候補{len(candidates)}件から上位{len(top)}件だけ軽量姿勢確認します")
+        self._start_fast_hp_pose_filter(top)
 
     def _current_audio_candidates(self):
         if self.data is None:return []
@@ -3636,9 +3671,10 @@ class TennisApp(tk.Tk):
             self.data,self.sensitivity.get(),gap,wall_mode=wall,
             use_frequency_filter=bool(self.audio_filter_enabled.get()),return_rejected=True,
             frequency_mode=self.audio_band_mode.get())
+        reject_reason="wall_gap" if wall else "min_gap"
         self._wall_gap_rejected_candidates=[
             {"idx":int(i),"time":float(self.data["times"][i]),"selected":False,
-             "reason":"wall_gap","backend":"audio"} for i in rejected]
+             "reason":reject_reason,"backend":"audio"} for i in rejected]
         return [{"idx":int(i),"time":float(self.data["times"][i])} for i in indices]
 
     def _show_provisional_audio_candidates(self,candidates):
@@ -3925,7 +3961,8 @@ class TennisApp(tk.Tk):
                         if self._gen != gen: return
                         t=cand["time"]
                         hit_t=max(0.0,t-sound_delay)
-                        coarse=[detect_at(det,max(0.0,min(duration,hit_t+d)),need_ball=True)
+                        # Ball YOLO runs later on every frame for the one winner.
+                        coarse=[detect_at(det,max(0.0,min(duration,hit_t+d)),need_ball=False)
                                 for d in HP_POSE_SAMPLE_OFFSETS]
                         verdict=self._classify_hp_pose_triplet(coarse)
                         audit_item={"time":float(t),"idx":int(cand["idx"]),
@@ -3995,25 +4032,47 @@ class TennisApp(tk.Tk):
         threading.Thread(target=_worker,daemon=True).start()
 
     def _finish_fast_hp_pose_filter(self,accepted,rejected,audit):
-        self._hp_candidate_audit=list(audit)+list(
+        all_audio=list(getattr(self,"_experiment_all_audio_candidates",[]))
+        processed={(int(a.get("idx",-1)),round(float(a.get("time",0)),6)) for a in audit}
+        unverified=[]
+        for cand in all_audio:
+            key=(int(cand.get("idx",-1)),round(float(cand.get("time",0)),6))
+            if key not in processed:
+                unverified.append({**cand,"selected":None,"verified":False,
+                                   "reason":"not_top3","backend":"audio"})
+        target=select_motion_validation_target(accepted,self.data,self.audio_band_mode.get())
+        target_key=None if target is None else (
+            int(target.get("idx",-1)),round(float(target.get("time",0)),6))
+        merged=[]
+        for item in audit:
+            current=dict(item)
+            key=(int(current.get("idx",-1)),round(float(current.get("time",0)),6))
+            if target_key is not None and key==target_key:
+                current.update({"selected":True,"verified":True,
+                                "reason":"full_frame_target","full_frame_target":True})
+            elif current.get("selected"):
+                current.update({"selected":None,"verified":True,
+                                "reason":"top3_motion_not_selected"})
+            merged.append(current)
+        self._hp_candidate_audit=merged+unverified+list(
             getattr(self,"_wall_gap_rejected_candidates",[]))
         self._refresh_peaks(refined_candidates=accepted,pose_rejected=rejected)
-        # Experimental branch: inspect only the strongest candidate that
-        # survived wall/no-motion filtering. Keep this independent of normal UI.
-        self.after(80,lambda:self._start_experiment_validation(accepted))
+        self.after(80,lambda t=target:self._start_experiment_validation([] if t is None else [t]))
 
     def _start_experiment_validation(self,candidates=None):
         if self._experiment_running or self.data is None:return
         candidates=list(candidates if candidates is not None else self.peaks)
-        target=select_sound_rank_one(candidates,self.data,self.audio_band_mode.get())
+        target=select_motion_validation_target(candidates,self.data,self.audio_band_mode.get())
         if target is None:
             self._experiment_status.set("解析対象なし（壁音除外後に採用候補がありません）")
             return
         path=self.video_path.get().strip(); gen=self._gen
         if not path or not os.path.exists(path):return
         self._experiment_running=True
+        sound_pick=select_sound_rank_one([target],self.data,self.audio_band_mode.get())
+        target.setdefault("sound_energy",0.0 if sound_pick is None else sound_pick["sound_energy"])
         self._experiment_status.set(
-            f"準備中: 音1位 {float(target['time']):.3f}s / energy {target['sound_energy']:.3f}")
+            f"準備中: 音声上位3件の手首移動最大 {float(target['time']):.3f}s / energy {target['sound_energy']:.3f}")
 
         def _worker():
             cap=None
@@ -4091,7 +4150,7 @@ class TennisApp(tk.Tk):
         self._draw_experiment_graphs()
         chosen=frames[best]
         self._experiment_status.set(
-            f"完了: 音1位 {float(target['time']):.3f}s → 音速補正 {corrected:.3f}s / 自動候補 F{chosen['frame_no']} {chosen['time']:.3f}s")
+            f"完了: 上位3件の手首移動最大 {float(target['time']):.3f}s → 音速補正 {corrected:.3f}s / 自動候補 F{chosen['frame_no']} {chosen['time']:.3f}s")
         self._experiment_metrics.set(
             f"選択 score={chosen['score']:.3f}　音声={chosen['audio_prior']:.3f}　"
             f"右手速={chosen['right_speed']:.3f}　左手速={chosen['left_speed']:.3f}\n"
@@ -4341,8 +4400,7 @@ class TennisApp(tk.Tk):
             x=pl+(ct-lo)/4*(w-pl-pr)
             top=max(float(np.max(energy)),1e-6)
             y=h-pb-float(energy[j])/top*(h-pt-pb)
-            selected=cand.get("selected")
-            color="#8a958e" if selected is None else ("#26c281" if selected else RED)
+            color=candidate_marker_color(cand)
             cv.create_oval(x-5,y-5,x+5,y+5,fill=color,outline="white",width=1)
             cv.create_text(x,y-8,text=str(number),fill=color,
                            font=_tk_font(8,bold=True),anchor="s")
@@ -5498,8 +5556,7 @@ class TennisApp(tk.Tk):
                 j=int(np.argmin(np.abs(np.asarray(times)-ct))) if len(times) else 0
                 level=float(combined[j]) if len(combined)>j else 0.5
                 y=max(13,min(ch-10,ch-level*(ch-22)-5))
-                selected=cand.get("selected")
-                color="#8a958e" if selected is None else ("#26c281" if selected else "#ff5252")
+                color=candidate_marker_color(cand)
                 tl.create_oval(x-6,y-6,x+6,y+6,fill=color,outline="white",width=1)
                 self._timeline_candidate_markers.append({"x":x,"y":y,"candidate":cand})
 
@@ -5541,16 +5598,24 @@ class TennisApp(tk.Tk):
         for marker in self._timeline_candidate_markers:
             if (event.x-marker["x"])**2+(event.y-marker["y"])**2<=100:
                 cand=marker["candidate"]
-                if cand.get("selected"): return
                 reason=cand.get("reason","unknown")
                 if reason=="no_swing":
                     travel=cand.get("travel"); angle=cand.get("arm_change")
                     text="不採用: スイング動作不足"
                     if travel is not None:text+=f"\n手首移動={float(travel):.2f}肩幅"
                     if angle is not None:text+=f" / 肘角度変化={float(angle):.1f}°"
+                elif reason=="wall_gap":text="除外: 壁音間隔（直前候補から0.8秒未満）"
+                elif reason=="min_gap":text="除外: 最小ピーク間隔内の後続音"
+                elif reason=="not_top3":text="未検証: サウンド上位3件外"
+                elif reason=="top3_motion_not_selected":text="軽量確認済み: 手首移動が最大ではありません"
+                elif reason=="full_frame_target":text="全フレーム解析対象: 上位3件で手首移動最大"
+                elif reason=="pending":text="軽量姿勢確認待ち"
+                elif cand.get("selected"):text="採用候補"
                 else:text=f"不採用: {reason}"
                 x=min(event.x+12,max(self.timeline.winfo_width()-220,10)); y=max(event.y-42,6)
-                self.timeline.create_rectangle(x,y,x+210,y+38,fill="#2b1111",outline=RED,
+                box_h=52 if "\n" in text else 38
+                self.timeline.create_rectangle(x,y,x+250,y+box_h,fill="#20332b",
+                                               outline=candidate_marker_color(cand),
                                                tags="candidate_tooltip")
                 self.timeline.create_text(x+6,y+5,text=text,fill="white",anchor="nw",
                                           font=_tk_font(8),tags="candidate_tooltip")
