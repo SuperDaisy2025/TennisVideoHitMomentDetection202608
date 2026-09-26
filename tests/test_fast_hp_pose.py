@@ -34,6 +34,27 @@ def test_candidate_marker_palette():
     assert TA.candidate_marker_color({"selected":True,"full_frame_target":True})=="#1976d2"
 
 
+def test_experiment_outlier_marks_low_confidence_and_isolated_ball():
+    frames=[]
+    xs=[.10,.20,.90,.40,.50]
+    for i,x in enumerate(xs):
+        frames.append({"time":i*.04,"kps":{"18":[x,.50,.9],"10":[.3+i*.01,.4,.9]}})
+    frames[0]["kps"]["10"][2]=.10
+    result=TA.mark_experiment_track_outliers(frames)
+    assert "右手首" in result[0]["track_warnings"]
+    assert "ボール" in result[2]["track_warnings"]
+
+
+def test_experiment_ball_direction_change_is_not_outlier():
+    # Two straight segments meet at index 2, which models a contact direction change.
+    frames=[]
+    points=[(.1,.5),(.2,.5),(.3,.5),(.3,.4),(.3,.3)]
+    for i,(x,y) in enumerate(points):
+        frames.append({"time":i*.04,"kps":{"18":[x,y,.9]}})
+    result=TA.mark_experiment_track_outliers(frames)
+    assert "ボール" not in result[2]["track_warnings"]
+
+
 def feat(x, y, serve=False, stroke=False, angle=120.0):
     return {
         "rw": np.array([x, y], dtype=float),

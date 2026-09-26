@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v114-exp"; APP_VERSION_DESC = "音声上位3件・手首移動選択"
+APP_VERSION = "v115-exp"; APP_VERSION_DESC = "軌跡信頼性・判定根拠表示"
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -1156,6 +1156,46 @@ def experiment_confidence_text(kps):
     return f"Confidence\nRW   {value(10)}\nLW   {value(9)}\nBall {value(18)}"
 
 
+def mark_experiment_track_outliers(frames,confidence_limit=.15):
+    """Mark low-confidence and isolated 2-D track points without smoothing them.
+
+    The residual accepts either the incoming or outgoing straight-line segment.
+    This preserves a genuine ball-direction change at contact while rejecting a
+    lone detection that agrees with neither side of the trajectory.
+    """
+    if not frames:return frames
+    names={"右手首":"10","左手首":"9","ボール":"18"}
+    for frame in frames:frame["track_warnings"]={}
+    for name,key in names.items():
+        points=[]
+        for frame in frames:
+            value=frame.get("kps",{}).get(key)
+            valid=bool(value and len(value)>=3)
+            points.append(np.asarray(value[:2],dtype=float) if valid else None)
+            if valid and float(value[2])<confidence_limit:
+                frame["track_warnings"][name]=f"Confidence {float(value[2]):.0%} < {confidence_limit:.0%}"
+        valid_indices=[i for i,p in enumerate(points) if p is not None]
+        for pos,i in enumerate(valid_indices):
+            if name in frames[i]["track_warnings"]:continue
+            residuals=[]
+            # Incoming-line extrapolation and outgoing-line extrapolation are
+            # evaluated separately, so a real contact-direction corner survives.
+            if pos>=2:
+                a,b=valid_indices[pos-2],valid_indices[pos-1]
+                dt=max(float(frames[b]["time"])-float(frames[a]["time"]),1e-6)
+                ratio=(float(frames[i]["time"])-float(frames[b]["time"]))/dt
+                residuals.append(float(np.linalg.norm(points[i]-(points[b]+ratio*(points[b]-points[a])))))
+            if pos+2<len(valid_indices):
+                b,c=valid_indices[pos+1],valid_indices[pos+2]
+                dt=max(float(frames[c]["time"])-float(frames[b]["time"]),1e-6)
+                ratio=(float(frames[b]["time"])-float(frames[i]["time"]))/dt
+                residuals.append(float(np.linalg.norm(points[i]-(points[b]-ratio*(points[c]-points[b])))))
+            threshold=.12 if name=="ボール" else .08
+            if residuals and min(residuals)>threshold:
+                frames[i]["track_warnings"][name]=f"前後どちらの軌跡からも外れ（残差 {min(residuals):.3f}）"
+    return frames
+
+
 def score_full_frame_hit_candidates(frames,audio_time,sigma=.08):
     """Attach transparent experimental contact scores to frame records.
 
@@ -1193,13 +1233,22 @@ def score_full_frame_hit_candidates(frames,audio_time,sigma=.08):
         return np.clip(finite/max(top,eps),0,1)
     audio=np.exp(-.5*((times-float(audio_time))/max(float(sigma),.01))**2)
     ns,nc,nb=norm(hand_speed),norm(hand_change),norm(ball_change)
-    scores=.30*audio+.28*ns+.18*nc+.16*nb+.08*proximity
+    reliability=np.asarray([.25 if f.get("track_warnings") else 1.0 for f in frames])
+    scores=(.30*audio+.28*ns+.18*nc+.16*nb+.08*proximity)*reliability
     best=int(np.argmax(scores))
     output=[]
     for i,frame in enumerate(frames):
+        contributions={"音声":.30*float(audio[i])*float(reliability[i]),
+                       "手首速度":.28*float(ns[i])*float(reliability[i]),
+                       "速度変化":.18*float(nc[i])*float(reliability[i]),
+                       "ボール変化":.16*float(nb[i])*float(reliability[i]),
+                       "手球近接":.08*float(proximity[i])*float(reliability[i])}
         item=dict(frame); item.update({"right_speed":float(rs[i]),"left_speed":float(ls[i]),
             "hand_change":float(hand_change[i]),"ball_change":float(ball_change[i]),
             "proximity":float(proximity[i]),"audio_prior":float(audio[i]),
+            "normalized_hand_speed":float(ns[i]),"normalized_hand_change":float(nc[i]),
+            "normalized_ball_change":float(nb[i]),"track_reliability":float(reliability[i]),
+            "score_contributions":contributions,
             "score":float(scores[i]),"selected":i==best})
         output.append(item)
     return output,best
@@ -2587,6 +2636,10 @@ class TennisApp(tk.Tk):
         tk.Label(parent,textvariable=self._experiment_metrics,bg=PANEL2,fg=TEXT,
                  font=("Meiryo UI",20,"bold"),anchor="w",justify="left",wraplength=1500
                  ).pack(fill="x",padx=8,pady=(0,7),ipadx=9,ipady=7)
+        self._experiment_quality_reason=tk.StringVar(value="×印: 低Confidenceまたは前後の軌跡から外れた点")
+        tk.Label(parent,textvariable=self._experiment_quality_reason,bg="#fff8e8",fg="#7a3f00",
+                 font=_tk_font(10,bold=True),anchor="w",justify="left",wraplength=1500
+                 ).pack(fill="x",padx=8,pady=(0,7),ipadx=8,ipady=4)
 
     def _initialize_experiment_split(self):
         if self._experiment_split_initialized:return
@@ -4117,6 +4170,7 @@ class TennisApp(tk.Tk):
                     self.after(0,lambda o=order,t=total:self._experiment_status.set(
                         f"全フレーム解析中… {o}/{t}"))
                 frames=build_person_relative_tracks(frames,min_conf=.05)
+                frames=mark_experiment_track_outliers(frames)
                 scored,best=score_full_frame_hit_candidates(frames,corrected)
                 if self._gen==gen:self.after(0,lambda:self._show_experiment_results(
                     scored,best,target,corrected,fps))
@@ -4135,6 +4189,7 @@ class TennisApp(tk.Tk):
             return
         self._experiment_audio_center=float(corrected)
         self._experiment_selected_frame=int(best)
+        self._experiment_auto_frame=int(best)
         xs=[]; ys=[]
         for frame in frames:
             for value in frame.get("kps",{}).values():
@@ -4151,11 +4206,7 @@ class TennisApp(tk.Tk):
         chosen=frames[best]
         self._experiment_status.set(
             f"完了: 上位3件の手首移動最大 {float(target['time']):.3f}s → 音速補正 {corrected:.3f}s / 自動候補 F{chosen['frame_no']} {chosen['time']:.3f}s")
-        self._experiment_metrics.set(
-            f"選択 score={chosen['score']:.3f}　音声={chosen['audio_prior']:.3f}　"
-            f"右手速={chosen['right_speed']:.3f}　左手速={chosen['left_speed']:.3f}\n"
-            f"手速度変化={chosen['hand_change']:.3f}　ボール変化={chosen['ball_change']:.3f}　"
-            f"手球近接={chosen['proximity']:.3f}\n重み: 音30%　手速28%　手変18%　球変16%　近接8%")
+        self._update_experiment_diagnostics()
 
     def _experiment_absolute_tracks(self,frame):
         kps=frame.get("kps",{}); valid=lambda v:bool(v and len(v)>=3 and float(v[2])>=.05)
@@ -4183,6 +4234,14 @@ class TennisApp(tk.Tk):
             for name,color in colors.items():
                 values=[track.get(name,[np.nan,np.nan])[coord] for track in source]
                 axis.plot(rel_times,values,"o-",label=name,color=color,linewidth=1.5,markersize=4)
+                bad=[]
+                for i,frame in enumerate(frames):
+                    if name in frame.get("track_warnings",{}) and np.isfinite(values[i]):
+                        bad.append(i)
+                if bad:
+                    axis.scatter(rel_times[bad],[values[i] for i in bad],marker="x",s=80,
+                                 linewidths=2.3,color="#111111",zorder=8,
+                                 label="信頼性注意" if name=="右手首" else None)
             axis.axvline(0,color="#777",linestyle="--",linewidth=1,label="音声補正時刻")
             axis.axvline(rel_times[auto],color="#ff8c00",linewidth=2,label="自動判定")
             axis.axvline(rel_times[selected],color="#1976d2",linewidth=1.8,
@@ -4221,10 +4280,12 @@ class TennisApp(tk.Tk):
         if not hasattr(self,"_experiment_photo_inner"):return
         for child in self._experiment_photo_inner.winfo_children():child.destroy()
         self._experiment_photo_refs=[]
+        self._experiment_thumbnail_cards=[]
         for i,frame in enumerate(self._experiment_frames):
             selected=i==self._experiment_selected_frame; bg="#fff3be" if selected else PANEL2
             card=tk.Frame(self._experiment_photo_inner,bg=bg,bd=2,relief="solid")
             card.pack(side="left",padx=3,pady=3)
+            self._experiment_thumbnail_cards.append(card)
             rel=float(frame["time"])-float(getattr(self,"_experiment_audio_center",frame["time"]))
             tk.Label(card,text=f"F{frame['frame_no']} {rel:+.3f}s  KP{frame.get('pose_points',0)}",
                      bg=bg,fg=GOLD if selected else TEXT,font=_tk_font(8,bold=True)).pack(fill="x")
@@ -4236,18 +4297,46 @@ class TennisApp(tk.Tk):
             tk.Label(card,text=f"score {frame['score']:.3f}{borrowed}",bg=bg,fg=TEXT,
                      font=("Consolas",8)).pack(fill="x")
         self._render_experiment_large()
+        self.after_idle(lambda:self._center_experiment_thumbnail(self._experiment_selected_frame))
+
+    def _center_experiment_thumbnail(self,index):
+        """Keep the selected thumbnail at the horizontal viewport center."""
+        if not hasattr(self,"_experiment_thumbnail_cards") or not self._experiment_thumbnail_cards:return
+        index=max(0,min(int(index),len(self._experiment_thumbnail_cards)-1))
+        canvas=self._experiment_photo_canvas; canvas.update_idletasks()
+        card=self._experiment_thumbnail_cards[index]
+        content=max(1,self._experiment_photo_inner.winfo_width())
+        viewport=max(1,canvas.winfo_width())
+        desired=card.winfo_x()+card.winfo_width()/2-viewport/2
+        desired=float(np.clip(desired,0,max(0,content-viewport)))
+        canvas.xview_moveto(desired/content)
 
     def _select_experiment_frame(self,index):
         self._experiment_selected_frame=max(0,min(int(index),len(self._experiment_frames)-1))
         self._rerender_experiment_images()
         self._draw_experiment_graphs()
-        frame=self._experiment_frames[self._experiment_selected_frame]
+        self._update_experiment_diagnostics()
+
+    def _update_experiment_diagnostics(self):
+        if not getattr(self,"_experiment_frames",None):return
+        selected=max(0,min(int(self._experiment_selected_frame),len(self._experiment_frames)-1))
+        auto=max(0,min(int(getattr(self,"_experiment_auto_frame",selected)),len(self._experiment_frames)-1))
+        frame=self._experiment_frames[selected]; winner=self._experiment_frames[auto]
+        parts=winner.get("score_contributions",{})
+        ordered=sorted(parts.items(),key=lambda pair:pair[1],reverse=True)
+        contribution_text="  ".join(f"{name} {value:.3f}" for name,value in ordered)
+        main="・".join(name for name,_ in ordered[:2]) if ordered else "算出不能"
         self._experiment_metrics.set(
-            f"選択 F{frame['frame_no']}　{frame['time']:.3f}s　score={frame['score']:.3f}　"
-            f"KP={frame.get('pose_points',0)}　音={frame['audio_prior']:.3f}\n"
-            f"右手速={frame['right_speed']:.3f}　左手速={frame['left_speed']:.3f}　"
-            f"手変={frame['hand_change']:.3f}\n"
-            f"球変={frame['ball_change']:.3f}　近接={frame['proximity']:.3f}")
+            f"自動判定 F{winner['frame_no']} score={winner['score']:.3f}：寄与上位は {main}\n"
+            f"加点内訳（合計=score）  {contribution_text}\n"
+            f"写真選択 F{frame['frame_no']} {frame['time']:.3f}s  score={frame['score']:.3f}")
+        warnings=frame.get("track_warnings",{})
+        if warnings:
+            detail=" / ".join(f"{name}: {reason}" for name,reason in warnings.items())
+            self._experiment_quality_reason.set(f"選択フレームの×理由　{detail}")
+        else:
+            self._experiment_quality_reason.set(
+                "選択フレームに×はありません。×＝Confidence 15%未満、または前後どちらの直線軌跡にも合わない孤立点")
 
     def _render_experiment_large(self):
         if not hasattr(self,"_experiment_large_canvas") or not self._experiment_frames:return
