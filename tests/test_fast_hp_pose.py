@@ -55,6 +55,28 @@ def test_experiment_ball_direction_change_is_not_outlier():
     assert "ボール" not in result[2]["track_warnings"]
 
 
+def test_video_artifacts_use_same_name_sidecar_folder():
+    with tempfile.TemporaryDirectory() as folder:
+        video=Path(folder)/"sample.mp4"; video.write_bytes(b"video")
+        sidecar=Path(TA.get_video_data_dir(str(video)))
+        assert sidecar==Path(folder)/"sample"
+        assert Path(TA.get_db_path(str(video)))==sidecar/"tennis_labels.db"
+        assert Path(TA.get_video_metadata_path(str(video)))==sidecar/"metadata.json"
+        assert Path(TA.get_analysis_cache_path(str(video)))==sidecar/"audio"/"sample_analysis.npz"
+
+
+def test_experiment_cache_round_trip_without_frame_jpeg():
+    with tempfile.TemporaryDirectory() as folder:
+        video=Path(folder)/"sample.mp4"; video.write_bytes(b"video-data")
+        frames=[{"time":1.0,"frame_no":30,"kps":{"10":[.2,.3,.9]},
+                 "frame_jpeg":b"large-binary","score":.8}]
+        target={"time":1.0,"idx":5}
+        assert TA.save_experiment_cache(str(video),frames,0,target,.991,30.0)
+        restored=TA.load_experiment_cache(str(video),1.0)
+        assert restored["frames"][0]["kps"]["10"]==[.2,.3,.9]
+        assert "frame_jpeg" not in restored["frames"][0]
+
+
 def feat(x, y, serve=False, stroke=False, angle=120.0):
     return {
         "rw": np.array([x, y], dtype=float),

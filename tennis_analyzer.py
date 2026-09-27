@@ -229,7 +229,7 @@ _YOLO_CONFIG_DIR=os.path.join(os.path.dirname(os.path.abspath(__file__)),".ultra
 try: os.makedirs(_YOLO_CONFIG_DIR,exist_ok=True)
 except Exception: pass
 os.environ.setdefault("YOLO_CONFIG_DIR",_YOLO_CONFIG_DIR)
-import json, sqlite3, threading, time, math, copy, sys, warnings
+import json, sqlite3, threading, time, math, copy, sys, warnings, shutil
 warnings.filterwarnings("ignore")
 import contextlib
 import tkinter as tk
@@ -321,7 +321,8 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v115-exp"; APP_VERSION_DESC = "軌跡信頼性・判定根拠表示"
+APP_VERSION = "v116-exp"; APP_VERSION_DESC = "動画別サイドカーフォルダ"
+GROUND_TRUTH_ENABLED = False
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -1339,8 +1340,50 @@ def extract_thumbnails(video_path, peak_times, output_dir, progress_cb=None):
 # ══════════════════════════════════════════════
 #  DB
 # ══════════════════════════════════════════════
+def get_video_data_dir(video_path,create=True):
+    """Return `<video parent>/<video stem>/` for portable per-video artifacts."""
+    stem=os.path.splitext(os.path.basename(video_path or ""))[0]
+    folder=os.path.join(os.path.dirname(os.path.abspath(video_path or ".")),stem)
+    if create:os.makedirs(folder,exist_ok=True)
+    return folder
+
+
+def _copy_legacy_artifact(old_path,new_path):
+    """One-time, non-destructive migration used when the new artifact is absent."""
+    if os.path.exists(new_path) or not os.path.isfile(old_path):return new_path
+    try:
+        os.makedirs(os.path.dirname(new_path),exist_ok=True); shutil.copy2(old_path,new_path)
+    except Exception as e:print(f"legacy artifact migration failed: {old_path}: {e}")
+    return new_path
+
+
 def get_db_path(video_path):
-    return os.path.join(os.path.dirname(video_path),"tennis_labels.db")
+    new_path=os.path.join(get_video_data_dir(video_path),"tennis_labels.db")
+    legacy=os.path.join(os.path.dirname(video_path),"tennis_labels.db")
+    return _copy_legacy_artifact(legacy,new_path)
+
+
+def get_video_metadata_path(video_path):
+    return os.path.join(get_video_data_dir(video_path),"metadata.json")
+
+
+def load_video_extra_metadata(video_path):
+    new_path=get_video_metadata_path(video_path)
+    legacy=os.path.splitext(video_path)[0]+"_meta_extra.json"
+    source=new_path if os.path.exists(new_path) else legacy
+    if not os.path.exists(source):return {}
+    try:
+        with open(source,"r",encoding="utf-8") as f:data=json.load(f)
+        if source==legacy and not os.path.exists(new_path):
+            with open(new_path,"w",encoding="utf-8") as f:json.dump(data,f,ensure_ascii=False,indent=2)
+        return data
+    except Exception:return {}
+
+
+def save_video_extra_metadata(video_path,data):
+    path=get_video_metadata_path(video_path)
+    with open(path,"w",encoding="utf-8") as f:json.dump(data,f,ensure_ascii=False,indent=2)
+    return path
 
 def get_ground_truth_db_path():
     """Version-independent per-user database for verified hit points."""
@@ -1585,11 +1628,13 @@ def load_deleted_peaks(db_path, video_file):
 
 # ── v15: 解析結果キャッシュ ────────────────
 def get_analysis_cache_path(video_path, first_minute_only=False):
-    audio_dir=os.path.join(os.path.dirname(video_path),"audio")
+    audio_dir=os.path.join(get_video_data_dir(video_path),"audio")
     os.makedirs(audio_dir,exist_ok=True)
     stem=os.path.splitext(os.path.basename(video_path))[0]
     suffix="_first60_analysis.npz" if first_minute_only else "_analysis.npz"
-    return os.path.join(audio_dir,f"{stem}{suffix}")
+    new_path=os.path.join(audio_dir,f"{stem}{suffix}")
+    legacy=os.path.join(os.path.dirname(video_path),"audio",f"{stem}{suffix}")
+    return _copy_legacy_artifact(legacy,new_path)
 
 def save_analysis_cache(cache_path,data):
     try:
@@ -1610,6 +1655,47 @@ def load_analysis_cache(cache_path):
         return out
     except Exception as e:
         print("cache load failed:",e); return None
+
+
+def get_experiment_cache_path(video_path):
+    folder=os.path.join(get_video_data_dir(video_path),"experiment")
+    os.makedirs(folder,exist_ok=True)
+    return os.path.join(folder,"frame_validation.json")
+
+
+def _json_safe(value):
+    if isinstance(value,dict):return {str(k):_json_safe(v) for k,v in value.items() if k!="frame_jpeg"}
+    if isinstance(value,(list,tuple)):return [_json_safe(v) for v in value]
+    if isinstance(value,np.ndarray):return value.tolist()
+    if isinstance(value,(np.integer,np.floating)):return value.item()
+    if isinstance(value,np.bool_):return bool(value)
+    return value
+
+
+def save_experiment_cache(video_path,frames,best,target,corrected,fps):
+    try:
+        stat=os.stat(video_path)
+        data={"version":1,"video_size":int(stat.st_size),"video_mtime_ns":int(stat.st_mtime_ns),
+              "target_time":float(target.get("time",0)),"corrected":float(corrected),
+              "fps":float(fps),"best":int(best),"target":_json_safe(target),
+              "frames":_json_safe(frames),"saved_at":time.strftime("%Y-%m-%d %H:%M:%S")}
+        with open(get_experiment_cache_path(video_path),"w",encoding="utf-8") as f:
+            json.dump(data,f,ensure_ascii=False,indent=1)
+        return True
+    except Exception as e:print("experiment cache save failed:",e); return False
+
+
+def load_experiment_cache(video_path,target_time):
+    path=get_experiment_cache_path(video_path)
+    if not os.path.exists(path):return None
+    try:
+        with open(path,"r",encoding="utf-8") as f:data=json.load(f)
+        stat=os.stat(video_path)
+        if int(data.get("video_size",-1))!=int(stat.st_size):return None
+        if abs(float(data.get("target_time",-999))-float(target_time))>.001:return None
+        if not data.get("frames"):return None
+        return data
+    except Exception as e:print("experiment cache load failed:",e); return None
 
 def backfill_ground_truth_peak_energies(db_path=None):
     """Fill legacy verified rows from each video's existing audio cache."""
@@ -1683,7 +1769,9 @@ def update_registry_entry(video_path,**fields):
 def find_cp_thumb_path(video_path, rank):
     """指定 rank のサムネファイルを探す (拡張子合致しているもの。hit を優先)"""
     base=os.path.splitext(os.path.basename(video_path))[0]
-    thumb_dir=os.path.join(os.path.dirname(video_path),"1_thumbnails",base)
+    thumb_dir=os.path.join(get_video_data_dir(video_path),"thumbnails")
+    legacy=os.path.join(os.path.dirname(video_path),"1_thumbnails",base)
+    if not os.path.isdir(thumb_dir):thumb_dir=legacy
     if not os.path.isdir(thumb_dir): return None
     try: entries=os.listdir(thumb_dir)
     except Exception: return None
@@ -1697,7 +1785,9 @@ def find_cp_thumb_path(video_path, rank):
 def find_any_thumb(video_path):
     """サムネディレクトリ内の任意のサムネを返す (フォールバック用)"""
     base=os.path.splitext(os.path.basename(video_path))[0]
-    thumb_dir=os.path.join(os.path.dirname(video_path),"1_thumbnails",base)
+    thumb_dir=os.path.join(get_video_data_dir(video_path),"thumbnails")
+    legacy=os.path.join(os.path.dirname(video_path),"1_thumbnails",base)
+    if not os.path.isdir(thumb_dir):thumb_dir=legacy
     if not os.path.isdir(thumb_dir): return None
     try: entries=sorted(os.listdir(thumb_dir))
     except Exception: return None
@@ -1712,7 +1802,9 @@ def find_any_thumb(video_path):
 
 def count_yolo_outputs(video_path):
     """yolo/ ディレクトリの解析済CP数を集計 → (n_yolo, n_refined)"""
-    yolo_dir=os.path.join(os.path.dirname(video_path),"yolo")
+    yolo_dir=os.path.join(get_video_data_dir(video_path),"pose")
+    legacy=os.path.join(os.path.dirname(video_path),"yolo")
+    if not os.path.isdir(yolo_dir):yolo_dir=legacy
     if not os.path.isdir(yolo_dir): return (0,0)
     stem=os.path.splitext(os.path.basename(video_path))[0]
     try: entries=os.listdir(yolo_dir)
@@ -1728,7 +1820,9 @@ def count_yolo_outputs(video_path):
 
 def check_cp_yolo_status(video_path, rank):
     """指定 rank の YOLO 状態 → (has_yolo, has_refined)"""
-    yolo_dir=os.path.join(os.path.dirname(video_path),"yolo")
+    yolo_dir=os.path.join(get_video_data_dir(video_path),"pose")
+    legacy=os.path.join(os.path.dirname(video_path),"yolo")
+    if not os.path.isdir(yolo_dir):yolo_dir=legacy
     if not os.path.isdir(yolo_dir): return (False,False)
     stem=os.path.splitext(os.path.basename(video_path))[0]
     has_yolo=os.path.exists(os.path.join(yolo_dir,f"{stem}_cp{rank:02d}.json"))
@@ -2386,13 +2480,13 @@ class TennisApp(tk.Tk):
         self.tabs.add(self.tab_main,   text="ヒットポイント一覧")
         self.tabs.add(self.tab_hp_detail, text="ヒットポイント詳細")
         self.tabs.add(self.tab_frame_validation, text="フレーム検証（実験）")
-        self.tabs.add(self.tab_truth_summary, text="正解DBサマリ")
+        if GROUND_TRUTH_ENABLED:self.tabs.add(self.tab_truth_summary, text="正解DBサマリ")
         self.tabs.bind("<<NotebookTabChanged>>",self._on_tab_changed)
 
         self._build_tab_main(self.tab_main)
         self._build_tab_hp_detail(self.tab_hp_detail)
         self._build_tab_frame_validation(self.tab_frame_validation)
-        self._build_tab_truth_summary(self.tab_truth_summary)
+        if GROUND_TRUTH_ENABLED:self._build_tab_truth_summary(self.tab_truth_summary)
         # v63: 今回の画面はヒットポイント検出に限定する。
         self.refiner = None
 
@@ -2913,7 +3007,7 @@ class TennisApp(tk.Tk):
             messagebox.showinfo("CP選択","動画を読み込んでください"); return
         path=self.video_path.get()
         stem=os.path.splitext(os.path.basename(path))[0]
-        thumb_dir=os.path.join(os.path.dirname(path),"1_thumbnails",stem)
+        thumb_dir=os.path.join(get_video_data_dir(path),"thumbnails")
 
         win=tk.Toplevel(self,bg=PANEL)
         win.title("ヒットポイントを選択"); win.geometry("760x520")
@@ -3334,13 +3428,7 @@ class TennisApp(tk.Tk):
         vf = os.path.basename(path)
         meta = load_video_meta(db_path, vf) or {}
         # v34: 追加メタデータの復元
-        saved_extra = {}
-        try:
-            extra_path = os.path.splitext(path)[0] + "_meta_extra.json"
-            if os.path.exists(extra_path):
-                with open(extra_path, "r", encoding="utf-8") as f:
-                    saved_extra = json.load(f)
-        except Exception: pass
+        saved_extra=load_video_extra_metadata(path)
         # v96: カメラ方向は保存済み設定またはユーザー入力のみを使用する。
         direction_estimate={"direction":"不明・複数","confidence":0.0,"reason":"自動推定なし"}
         estimated_dir="不明・複数"
@@ -3399,12 +3487,9 @@ class TennisApp(tk.Tk):
                        variable=first_minute_var,bg=PANEL,fg=ACCENT2,
                        activebackground=PANEL,selectcolor=DARK2,
                        font=_tk_font(10,bold=True)).pack(anchor="w",pady=(8,0),padx=8)
-        # v40: プロジェクトフォルダ取込
-        import_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(right, text="プロジェクトフォルダに取込 (動画+解析データを集約管理)",
-                       variable=import_var, bg=PANEL, fg=TEXT,
-                       activebackground=PANEL, selectcolor=DARK2,
-                       font=_tk_font(9)).pack(anchor="w", pady=(8,2), padx=8)
+        tk.Label(right,text="保存先: 動画と同じ場所の同名フォルダ（動画本体はコピーしません）",
+                 bg=PANEL,fg=ACCENT2,font=_tk_font(9,bold=True)
+                 ).pack(anchor="w",pady=(8,2),padx=8)
         # メモ
         tk.Label(right, text="メモ:", bg=PANEL, fg=TEXT,
                  font=_tk_font(10, True)).pack(anchor="w", pady=(8,2))
@@ -3452,20 +3537,11 @@ class TennisApp(tk.Tk):
                 "camera_estimate_reason": direction_estimate.get("reason",""),
                 "camera_direction_corrected": cam_var.get()!=estimated_dir,
             }
-            # v34: 追加メタデータをJSON保存 (次回復元用)
+            # Portable per-video sidecar metadata (next load restores settings).
             try:
-                extra_path = os.path.splitext(path)[0] + "_meta_extra.json"
-                with open(extra_path, "w", encoding="utf-8") as f:
-                    json.dump(self._video_meta_extra, f, ensure_ascii=False)
+                save_video_extra_metadata(path,self._video_meta_extra)
             except Exception: pass
-            # v40: プロジェクトフォルダに取込
-            load_path = path
-            if import_var.get():
-                imported = self._import_to_project(path)
-                if imported:
-                    load_path = imported
-                    self.video_path.set(imported)
-            self._proceed_video_load(load_path)
+            self._proceed_video_load(path)
         tk.Button(btn_frame, text="OK - 解析開始", bg=ACCENT2, fg="white",
                   font=_tk_font(11, True), cursor="hand2",
                   command=_on_ok).pack(side="right", padx=4, ipady=4, ipadx=16)
@@ -3684,8 +3760,8 @@ class TennisApp(tk.Tk):
 
         def _worker():
             try:
-                base=os.path.dirname(path); stem=os.path.splitext(os.path.basename(path))[0]
-                audio_dir=os.path.join(base,"audio"); os.makedirs(audio_dir,exist_ok=True)
+                stem=os.path.splitext(os.path.basename(path))[0]
+                audio_dir=os.path.join(get_video_data_dir(path),"audio"); os.makedirs(audio_dir,exist_ok=True)
                 audio_path=os.path.join(audio_dir,f"{stem}_first60.mp3" if first_minute else f"{stem}.mp3")
                 self.after(0,lambda: self._set_progress(5,"音声抽出中…"))
                 extract_audio(path,audio_path,60.0 if first_minute else None)
@@ -4124,6 +4200,28 @@ class TennisApp(tk.Tk):
         self._experiment_running=True
         sound_pick=select_sound_rank_one([target],self.data,self.audio_band_mode.get())
         target.setdefault("sound_energy",0.0 if sound_pick is None else sound_pick["sound_energy"])
+        cached=load_experiment_cache(path,float(target["time"]))
+        if cached is not None:
+            self._experiment_status.set("保存済み全フレーム解析を復元中…")
+            def _restore_worker():
+                cap=None
+                try:
+                    frames=list(cached["frames"]); cap=cv2.VideoCapture(path)
+                    for frame in frames:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES,int(frame["frame_no"])); ok,bgr=cap.read()
+                        if ok:
+                            good,encoded=cv2.imencode(".jpg",bgr,[cv2.IMWRITE_JPEG_QUALITY,90])
+                            frame["frame_jpeg"]=encoded.tobytes() if good else None
+                    self.after(0,lambda:self._show_experiment_results(
+                        frames,int(cached["best"]),cached.get("target",target),
+                        float(cached["corrected"]),float(cached["fps"]),restored=True))
+                except Exception as e:
+                    err=str(e); self.after(0,lambda message=err:self._experiment_status.set(f"保存結果の復元エラー: {message}"))
+                finally:
+                    if cap is not None:cap.release()
+                    self._experiment_running=False
+            threading.Thread(target=_restore_worker,daemon=True).start()
+            return
         self._experiment_status.set(
             f"準備中: 音声上位3件の手首移動最大 {float(target['time']):.3f}s / energy {target['sound_energy']:.3f}")
 
@@ -4182,7 +4280,7 @@ class TennisApp(tk.Tk):
                 self._experiment_running=False
         threading.Thread(target=_worker,daemon=True).start()
 
-    def _show_experiment_results(self,frames,best,target,corrected,fps):
+    def _show_experiment_results(self,frames,best,target,corrected,fps,restored=False):
         self._experiment_frames=list(frames); self._experiment_photo_refs=[]
         if not frames or best is None:
             self._experiment_status.set("解析できるフレームがありません")
@@ -4205,8 +4303,9 @@ class TennisApp(tk.Tk):
         self._draw_experiment_graphs()
         chosen=frames[best]
         self._experiment_status.set(
-            f"完了: 上位3件の手首移動最大 {float(target['time']):.3f}s → 音速補正 {corrected:.3f}s / 自動候補 F{chosen['frame_no']} {chosen['time']:.3f}s")
+            f"{'保存結果を復元' if restored else '完了'}: 上位3件の手首移動最大 {float(target['time']):.3f}s → 音速補正 {corrected:.3f}s / 自動候補 F{chosen['frame_no']} {chosen['time']:.3f}s")
         self._update_experiment_diagnostics()
+        if not restored:save_experiment_cache(self.video_path.get(),frames,best,target,corrected,fps)
 
     def _experiment_absolute_tracks(self,frame):
         kps=frame.get("kps",{}); valid=lambda v:bool(v and len(v)>=3 and float(v[2])>=.05)
@@ -4695,9 +4794,7 @@ class TennisApp(tk.Tk):
         # サムネイル抽出 (検出順=rank順) — 進捗付き
         # v24 後修正: 紙芝居は廃止 (画面バタつき・0%固まり問題の原因)
         #            シンプルな進捗テキストのみ
-        base=os.path.dirname(path)
-        thumb_dir=os.path.join(base,"1_thumbnails",
-                               os.path.splitext(os.path.basename(path))[0])
+        thumb_dir=os.path.join(get_video_data_dir(path),"thumbnails")
         def _cb(done,total,thumb_path=None):
             pct=70 + 28*done/max(1,total)
             self.after(0,lambda: self._set_progress(
@@ -7796,7 +7893,7 @@ class TennisApp(tk.Tk):
     }
 
     def _yolo_out_dir(self,video_path):
-        return os.path.join(os.path.dirname(video_path),"yolo")
+        return os.path.join(get_video_data_dir(video_path),"pose")
 
     def _yolo_data_file(self,video_path,rank,prefer_refined=False):
         """v62: 互換維持。source指定なしはMP優先→YOLO fallback"""
@@ -11232,6 +11329,7 @@ class RefinerFrame(tk.Frame):
         thumb_dirs = []
         if video_path:
             base = os.path.dirname(video_path)
+            thumb_dirs.append(os.path.join(get_video_data_dir(video_path),"thumbnails"))
             thumb_dirs.append(os.path.join(base, "1_thumbnails", stem))
         # JSON フォルダの兄弟も試す
         json_parent = os.path.dirname(os.path.dirname(self.cp_files[0]))
@@ -13167,13 +13265,10 @@ class RefinerFrame(tk.Frame):
             if self.analyzer is not None:
                 cam_dir = getattr(self.analyzer, "_video_meta_extra", {}).get("camera_dir", "")
                 if not cam_dir:
-                    # _meta_extra.json からも試行
+                    # Per-video sidecar metadataからも試行
                     vp = self.analyzer.video_path.get()
                     if vp:
-                        extra_path = os.path.splitext(vp)[0] + "_meta_extra.json"
-                        if os.path.exists(extra_path):
-                            with open(extra_path, "r", encoding="utf-8") as f:
-                                cam_dir = json.load(f).get("camera_dir", "")
+                        cam_dir=load_video_extra_metadata(vp).get("camera_dir","")
         except Exception: pass
         azim_map = {
             "後ろ": -90.0,          # 選手の背後から
