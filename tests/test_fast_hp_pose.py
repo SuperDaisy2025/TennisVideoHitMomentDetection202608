@@ -77,6 +77,25 @@ def test_experiment_cache_round_trip_without_frame_jpeg():
         assert "frame_jpeg" not in restored["frames"][0]
 
 
+def test_batch_result_round_trip_and_report_contains_evidence():
+    with tempfile.TemporaryDirectory() as folder:
+        video=Path(folder)/"match.mp4"; video.write_bytes(b"video-data")
+        result={"video":str(video),"status":"完了","comment":"壁音を要確認",
+                "video_info":{"frame_count":300,"fps":30,"duration":10},
+                "settings":{"sensitivity":.4,"wall_mode":True,"audio_mode":"combined"},
+                "audio_candidates":[{"rank":1,"time":1.2,"energy":.8,"state":"採用","reason":"swing"}],
+                "selected_frame":{"frame_no":35,"time":1.167,"score":.72},
+                "frames":[{"frame_no":35,"time":1.167,"score":.72,"audio_prior":.9,
+                           "kps":{"10":[.5,.4,.88],"9":[.3,.4,.77]},"track_warnings":{}}]}
+        TA.save_batch_result(str(video),result)
+        restored=TA.load_batch_result(str(video))
+        report=TA.format_batch_report(folder,[restored])
+        assert "壁音を要確認" in report
+        assert "300フレーム" in report
+        assert "energy=0.8000" in report
+        assert "F35" in report and "conf=88.0%" in report
+
+
 def feat(x, y, serve=False, stroke=False, angle=120.0):
     return {
         "rw": np.array([x, y], dtype=float),
