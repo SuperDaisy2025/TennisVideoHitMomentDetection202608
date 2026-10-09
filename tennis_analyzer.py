@@ -229,7 +229,7 @@ _YOLO_CONFIG_DIR=os.path.join(os.path.dirname(os.path.abspath(__file__)),".ultra
 try: os.makedirs(_YOLO_CONFIG_DIR,exist_ok=True)
 except Exception: pass
 os.environ.setdefault("YOLO_CONFIG_DIR",_YOLO_CONFIG_DIR)
-import json, sqlite3, threading, time, math, copy, sys, warnings
+import json, sqlite3, threading, time, math, copy, sys, warnings, shutil
 warnings.filterwarnings("ignore")
 import contextlib
 import tkinter as tk
@@ -321,7 +321,8 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v106"; APP_VERSION_DESC = "音域表示の即時切替"
+APP_VERSION = "v116-exp"; APP_VERSION_DESC = "動画別サイドカーフォルダ"
+GROUND_TRUTH_ENABLED = False
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
 HP_POSE_SAMPLE_OFFSETS = (-0.2,-0.1,0.0,0.1,0.2)
@@ -1060,6 +1061,200 @@ def audio_band_color(mode="combined"):
             "wall":"#d17a22","broadband":"#6b7280"}.get(str(mode),"#23845b")
 
 
+def select_sound_rank_one(candidates,data,mode="combined"):
+    """Return the strongest surviving audio candidate, without changing ranks."""
+    if not candidates or data is None:return None
+    times=np.asarray(data.get("times",[]),dtype=float)
+    energy=audio_energy_series(data,mode)
+    if not len(times) or not len(energy):return None
+    def level(candidate):
+        idx=int(candidate.get("idx",np.argmin(np.abs(times-float(candidate.get("time",0))))))
+        idx=max(0,min(idx,len(energy)-1))
+        return float(energy[idx])
+    winner=max(candidates,key=level)
+    result=dict(winner); result["sound_energy"]=level(winner)
+    return result
+
+
+def select_sound_top_candidates(candidates,data,mode="combined",limit=3):
+    """Return the strongest audio candidates while retaining their source data."""
+    if not candidates or data is None or limit<=0:return []
+    times=np.asarray(data.get("times",[]),dtype=float)
+    energy=audio_energy_series(data,mode)
+    if not len(times) or not len(energy):return []
+    ranked=[]
+    for candidate in candidates:
+        item=dict(candidate)
+        idx=int(item.get("idx",np.argmin(np.abs(times-float(item.get("time",0))))))
+        idx=max(0,min(idx,len(energy)-1)); item["sound_energy"]=float(energy[idx])
+        ranked.append(item)
+    return sorted(ranked,key=lambda item:item["sound_energy"],reverse=True)[:int(limit)]
+
+
+def select_motion_validation_target(candidates,data=None,mode="combined"):
+    """Choose the largest reliable wrist movement, falling back to sound level."""
+    if not candidates:return None
+    measurable=[c for c in candidates if c.get("pose_travel") is not None]
+    if measurable:return dict(max(measurable,key=lambda c:float(c.get("pose_travel",0))))
+    return select_sound_rank_one(candidates,data,mode)
+
+
+def candidate_marker_color(candidate):
+    """Shared audit marker palette: blue target, green accepted, red rejected, gray pending."""
+    if candidate.get("full_frame_target") or candidate.get("reason")=="full_frame_target":
+        return "#1976d2"
+    selected=candidate.get("selected")
+    return "#8a958e" if selected is None else ("#26c281" if selected else "#ff5252")
+
+
+def build_person_relative_tracks(frames,min_conf=.05):
+    """Build tracks without discarding visible wrists when torso KP flickers.
+
+    A missing pelvis/shoulder reference borrows the nearest valid frame's
+    reference. The actual KP confidence is never fabricated.
+    """
+    if not frames:return []
+    anchors=[]; scales=[]
+    valid=lambda v:bool(v and len(v)>=3 and float(v[2])>=min_conf)
+    for frame in frames:
+        kps=frame.get("kps",{})
+        hips=[v for v in (kps.get("11"),kps.get("12")) if valid(v)]
+        shoulders=[v for v in (kps.get("5"),kps.get("6")) if valid(v)]
+        anchors.append(np.mean([v[:2] for v in hips],axis=0) if hips else None)
+        scales.append(float(np.linalg.norm(np.asarray(shoulders[0][:2])-
+                                           np.asarray(shoulders[1][:2])))
+                      if len(shoulders)==2 else None)
+    good_anchor=[i for i,v in enumerate(anchors) if v is not None]
+    good_scale=[i for i,v in enumerate(scales) if v is not None and v>.015]
+    median_scale=float(np.median([scales[i] for i in good_scale])) if good_scale else .15
+    output=[]
+    for i,frame in enumerate(frames):
+        item=dict(frame); kps=item.get("kps",{})
+        ai=i if anchors[i] is not None else (min(good_anchor,key=lambda j:abs(j-i)) if good_anchor else None)
+        si=i if scales[i] is not None and scales[i]>.015 else (
+            min(good_scale,key=lambda j:abs(j-i)) if good_scale else None)
+        anchor=anchors[ai] if ai is not None else np.array([.5,.6])
+        scale=scales[si] if si is not None else median_scale
+        tracks={}; detected=0
+        for name,ki in (("右手首","10"),("左手首","9"),("ボール","18")):
+            value=kps.get(ki)
+            if valid(value):
+                tracks[name]=((np.asarray(value[:2])-anchor)/max(scale,.015)).tolist(); detected+=1
+        torso=[v[:2] for v in (kps.get("5"),kps.get("6"),kps.get("11"),kps.get("12")) if valid(v)]
+        if torso:tracks["重心"]=((np.mean(torso,axis=0)-anchor)/max(scale,.015)).tolist()
+        item["tracks"]=tracks; item["pose_points"]=sum(valid(v) for v in kps.values() if v is not None)
+        item["reference_borrowed"]=bool(ai!=i or si!=i)
+        output.append(item)
+    return output
+
+
+def experiment_confidence_text(kps):
+    """Compact RTMPose/YOLO confidence text for experimental photos."""
+    def value(key):
+        point=(kps or {}).get(str(key))
+        try:return f"{float(point[2])*100:.0f}%" if point and len(point)>=3 else "--"
+        except Exception:return "--"
+    return f"Confidence\nRW   {value(10)}\nLW   {value(9)}\nBall {value(18)}"
+
+
+def mark_experiment_track_outliers(frames,confidence_limit=.15):
+    """Mark low-confidence and isolated 2-D track points without smoothing them.
+
+    The residual accepts either the incoming or outgoing straight-line segment.
+    This preserves a genuine ball-direction change at contact while rejecting a
+    lone detection that agrees with neither side of the trajectory.
+    """
+    if not frames:return frames
+    names={"右手首":"10","左手首":"9","ボール":"18"}
+    for frame in frames:frame["track_warnings"]={}
+    for name,key in names.items():
+        points=[]
+        for frame in frames:
+            value=frame.get("kps",{}).get(key)
+            valid=bool(value and len(value)>=3)
+            points.append(np.asarray(value[:2],dtype=float) if valid else None)
+            if valid and float(value[2])<confidence_limit:
+                frame["track_warnings"][name]=f"Confidence {float(value[2]):.0%} < {confidence_limit:.0%}"
+        valid_indices=[i for i,p in enumerate(points) if p is not None]
+        for pos,i in enumerate(valid_indices):
+            if name in frames[i]["track_warnings"]:continue
+            residuals=[]
+            # Incoming-line extrapolation and outgoing-line extrapolation are
+            # evaluated separately, so a real contact-direction corner survives.
+            if pos>=2:
+                a,b=valid_indices[pos-2],valid_indices[pos-1]
+                dt=max(float(frames[b]["time"])-float(frames[a]["time"]),1e-6)
+                ratio=(float(frames[i]["time"])-float(frames[b]["time"]))/dt
+                residuals.append(float(np.linalg.norm(points[i]-(points[b]+ratio*(points[b]-points[a])))))
+            if pos+2<len(valid_indices):
+                b,c=valid_indices[pos+1],valid_indices[pos+2]
+                dt=max(float(frames[c]["time"])-float(frames[b]["time"]),1e-6)
+                ratio=(float(frames[b]["time"])-float(frames[i]["time"]))/dt
+                residuals.append(float(np.linalg.norm(points[i]-(points[b]-ratio*(points[c]-points[b])))))
+            threshold=.12 if name=="ボール" else .08
+            if residuals and min(residuals)>threshold:
+                frames[i]["track_warnings"][name]=f"前後どちらの軌跡からも外れ（残差 {min(residuals):.3f}）"
+    return frames
+
+
+def score_full_frame_hit_candidates(frames,audio_time,sigma=.08):
+    """Attach transparent experimental contact scores to frame records.
+
+    Tracks are person-relative (pelvis origin, shoulder-width scale). Missing
+    ball observations contribute zero instead of invalidating wrist evidence.
+    """
+    if not frames:return [],None
+    n=len(frames); eps=1e-6
+    times=np.asarray([float(f["time"]) for f in frames])
+    def track(name):
+        arr=np.full((n,2),np.nan)
+        for i,f in enumerate(frames):
+            value=f.get("tracks",{}).get(name)
+            if value is not None:arr[i]=value[:2]
+        return arr
+    rw,lw,ball=track("右手首"),track("左手首"),track("ボール")
+    def speed(arr):
+        out=np.zeros(n)
+        if n<2:return out
+        for i in range(1,n):
+            if np.isfinite(arr[i]).all() and np.isfinite(arr[i-1]).all():
+                out[i]=np.linalg.norm(arr[i]-arr[i-1])/max(times[i]-times[i-1],1e-4)
+        return out
+    rs,ls,bs=speed(rw),speed(lw),speed(ball)
+    hand_speed=np.maximum(rs,ls)
+    hand_change=np.abs(np.gradient(hand_speed,times)) if n>2 else np.zeros(n)
+    ball_change=np.abs(np.gradient(bs,times)) if n>2 else np.zeros(n)
+    proximity=np.zeros(n)
+    for i in range(n):
+        if np.isfinite(ball[i]).all():
+            distances=[np.linalg.norm(ball[i]-h[i]) for h in (rw,lw) if np.isfinite(h[i]).all()]
+            if distances:proximity[i]=math.exp(-min(distances)/.45)
+    def norm(values):
+        finite=np.asarray(values,dtype=float); top=float(np.nanpercentile(finite,90)) if len(finite) else 0
+        return np.clip(finite/max(top,eps),0,1)
+    audio=np.exp(-.5*((times-float(audio_time))/max(float(sigma),.01))**2)
+    ns,nc,nb=norm(hand_speed),norm(hand_change),norm(ball_change)
+    reliability=np.asarray([.25 if f.get("track_warnings") else 1.0 for f in frames])
+    scores=(.30*audio+.28*ns+.18*nc+.16*nb+.08*proximity)*reliability
+    best=int(np.argmax(scores))
+    output=[]
+    for i,frame in enumerate(frames):
+        contributions={"音声":.30*float(audio[i])*float(reliability[i]),
+                       "手首速度":.28*float(ns[i])*float(reliability[i]),
+                       "速度変化":.18*float(nc[i])*float(reliability[i]),
+                       "ボール変化":.16*float(nb[i])*float(reliability[i]),
+                       "手球近接":.08*float(proximity[i])*float(reliability[i])}
+        item=dict(frame); item.update({"right_speed":float(rs[i]),"left_speed":float(ls[i]),
+            "hand_change":float(hand_change[i]),"ball_change":float(ball_change[i]),
+            "proximity":float(proximity[i]),"audio_prior":float(audio[i]),
+            "normalized_hand_speed":float(ns[i]),"normalized_hand_change":float(nc[i]),
+            "normalized_ball_change":float(nb[i]),"track_reliability":float(reliability[i]),
+            "score_contributions":contributions,
+            "score":float(scores[i]),"selected":i==best})
+        output.append(item)
+    return output,best
+
+
 def detect_peaks(data, sensitivity=0.5, min_gap=1.0, wall_mode=False,
                  use_frequency_filter=True,return_rejected=False,frequency_mode=None):
     """ピーク検出。
@@ -1095,11 +1290,14 @@ def detect_peaks(data, sensitivity=0.5, min_gap=1.0, wall_mode=False,
         rejected=np.array(sorted(suppressed|gap_rejected,key=lambda i:times[i]),dtype=int)
         base=(np.array(filtered,dtype=int),len(rejected))
         return (*base,rejected) if return_rejected else base
+    gap_rejected=[]
     for idx in raw:
         t=times[idx]
         if t-last_t>=min_gap: filtered.append(idx); last_t=t
-    base=(np.array(filtered,dtype=int),0)
-    return (*base,np.array([],dtype=int)) if return_rejected else base
+        else:gap_rejected.append(idx)
+    rejected=np.array(gap_rejected,dtype=int)
+    base=(np.array(filtered,dtype=int),len(rejected))
+    return (*base,rejected) if return_rejected else base
 
 def grab_frame(video_path, time_sec):
     cap=cv2.VideoCapture(video_path)
@@ -1142,8 +1340,50 @@ def extract_thumbnails(video_path, peak_times, output_dir, progress_cb=None):
 # ══════════════════════════════════════════════
 #  DB
 # ══════════════════════════════════════════════
+def get_video_data_dir(video_path,create=True):
+    """Return `<video parent>/<video stem>/` for portable per-video artifacts."""
+    stem=os.path.splitext(os.path.basename(video_path or ""))[0]
+    folder=os.path.join(os.path.dirname(os.path.abspath(video_path or ".")),stem)
+    if create:os.makedirs(folder,exist_ok=True)
+    return folder
+
+
+def _copy_legacy_artifact(old_path,new_path):
+    """One-time, non-destructive migration used when the new artifact is absent."""
+    if os.path.exists(new_path) or not os.path.isfile(old_path):return new_path
+    try:
+        os.makedirs(os.path.dirname(new_path),exist_ok=True); shutil.copy2(old_path,new_path)
+    except Exception as e:print(f"legacy artifact migration failed: {old_path}: {e}")
+    return new_path
+
+
 def get_db_path(video_path):
-    return os.path.join(os.path.dirname(video_path),"tennis_labels.db")
+    new_path=os.path.join(get_video_data_dir(video_path),"tennis_labels.db")
+    legacy=os.path.join(os.path.dirname(video_path),"tennis_labels.db")
+    return _copy_legacy_artifact(legacy,new_path)
+
+
+def get_video_metadata_path(video_path):
+    return os.path.join(get_video_data_dir(video_path),"metadata.json")
+
+
+def load_video_extra_metadata(video_path):
+    new_path=get_video_metadata_path(video_path)
+    legacy=os.path.splitext(video_path)[0]+"_meta_extra.json"
+    source=new_path if os.path.exists(new_path) else legacy
+    if not os.path.exists(source):return {}
+    try:
+        with open(source,"r",encoding="utf-8") as f:data=json.load(f)
+        if source==legacy and not os.path.exists(new_path):
+            with open(new_path,"w",encoding="utf-8") as f:json.dump(data,f,ensure_ascii=False,indent=2)
+        return data
+    except Exception:return {}
+
+
+def save_video_extra_metadata(video_path,data):
+    path=get_video_metadata_path(video_path)
+    with open(path,"w",encoding="utf-8") as f:json.dump(data,f,ensure_ascii=False,indent=2)
+    return path
 
 def get_ground_truth_db_path():
     """Version-independent per-user database for verified hit points."""
@@ -1388,11 +1628,13 @@ def load_deleted_peaks(db_path, video_file):
 
 # ── v15: 解析結果キャッシュ ────────────────
 def get_analysis_cache_path(video_path, first_minute_only=False):
-    audio_dir=os.path.join(os.path.dirname(video_path),"audio")
+    audio_dir=os.path.join(get_video_data_dir(video_path),"audio")
     os.makedirs(audio_dir,exist_ok=True)
     stem=os.path.splitext(os.path.basename(video_path))[0]
     suffix="_first60_analysis.npz" if first_minute_only else "_analysis.npz"
-    return os.path.join(audio_dir,f"{stem}{suffix}")
+    new_path=os.path.join(audio_dir,f"{stem}{suffix}")
+    legacy=os.path.join(os.path.dirname(video_path),"audio",f"{stem}{suffix}")
+    return _copy_legacy_artifact(legacy,new_path)
 
 def save_analysis_cache(cache_path,data):
     try:
@@ -1413,6 +1655,47 @@ def load_analysis_cache(cache_path):
         return out
     except Exception as e:
         print("cache load failed:",e); return None
+
+
+def get_experiment_cache_path(video_path):
+    folder=os.path.join(get_video_data_dir(video_path),"experiment")
+    os.makedirs(folder,exist_ok=True)
+    return os.path.join(folder,"frame_validation.json")
+
+
+def _json_safe(value):
+    if isinstance(value,dict):return {str(k):_json_safe(v) for k,v in value.items() if k!="frame_jpeg"}
+    if isinstance(value,(list,tuple)):return [_json_safe(v) for v in value]
+    if isinstance(value,np.ndarray):return value.tolist()
+    if isinstance(value,(np.integer,np.floating)):return value.item()
+    if isinstance(value,np.bool_):return bool(value)
+    return value
+
+
+def save_experiment_cache(video_path,frames,best,target,corrected,fps):
+    try:
+        stat=os.stat(video_path)
+        data={"version":1,"video_size":int(stat.st_size),"video_mtime_ns":int(stat.st_mtime_ns),
+              "target_time":float(target.get("time",0)),"corrected":float(corrected),
+              "fps":float(fps),"best":int(best),"target":_json_safe(target),
+              "frames":_json_safe(frames),"saved_at":time.strftime("%Y-%m-%d %H:%M:%S")}
+        with open(get_experiment_cache_path(video_path),"w",encoding="utf-8") as f:
+            json.dump(data,f,ensure_ascii=False,indent=1)
+        return True
+    except Exception as e:print("experiment cache save failed:",e); return False
+
+
+def load_experiment_cache(video_path,target_time):
+    path=get_experiment_cache_path(video_path)
+    if not os.path.exists(path):return None
+    try:
+        with open(path,"r",encoding="utf-8") as f:data=json.load(f)
+        stat=os.stat(video_path)
+        if int(data.get("video_size",-1))!=int(stat.st_size):return None
+        if abs(float(data.get("target_time",-999))-float(target_time))>.001:return None
+        if not data.get("frames"):return None
+        return data
+    except Exception as e:print("experiment cache load failed:",e); return None
 
 def backfill_ground_truth_peak_energies(db_path=None):
     """Fill legacy verified rows from each video's existing audio cache."""
@@ -1486,7 +1769,9 @@ def update_registry_entry(video_path,**fields):
 def find_cp_thumb_path(video_path, rank):
     """指定 rank のサムネファイルを探す (拡張子合致しているもの。hit を優先)"""
     base=os.path.splitext(os.path.basename(video_path))[0]
-    thumb_dir=os.path.join(os.path.dirname(video_path),"1_thumbnails",base)
+    thumb_dir=os.path.join(get_video_data_dir(video_path),"thumbnails")
+    legacy=os.path.join(os.path.dirname(video_path),"1_thumbnails",base)
+    if not os.path.isdir(thumb_dir):thumb_dir=legacy
     if not os.path.isdir(thumb_dir): return None
     try: entries=os.listdir(thumb_dir)
     except Exception: return None
@@ -1500,7 +1785,9 @@ def find_cp_thumb_path(video_path, rank):
 def find_any_thumb(video_path):
     """サムネディレクトリ内の任意のサムネを返す (フォールバック用)"""
     base=os.path.splitext(os.path.basename(video_path))[0]
-    thumb_dir=os.path.join(os.path.dirname(video_path),"1_thumbnails",base)
+    thumb_dir=os.path.join(get_video_data_dir(video_path),"thumbnails")
+    legacy=os.path.join(os.path.dirname(video_path),"1_thumbnails",base)
+    if not os.path.isdir(thumb_dir):thumb_dir=legacy
     if not os.path.isdir(thumb_dir): return None
     try: entries=sorted(os.listdir(thumb_dir))
     except Exception: return None
@@ -1515,7 +1802,9 @@ def find_any_thumb(video_path):
 
 def count_yolo_outputs(video_path):
     """yolo/ ディレクトリの解析済CP数を集計 → (n_yolo, n_refined)"""
-    yolo_dir=os.path.join(os.path.dirname(video_path),"yolo")
+    yolo_dir=os.path.join(get_video_data_dir(video_path),"pose")
+    legacy=os.path.join(os.path.dirname(video_path),"yolo")
+    if not os.path.isdir(yolo_dir):yolo_dir=legacy
     if not os.path.isdir(yolo_dir): return (0,0)
     stem=os.path.splitext(os.path.basename(video_path))[0]
     try: entries=os.listdir(yolo_dir)
@@ -1531,7 +1820,9 @@ def count_yolo_outputs(video_path):
 
 def check_cp_yolo_status(video_path, rank):
     """指定 rank の YOLO 状態 → (has_yolo, has_refined)"""
-    yolo_dir=os.path.join(os.path.dirname(video_path),"yolo")
+    yolo_dir=os.path.join(get_video_data_dir(video_path),"pose")
+    legacy=os.path.join(os.path.dirname(video_path),"yolo")
+    if not os.path.isdir(yolo_dir):yolo_dir=legacy
     if not os.path.isdir(yolo_dir): return (False,False)
     stem=os.path.splitext(os.path.basename(video_path))[0]
     has_yolo=os.path.exists(os.path.join(yolo_dir,f"{stem}_cp{rank:02d}.json"))
@@ -1794,6 +2085,8 @@ class TennisApp(tk.Tk):
         self._hp_candidate_audit = []
         self._timeline_zoomed = False
         self._timeline_candidate_markers = []
+        self._experiment_frames = []
+        self._experiment_running = False
         try:self.noise_summary_var.set("音響混雑度: 解析中…")
         except Exception:pass
 
@@ -1874,6 +2167,8 @@ class TennisApp(tk.Tk):
         self._hp_candidate_audit = []
         self._timeline_zoomed = False
         self._timeline_candidate_markers = []
+        self._experiment_frames = []
+        self._experiment_running = False
         try:self.noise_summary_var.set("音響混雑度: 解析中…")
         except Exception:pass
         try:
@@ -2180,15 +2475,18 @@ class TennisApp(tk.Tk):
 
         self.tab_main    = tk.Frame(self.tabs,bg=BG)
         self.tab_hp_detail = tk.Frame(self.tabs,bg=BG)
+        self.tab_frame_validation = tk.Frame(self.tabs,bg=BG)
         self.tab_truth_summary = tk.Frame(self.tabs,bg=BG)
         self.tabs.add(self.tab_main,   text="ヒットポイント一覧")
         self.tabs.add(self.tab_hp_detail, text="ヒットポイント詳細")
-        self.tabs.add(self.tab_truth_summary, text="正解DBサマリ")
+        self.tabs.add(self.tab_frame_validation, text="フレーム検証（実験）")
+        if GROUND_TRUTH_ENABLED:self.tabs.add(self.tab_truth_summary, text="正解DBサマリ")
         self.tabs.bind("<<NotebookTabChanged>>",self._on_tab_changed)
 
         self._build_tab_main(self.tab_main)
         self._build_tab_hp_detail(self.tab_hp_detail)
-        self._build_tab_truth_summary(self.tab_truth_summary)
+        self._build_tab_frame_validation(self.tab_frame_validation)
+        if GROUND_TRUTH_ENABLED:self._build_tab_truth_summary(self.tab_truth_summary)
         # v63: 今回の画面はヒットポイント検出に限定する。
         self.refiner = None
 
@@ -2364,6 +2662,93 @@ class TennisApp(tk.Tk):
         tk.Label(parent,textvariable=self._hp_rejected_reason_var,bg="#fff4f4",fg="#8b1a1a",
                  font=_tk_font(9),anchor="w",justify="left",wraplength=1200
                  ).pack(fill="x",padx=14,pady=(0,5),ipadx=6,ipady=3)
+
+    def _build_tab_frame_validation(self,parent):
+        """Experimental, inspectable full-frame contact validation screen."""
+        head=tk.Frame(parent,bg=PANEL); head.pack(fill="x",padx=8,pady=(8,4))
+        self._experiment_status=tk.StringVar(value="音声解析後、壁音除外後のサウンド1位を自動解析します")
+        tk.Label(head,text="サウンド1位・全フレーム検証",bg=PANEL,fg=ACCENT2,
+                 font=_tk_font(14,bold=True)).pack(side="left",padx=8,pady=6)
+        tk.Button(head,text="再解析",bg=ACCENT2,fg="white",relief="flat",
+                  font=_tk_font(10,bold=True),command=self._start_experiment_validation
+                  ).pack(side="right",padx=6,ipadx=10,ipady=3)
+        tk.Label(head,textvariable=self._experiment_status,bg=PANEL,fg=TEXT,
+                 font=_tk_font(9),anchor="w").pack(side="left",fill="x",expand=True,padx=12)
+
+        self._experiment_autocrop=tk.BooleanVar(value=True)
+        tk.Checkbutton(head,text="自動クロップ ON/OFF",variable=self._experiment_autocrop,
+                       bg=PANEL,fg=TEXT,selectcolor=DARK2,font=_tk_font(9,bold=True),
+                       command=self._rerender_experiment_images).pack(side="right",padx=8)
+        self._experiment_coordinate_mode=tk.StringVar(value="relative")
+        self._experiment_coordinate_button=tk.Button(head,text="座標: 相対",bg=DARK2,fg=TEXT,
+                  relief="flat",font=_tk_font(9,bold=True),command=self._toggle_experiment_coordinates)
+        self._experiment_coordinate_button.pack(side="right",padx=4,ipadx=6)
+        split=tk.PanedWindow(parent,orient="horizontal",bg=BG,sashwidth=7,
+                             sashrelief="flat",showhandle=False)
+        self._experiment_split=split; self._experiment_split_initialized=False
+        split.pack(fill="both",expand=True,padx=8,pady=(2,5))
+        graph=tk.Frame(split,bg="white",width=600); split.add(graph,minsize=420,stretch="always")
+        right=tk.Frame(split,bg=BG,width=600); split.add(right,minsize=420,stretch="always")
+        split.bind("<Configure>",lambda e:self._initialize_experiment_split())
+        self._experiment_fig,self._experiment_axes=plt.subplots(2,1,sharex=True,figsize=(11,4.4))
+        self._experiment_fig.patch.set_facecolor("white")
+        self._experiment_fig.subplots_adjust(left=.07,right=.98,top=.93,bottom=.13,hspace=.22)
+        self._experiment_chart=FigureCanvasTkAgg(self._experiment_fig,master=graph)
+        self._experiment_chart.get_tk_widget().pack(fill="both",expand=True)
+
+        large_box=tk.Frame(right,bg="#173128"); large_box.pack(fill="both",expand=True)
+        self._experiment_large_canvas=tk.Canvas(large_box,bg="#173128",highlightthickness=0)
+        large_x=tk.Scrollbar(large_box,orient="horizontal",command=self._experiment_large_canvas.xview)
+        large_y=tk.Scrollbar(large_box,orient="vertical",command=self._experiment_large_canvas.yview)
+        self._experiment_large_canvas.configure(xscrollcommand=large_x.set,yscrollcommand=large_y.set)
+        large_y.pack(side="right",fill="y"); large_x.pack(side="bottom",fill="x")
+        self._experiment_large_canvas.pack(fill="both",expand=True)
+        self._experiment_large_canvas.bind("<Configure>",lambda e:self._render_experiment_large())
+        self._experiment_confidence_var=tk.StringVar(value="Confidence\nRW   --\nLW   --\nBall --")
+        self._experiment_confidence_label=tk.Label(
+            self._experiment_large_canvas,textvariable=self._experiment_confidence_var,
+            bg="#ffffff",fg="#000000",font=("Arial",20,"bold"),justify="left",
+            anchor="w",relief="solid",bd=2,padx=8,pady=5)
+        # `place` is viewport-relative, unlike Canvas items, so scrolling the
+        # image never clips or moves this diagnostic overlay.
+        self._experiment_confidence_label.place(x=8,rely=1.0,y=-8,anchor="sw")
+
+        photo_outer=tk.Frame(right,bg=BG,height=205); photo_outer.pack(fill="x",pady=(5,0))
+        self._experiment_photo_canvas=tk.Canvas(photo_outer,bg="#173128",height=178,
+                                                 highlightthickness=0)
+        sx=tk.Scrollbar(photo_outer,orient="horizontal",command=self._experiment_photo_canvas.xview)
+        self._experiment_photo_canvas.configure(xscrollcommand=sx.set)
+        self._experiment_photo_canvas.pack(fill="x",expand=True); sx.pack(fill="x")
+        self._experiment_photo_inner=tk.Frame(self._experiment_photo_canvas,bg="#173128")
+        self._experiment_photo_window=self._experiment_photo_canvas.create_window(
+            (0,0),window=self._experiment_photo_inner,anchor="nw")
+        self._experiment_photo_inner.bind("<Configure>",lambda e:
+            self._experiment_photo_canvas.configure(scrollregion=self._experiment_photo_canvas.bbox("all")))
+        self._experiment_photo_refs=[]; self._experiment_large_ref=None
+        self._experiment_selected_frame=0; self._experiment_crop_rect=None
+        self._experiment_metrics=tk.StringVar(value="判定式: 音声30% + 手首速度28% + 速度変化18% + ボール変化16% + 近接8%")
+        tk.Label(parent,textvariable=self._experiment_metrics,bg=PANEL2,fg=TEXT,
+                 font=("Meiryo UI",20,"bold"),anchor="w",justify="left",wraplength=1500
+                 ).pack(fill="x",padx=8,pady=(0,7),ipadx=9,ipady=7)
+        self._experiment_quality_reason=tk.StringVar(value="×印: 低Confidenceまたは前後の軌跡から外れた点")
+        tk.Label(parent,textvariable=self._experiment_quality_reason,bg="#fff8e8",fg="#7a3f00",
+                 font=_tk_font(10,bold=True),anchor="w",justify="left",wraplength=1500
+                 ).pack(fill="x",padx=8,pady=(0,7),ipadx=8,ipady=4)
+
+    def _initialize_experiment_split(self):
+        if self._experiment_split_initialized:return
+        width=self._experiment_split.winfo_width()
+        if width<850:return
+        self._experiment_split.sash_place(0,width//2,1)
+        self._experiment_split_initialized=True
+
+    def _toggle_experiment_coordinates(self):
+        mode="absolute" if self._experiment_coordinate_mode.get()=="relative" else "relative"
+        self._experiment_coordinate_mode.set(mode)
+        self._experiment_coordinate_button.configure(text="座標: 絶対" if mode=="absolute" else "座標: 相対",
+                                                     bg=ACCENT2 if mode=="absolute" else DARK2,
+                                                     fg="white" if mode=="absolute" else TEXT)
+        self._draw_experiment_graphs()
 
     def _build_tab_truth_summary(self,parent):
         head=tk.Frame(parent,bg=PANEL); head.pack(fill="x",padx=12,pady=(10,6))
@@ -2622,7 +3007,7 @@ class TennisApp(tk.Tk):
             messagebox.showinfo("CP選択","動画を読み込んでください"); return
         path=self.video_path.get()
         stem=os.path.splitext(os.path.basename(path))[0]
-        thumb_dir=os.path.join(os.path.dirname(path),"1_thumbnails",stem)
+        thumb_dir=os.path.join(get_video_data_dir(path),"thumbnails")
 
         win=tk.Toplevel(self,bg=PANEL)
         win.title("ヒットポイントを選択"); win.geometry("760x520")
@@ -3043,13 +3428,7 @@ class TennisApp(tk.Tk):
         vf = os.path.basename(path)
         meta = load_video_meta(db_path, vf) or {}
         # v34: 追加メタデータの復元
-        saved_extra = {}
-        try:
-            extra_path = os.path.splitext(path)[0] + "_meta_extra.json"
-            if os.path.exists(extra_path):
-                with open(extra_path, "r", encoding="utf-8") as f:
-                    saved_extra = json.load(f)
-        except Exception: pass
+        saved_extra=load_video_extra_metadata(path)
         # v96: カメラ方向は保存済み設定またはユーザー入力のみを使用する。
         direction_estimate={"direction":"不明・複数","confidence":0.0,"reason":"自動推定なし"}
         estimated_dir="不明・複数"
@@ -3108,12 +3487,9 @@ class TennisApp(tk.Tk):
                        variable=first_minute_var,bg=PANEL,fg=ACCENT2,
                        activebackground=PANEL,selectcolor=DARK2,
                        font=_tk_font(10,bold=True)).pack(anchor="w",pady=(8,0),padx=8)
-        # v40: プロジェクトフォルダ取込
-        import_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(right, text="プロジェクトフォルダに取込 (動画+解析データを集約管理)",
-                       variable=import_var, bg=PANEL, fg=TEXT,
-                       activebackground=PANEL, selectcolor=DARK2,
-                       font=_tk_font(9)).pack(anchor="w", pady=(8,2), padx=8)
+        tk.Label(right,text="保存先: 動画と同じ場所の同名フォルダ（動画本体はコピーしません）",
+                 bg=PANEL,fg=ACCENT2,font=_tk_font(9,bold=True)
+                 ).pack(anchor="w",pady=(8,2),padx=8)
         # メモ
         tk.Label(right, text="メモ:", bg=PANEL, fg=TEXT,
                  font=_tk_font(10, True)).pack(anchor="w", pady=(8,2))
@@ -3161,20 +3537,11 @@ class TennisApp(tk.Tk):
                 "camera_estimate_reason": direction_estimate.get("reason",""),
                 "camera_direction_corrected": cam_var.get()!=estimated_dir,
             }
-            # v34: 追加メタデータをJSON保存 (次回復元用)
+            # Portable per-video sidecar metadata (next load restores settings).
             try:
-                extra_path = os.path.splitext(path)[0] + "_meta_extra.json"
-                with open(extra_path, "w", encoding="utf-8") as f:
-                    json.dump(self._video_meta_extra, f, ensure_ascii=False)
+                save_video_extra_metadata(path,self._video_meta_extra)
             except Exception: pass
-            # v40: プロジェクトフォルダに取込
-            load_path = path
-            if import_var.get():
-                imported = self._import_to_project(path)
-                if imported:
-                    load_path = imported
-                    self.video_path.set(imported)
-            self._proceed_video_load(load_path)
+            self._proceed_video_load(path)
         tk.Button(btn_frame, text="OK - 解析開始", bg=ACCENT2, fg="white",
                   font=_tk_font(11, True), cursor="hand2",
                   command=_on_ok).pack(side="right", padx=4, ipady=4, ipadx=16)
@@ -3393,8 +3760,8 @@ class TennisApp(tk.Tk):
 
         def _worker():
             try:
-                base=os.path.dirname(path); stem=os.path.splitext(os.path.basename(path))[0]
-                audio_dir=os.path.join(base,"audio"); os.makedirs(audio_dir,exist_ok=True)
+                stem=os.path.splitext(os.path.basename(path))[0]
+                audio_dir=os.path.join(get_video_data_dir(path),"audio"); os.makedirs(audio_dir,exist_ok=True)
                 audio_path=os.path.join(audio_dir,f"{stem}_first60.mp3" if first_minute else f"{stem}.mp3")
                 self.after(0,lambda: self._set_progress(5,"音声抽出中…"))
                 extract_audio(path,audio_path,60.0 if first_minute else None)
@@ -3412,10 +3779,18 @@ class TennisApp(tk.Tk):
 
     def _finish_analysis(self):
         self._update_noise_summary()
-        # v77: 音声解析が終わった時点で波形と仮候補を即表示する。
+        # Keep every threshold-crossing peak visible, but limit the lightweight
+        # pose pass to the strongest three to avoid multiplying model cost.
         candidates=self._current_audio_candidates()
+        self._experiment_all_audio_candidates=list(candidates)
         self._show_provisional_audio_candidates(candidates)
-        self._start_fast_hp_pose_filter(candidates)
+        top=select_sound_top_candidates(candidates,self.data,self.audio_band_mode.get(),3)
+        if not top:
+            self._start_fast_hp_pose_filter([])
+            return
+        self.status_var.set(
+            f"実験モード: 音声候補{len(candidates)}件から上位{len(top)}件だけ軽量姿勢確認します")
+        self._start_fast_hp_pose_filter(top)
 
     def _current_audio_candidates(self):
         if self.data is None:return []
@@ -3425,9 +3800,10 @@ class TennisApp(tk.Tk):
             self.data,self.sensitivity.get(),gap,wall_mode=wall,
             use_frequency_filter=bool(self.audio_filter_enabled.get()),return_rejected=True,
             frequency_mode=self.audio_band_mode.get())
+        reject_reason="wall_gap" if wall else "min_gap"
         self._wall_gap_rejected_candidates=[
             {"idx":int(i),"time":float(self.data["times"][i]),"selected":False,
-             "reason":"wall_gap","backend":"audio"} for i in rejected]
+             "reason":reject_reason,"backend":"audio"} for i in rejected]
         return [{"idx":int(i),"time":float(self.data["times"][i])} for i in indices]
 
     def _show_provisional_audio_candidates(self,candidates):
@@ -3714,7 +4090,8 @@ class TennisApp(tk.Tk):
                         if self._gen != gen: return
                         t=cand["time"]
                         hit_t=max(0.0,t-sound_delay)
-                        coarse=[detect_at(det,max(0.0,min(duration,hit_t+d)),need_ball=True)
+                        # Ball YOLO runs later on every frame for the one winner.
+                        coarse=[detect_at(det,max(0.0,min(duration,hit_t+d)),need_ball=False)
                                 for d in HP_POSE_SAMPLE_OFFSETS]
                         verdict=self._classify_hp_pose_triplet(coarse)
                         audit_item={"time":float(t),"idx":int(cand["idx"]),
@@ -3784,9 +4161,315 @@ class TennisApp(tk.Tk):
         threading.Thread(target=_worker,daemon=True).start()
 
     def _finish_fast_hp_pose_filter(self,accepted,rejected,audit):
-        self._hp_candidate_audit=list(audit)+list(
+        all_audio=list(getattr(self,"_experiment_all_audio_candidates",[]))
+        processed={(int(a.get("idx",-1)),round(float(a.get("time",0)),6)) for a in audit}
+        unverified=[]
+        for cand in all_audio:
+            key=(int(cand.get("idx",-1)),round(float(cand.get("time",0)),6))
+            if key not in processed:
+                unverified.append({**cand,"selected":None,"verified":False,
+                                   "reason":"not_top3","backend":"audio"})
+        target=select_motion_validation_target(accepted,self.data,self.audio_band_mode.get())
+        target_key=None if target is None else (
+            int(target.get("idx",-1)),round(float(target.get("time",0)),6))
+        merged=[]
+        for item in audit:
+            current=dict(item)
+            key=(int(current.get("idx",-1)),round(float(current.get("time",0)),6))
+            if target_key is not None and key==target_key:
+                current.update({"selected":True,"verified":True,
+                                "reason":"full_frame_target","full_frame_target":True})
+            elif current.get("selected"):
+                current.update({"selected":None,"verified":True,
+                                "reason":"top3_motion_not_selected"})
+            merged.append(current)
+        self._hp_candidate_audit=merged+unverified+list(
             getattr(self,"_wall_gap_rejected_candidates",[]))
         self._refresh_peaks(refined_candidates=accepted,pose_rejected=rejected)
+        self.after(80,lambda t=target:self._start_experiment_validation([] if t is None else [t]))
+
+    def _start_experiment_validation(self,candidates=None):
+        if self._experiment_running or self.data is None:return
+        candidates=list(candidates if candidates is not None else self.peaks)
+        target=select_motion_validation_target(candidates,self.data,self.audio_band_mode.get())
+        if target is None:
+            self._experiment_status.set("解析対象なし（壁音除外後に採用候補がありません）")
+            return
+        path=self.video_path.get().strip(); gen=self._gen
+        if not path or not os.path.exists(path):return
+        self._experiment_running=True
+        sound_pick=select_sound_rank_one([target],self.data,self.audio_band_mode.get())
+        target.setdefault("sound_energy",0.0 if sound_pick is None else sound_pick["sound_energy"])
+        cached=load_experiment_cache(path,float(target["time"]))
+        if cached is not None:
+            self._experiment_status.set("保存済み全フレーム解析を復元中…")
+            def _restore_worker():
+                cap=None
+                try:
+                    frames=list(cached["frames"]); cap=cv2.VideoCapture(path)
+                    for frame in frames:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES,int(frame["frame_no"])); ok,bgr=cap.read()
+                        if ok:
+                            good,encoded=cv2.imencode(".jpg",bgr,[cv2.IMWRITE_JPEG_QUALITY,90])
+                            frame["frame_jpeg"]=encoded.tobytes() if good else None
+                    self.after(0,lambda:self._show_experiment_results(
+                        frames,int(cached["best"]),cached.get("target",target),
+                        float(cached["corrected"]),float(cached["fps"]),restored=True))
+                except Exception as e:
+                    err=str(e); self.after(0,lambda message=err:self._experiment_status.set(f"保存結果の復元エラー: {message}"))
+                finally:
+                    if cap is not None:cap.release()
+                    self._experiment_running=False
+            threading.Thread(target=_restore_worker,daemon=True).start()
+            return
+        self._experiment_status.set(
+            f"準備中: 音声上位3件の手首移動最大 {float(target['time']):.3f}s / energy {target['sound_energy']:.3f}")
+
+        def _worker():
+            cap=None
+            try:
+                import onnxruntime as ort
+                from rtmlib import Body
+                from ultralytics import YOLO
+                device="cuda" if "CUDAExecutionProvider" in ort.get_available_providers() else "cpu"
+                pose=Body(to_openpose=False,mode="lightweight",backend="onnxruntime",device=device)
+                ball_model=YOLO("yolov8n.pt")
+                cap=cv2.VideoCapture(path); fps=cap.get(cv2.CAP_PROP_FPS) or 30.0
+                frame_count=int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                try:distance=float(self.camera_dist.get())
+                except Exception:distance=3.0
+                corrected=max(0.0,float(target["time"])-distance/SOUND_SPEED)
+                first=max(0,int(math.floor((corrected-.2)*fps)))
+                last=min(max(0,frame_count-1),int(math.ceil((corrected+.2)*fps)))
+                frames=[]; total=max(1,last-first+1)
+                for order,frame_no in enumerate(range(first,last+1),1):
+                    if self._gen!=gen:return
+                    cap.set(cv2.CAP_PROP_POS_FRAMES,frame_no); ok,bgr=cap.read()
+                    if not ok:continue
+                    h,w=bgr.shape[:2]; keypoints,scores=pose(bgr)
+                    kps=rtmpose_result_to_coco(keypoints,scores,w,h)
+                    obj=ball_model.predict(bgr,verbose=False,conf=.06,imgsz=1280,classes=[32])[0]
+                    if obj.boxes is not None and len(obj.boxes)>0:
+                        confs=obj.boxes.conf.cpu().numpy(); boxes=obj.boxes.xyxy.cpu().numpy()
+                        wrists=[kps.get("9"),kps.get("10")]
+                        centers=np.column_stack(((boxes[:,0]+boxes[:,2])*.5/w,
+                                                 (boxes[:,1]+boxes[:,3])*.5/h))
+                        valid_wrists=[np.asarray(v[:2]) for v in wrists if v and float(v[2])>=.15]
+                        if valid_wrists:
+                            d=np.min(np.stack([np.linalg.norm(centers-wr,axis=1)
+                                               for wr in valid_wrists]),axis=0)
+                            bi=int(np.argmin(d-.06*confs))
+                        else:bi=int(np.argmax(confs))
+                        box=boxes[bi]; kps["18"]=[float((box[0]+box[2])*.5/w),
+                            float((box[1]+box[3])*.5/h),float(confs[bi])]
+                    good,encoded=cv2.imencode(".jpg",bgr,[cv2.IMWRITE_JPEG_QUALITY,90])
+                    frames.append({"time":frame_no/fps,"frame_no":frame_no,"kps":kps,
+                                   "frame_jpeg":encoded.tobytes() if good else None})
+                    self.after(0,lambda o=order,t=total:self._experiment_status.set(
+                        f"全フレーム解析中… {o}/{t}"))
+                frames=build_person_relative_tracks(frames,min_conf=.05)
+                frames=mark_experiment_track_outliers(frames)
+                scored,best=score_full_frame_hit_candidates(frames,corrected)
+                if self._gen==gen:self.after(0,lambda:self._show_experiment_results(
+                    scored,best,target,corrected,fps))
+            except Exception as e:
+                err=str(e); print("[実験フレーム検証エラー]",err)
+                self.after(0,lambda e=err:self._experiment_status.set(f"解析エラー: {e}"))
+            finally:
+                if cap is not None:cap.release()
+                self._experiment_running=False
+        threading.Thread(target=_worker,daemon=True).start()
+
+    def _show_experiment_results(self,frames,best,target,corrected,fps,restored=False):
+        self._experiment_frames=list(frames); self._experiment_photo_refs=[]
+        if not frames or best is None:
+            self._experiment_status.set("解析できるフレームがありません")
+            return
+        self._experiment_audio_center=float(corrected)
+        self._experiment_selected_frame=int(best)
+        self._experiment_auto_frame=int(best)
+        xs=[]; ys=[]
+        for frame in frames:
+            for value in frame.get("kps",{}).values():
+                try:
+                    if float(value[2])>=.05:xs.append(float(value[0])); ys.append(float(value[1]))
+                except Exception:pass
+        if xs and ys:
+            pad_x=max(.04,(max(xs)-min(xs))*.16); pad_y=max(.04,(max(ys)-min(ys))*.16)
+            self._experiment_crop_rect=(max(0,min(xs)-pad_x),max(0,min(ys)-pad_y),
+                                        min(1,max(xs)+pad_x),min(1,max(ys)+pad_y))
+        else:self._experiment_crop_rect=None
+        self._rerender_experiment_images()
+        self._draw_experiment_graphs()
+        chosen=frames[best]
+        self._experiment_status.set(
+            f"{'保存結果を復元' if restored else '完了'}: 上位3件の手首移動最大 {float(target['time']):.3f}s → 音速補正 {corrected:.3f}s / 自動候補 F{chosen['frame_no']} {chosen['time']:.3f}s")
+        self._update_experiment_diagnostics()
+        if not restored:save_experiment_cache(self.video_path.get(),frames,best,target,corrected,fps)
+
+    def _experiment_absolute_tracks(self,frame):
+        kps=frame.get("kps",{}); valid=lambda v:bool(v and len(v)>=3 and float(v[2])>=.05)
+        tracks={}
+        for name,ki in (("右手首","10"),("左手首","9"),("ボール","18")):
+            value=kps.get(ki)
+            if valid(value):tracks[name]=[float(value[0]),float(value[1])]
+        torso=[v[:2] for v in (kps.get("5"),kps.get("6"),kps.get("11"),kps.get("12")) if valid(v)]
+        if torso:tracks["重心"]=np.mean(torso,axis=0).tolist()
+        return tracks
+
+    def _draw_experiment_graphs(self):
+        if not getattr(self,"_experiment_frames",None):return
+        frames=self._experiment_frames; center=float(getattr(self,"_experiment_audio_center",frames[0]["time"]))
+        rel_times=np.asarray([float(f["time"])-center for f in frames])
+        mode=self._experiment_coordinate_mode.get()
+        source=[self._experiment_absolute_tracks(f) for f in frames] if mode=="absolute" else [f.get("tracks",{}) for f in frames]
+        colors={"右手首":"#e74c3c","左手首":"#2980b9","ボール":"#d19a00","重心":"#23835b"}
+        titles=("X 絶対位置（画像左=0、右=1）","Y 絶対位置（画像上=0、下=1）") if mode=="absolute" else (
+                "X 相対位置（腰中心=0、右＋ / 肩幅単位）","Y 相対位置（腰中心=0、下＋ / 肩幅単位）")
+        auto=next((i for i,f in enumerate(frames) if f.get("selected")),0)
+        selected=max(0,min(int(getattr(self,"_experiment_selected_frame",auto)),len(frames)-1))
+        for axis,coord,title in zip(self._experiment_axes,(0,1),titles):
+            axis.clear(); axis.set_facecolor("white")
+            for name,color in colors.items():
+                values=[track.get(name,[np.nan,np.nan])[coord] for track in source]
+                axis.plot(rel_times,values,"o-",label=name,color=color,linewidth=1.5,markersize=4)
+                bad=[]
+                for i,frame in enumerate(frames):
+                    if name in frame.get("track_warnings",{}) and np.isfinite(values[i]):
+                        bad.append(i)
+                if bad:
+                    axis.scatter(rel_times[bad],[values[i] for i in bad],marker="x",s=80,
+                                 linewidths=2.3,color="#111111",zorder=8,
+                                 label="信頼性注意" if name=="右手首" else None)
+            axis.axvline(0,color="#777",linestyle="--",linewidth=1,label="音声補正時刻")
+            axis.axvline(rel_times[auto],color="#ff8c00",linewidth=2,label="自動判定")
+            axis.axvline(rel_times[selected],color="#1976d2",linewidth=1.8,
+                         linestyle=(0,(3,3)),label="写真選択")
+            axis.set_ylabel(title); axis.grid(True,alpha=.25)
+            axis.legend(loc="lower left",ncol=2,fontsize=8)
+            axis.tick_params(axis="x",which="both",labelbottom=True)
+            axis.set_xlabel("音声補正時刻からの秒数")
+        self._experiment_chart.draw_idle()
+
+    def _experiment_annotated_image(self,frame):
+        raw=cv2.imdecode(np.frombuffer(frame["frame_jpeg"],dtype=np.uint8),cv2.IMREAD_COLOR)
+        image=Image.fromarray(cv2.cvtColor(raw,cv2.COLOR_BGR2RGB)); iw,ih=image.size
+        draw=ImageDraw.Draw(image,"RGBA"); radius=max(5,int(min(iw,ih)*.009))
+        for key,value in frame.get("kps",{}).items():
+            try:
+                ki=int(key)
+                if float(value[2])>=.05:
+                    _draw_kp_shape_pil(draw,KP_SHAPES[ki],float(value[0])*iw,
+                                       float(value[1])*ih,radius,KP_COLORS[ki],"white",1)
+            except Exception:pass
+        valid=lambda v:bool(v and len(v)>=3 and float(v[2])>=.05)
+        torso=[v[:2] for v in (frame.get("kps",{}).get("5"),frame.get("kps",{}).get("6"),
+                                frame.get("kps",{}).get("11"),frame.get("kps",{}).get("12")) if valid(v)]
+        if torso:
+            gx,gy=np.mean(torso,axis=0); gx*=iw; gy*=ih
+            r=max(radius+2,int(min(iw,ih)*.012)); color="#075c36"
+            draw.line((gx-r,gy-r,gx+r,gy+r),fill=color,width=max(3,r//3))
+            draw.line((gx-r,gy+r,gx+r,gy-r),fill=color,width=max(3,r//3))
+        if self._experiment_autocrop.get() and self._experiment_crop_rect:
+            x1,y1,x2,y2=self._experiment_crop_rect
+            image=image.crop((int(x1*iw),int(y1*ih),int(x2*iw),int(y2*ih)))
+        return image
+
+    def _rerender_experiment_images(self):
+        if not hasattr(self,"_experiment_photo_inner"):return
+        for child in self._experiment_photo_inner.winfo_children():child.destroy()
+        self._experiment_photo_refs=[]
+        self._experiment_thumbnail_cards=[]
+        for i,frame in enumerate(self._experiment_frames):
+            selected=i==self._experiment_selected_frame; bg="#fff3be" if selected else PANEL2
+            card=tk.Frame(self._experiment_photo_inner,bg=bg,bd=2,relief="solid")
+            card.pack(side="left",padx=3,pady=3)
+            self._experiment_thumbnail_cards.append(card)
+            rel=float(frame["time"])-float(getattr(self,"_experiment_audio_center",frame["time"]))
+            tk.Label(card,text=f"F{frame['frame_no']} {rel:+.3f}s  KP{frame.get('pose_points',0)}",
+                     bg=bg,fg=GOLD if selected else TEXT,font=_tk_font(8,bold=True)).pack(fill="x")
+            image=self._experiment_annotated_image(frame); image.thumbnail((150,115),Image.LANCZOS)
+            photo=ImageTk.PhotoImage(image); self._experiment_photo_refs.append(photo)
+            label=tk.Label(card,image=photo,bg=bg,cursor="hand2"); label.pack()
+            label.bind("<Button-1>",lambda e,index=i:self._select_experiment_frame(index))
+            borrowed=" 基準補間" if frame.get("reference_borrowed") else ""
+            tk.Label(card,text=f"score {frame['score']:.3f}{borrowed}",bg=bg,fg=TEXT,
+                     font=("Consolas",8)).pack(fill="x")
+        self._render_experiment_large()
+        self.after_idle(lambda:self._center_experiment_thumbnail(self._experiment_selected_frame))
+
+    def _center_experiment_thumbnail(self,index):
+        """Keep the selected thumbnail at the horizontal viewport center."""
+        if not hasattr(self,"_experiment_thumbnail_cards") or not self._experiment_thumbnail_cards:return
+        index=max(0,min(int(index),len(self._experiment_thumbnail_cards)-1))
+        canvas=self._experiment_photo_canvas; canvas.update_idletasks()
+        card=self._experiment_thumbnail_cards[index]
+        content=max(1,self._experiment_photo_inner.winfo_width())
+        viewport=max(1,canvas.winfo_width())
+        desired=card.winfo_x()+card.winfo_width()/2-viewport/2
+        desired=float(np.clip(desired,0,max(0,content-viewport)))
+        canvas.xview_moveto(desired/content)
+
+    def _select_experiment_frame(self,index):
+        self._experiment_selected_frame=max(0,min(int(index),len(self._experiment_frames)-1))
+        self._rerender_experiment_images()
+        self._draw_experiment_graphs()
+        self._update_experiment_diagnostics()
+
+    def _update_experiment_diagnostics(self):
+        if not getattr(self,"_experiment_frames",None):return
+        selected=max(0,min(int(self._experiment_selected_frame),len(self._experiment_frames)-1))
+        auto=max(0,min(int(getattr(self,"_experiment_auto_frame",selected)),len(self._experiment_frames)-1))
+        frame=self._experiment_frames[selected]; winner=self._experiment_frames[auto]
+        parts=winner.get("score_contributions",{})
+        ordered=sorted(parts.items(),key=lambda pair:pair[1],reverse=True)
+        contribution_text="  ".join(f"{name} {value:.3f}" for name,value in ordered)
+        main="・".join(name for name,_ in ordered[:2]) if ordered else "算出不能"
+        self._experiment_metrics.set(
+            f"自動判定 F{winner['frame_no']} score={winner['score']:.3f}：寄与上位は {main}\n"
+            f"加点内訳（合計=score）  {contribution_text}\n"
+            f"写真選択 F{frame['frame_no']} {frame['time']:.3f}s  score={frame['score']:.3f}")
+        warnings=frame.get("track_warnings",{})
+        if warnings:
+            detail=" / ".join(f"{name}: {reason}" for name,reason in warnings.items())
+            self._experiment_quality_reason.set(f"選択フレームの×理由　{detail}")
+        else:
+            self._experiment_quality_reason.set(
+                "選択フレームに×はありません。×＝Confidence 15%未満、または前後どちらの直線軌跡にも合わない孤立点")
+
+    def _render_experiment_large(self):
+        if not hasattr(self,"_experiment_large_canvas") or not self._experiment_frames:return
+        index=max(0,min(self._experiment_selected_frame,len(self._experiment_frames)-1))
+        frame=self._experiment_frames[index]; image=self._experiment_annotated_image(frame)
+        cv=self._experiment_large_canvas; cv.delete("all")
+        vw=max(500,cv.winfo_width()); vh=max(330,cv.winfo_height())
+        scale=max(.1,(vh-42)/max(image.height,1))
+        size=(max(1,int(image.width*scale)),max(1,int(image.height*scale)))
+        image=image.resize(size,Image.LANCZOS)
+        self._experiment_large_ref=ImageTk.PhotoImage(image)
+        x0=max(0,(vw-size[0])//2); y0=28+max(0,(vh-32-size[1])//2)
+        cv.create_image(x0,y0,image=self._experiment_large_ref,anchor="nw")
+        borrowed="（身体基準は前後フレームから補間）" if frame.get("reference_borrowed") else ""
+        cv.create_text(8,5,text=f"F{frame['frame_no']}  {frame['time']:.3f}s  KP {frame.get('pose_points',0)} {borrowed}",
+                       fill="white",font=_tk_font(10,bold=True),anchor="nw")
+        self._experiment_confidence_var.set(experiment_confidence_text(frame.get("kps",{})))
+        self._experiment_confidence_label.lift()
+        total_w=max(vw,size[0]); total_h=max(vh,size[1]+32)
+        cv.configure(scrollregion=(0,0,total_w,total_h))
+        # Default viewport follows the player's median KP position. The user can
+        # still move away with the horizontal/vertical scrollbars.
+        person=[]
+        for key,value in frame.get("kps",{}).items():
+            try:
+                if int(key)<=16 and float(value[2])>=.05:person.append((float(value[0]),float(value[1])))
+            except Exception:pass
+        if person and size[0]>vw:
+            px=float(np.median([p[0] for p in person]))
+            if self._experiment_autocrop.get() and self._experiment_crop_rect:
+                x1,_,x2,_=self._experiment_crop_rect; px=(px-x1)/max(x2-x1,1e-6)
+            start=np.clip(px*size[0]-vw/2,0,max(0,size[0]-vw))
+            cv.xview_moveto(float(start/max(total_w,1)))
+        else:cv.xview_moveto(0)
 
     def _render_hp_detail_photo(self,canvas,sample,slot):
         canvas.delete("all"); path=self.video_path.get()
@@ -3905,8 +4588,7 @@ class TennisApp(tk.Tk):
             x=pl+(ct-lo)/4*(w-pl-pr)
             top=max(float(np.max(energy)),1e-6)
             y=h-pb-float(energy[j])/top*(h-pt-pb)
-            selected=cand.get("selected")
-            color="#8a958e" if selected is None else ("#26c281" if selected else RED)
+            color=candidate_marker_color(cand)
             cv.create_oval(x-5,y-5,x+5,y+5,fill=color,outline="white",width=1)
             cv.create_text(x,y-8,text=str(number),fill=color,
                            font=_tk_font(8,bold=True),anchor="s")
@@ -4112,9 +4794,7 @@ class TennisApp(tk.Tk):
         # サムネイル抽出 (検出順=rank順) — 進捗付き
         # v24 後修正: 紙芝居は廃止 (画面バタつき・0%固まり問題の原因)
         #            シンプルな進捗テキストのみ
-        base=os.path.dirname(path)
-        thumb_dir=os.path.join(base,"1_thumbnails",
-                               os.path.splitext(os.path.basename(path))[0])
+        thumb_dir=os.path.join(get_video_data_dir(path),"thumbnails")
         def _cb(done,total,thumb_path=None):
             pct=70 + 28*done/max(1,total)
             self.after(0,lambda: self._set_progress(
@@ -5062,8 +5742,7 @@ class TennisApp(tk.Tk):
                 j=int(np.argmin(np.abs(np.asarray(times)-ct))) if len(times) else 0
                 level=float(combined[j]) if len(combined)>j else 0.5
                 y=max(13,min(ch-10,ch-level*(ch-22)-5))
-                selected=cand.get("selected")
-                color="#8a958e" if selected is None else ("#26c281" if selected else "#ff5252")
+                color=candidate_marker_color(cand)
                 tl.create_oval(x-6,y-6,x+6,y+6,fill=color,outline="white",width=1)
                 self._timeline_candidate_markers.append({"x":x,"y":y,"candidate":cand})
 
@@ -5105,16 +5784,24 @@ class TennisApp(tk.Tk):
         for marker in self._timeline_candidate_markers:
             if (event.x-marker["x"])**2+(event.y-marker["y"])**2<=100:
                 cand=marker["candidate"]
-                if cand.get("selected"): return
                 reason=cand.get("reason","unknown")
                 if reason=="no_swing":
                     travel=cand.get("travel"); angle=cand.get("arm_change")
                     text="不採用: スイング動作不足"
                     if travel is not None:text+=f"\n手首移動={float(travel):.2f}肩幅"
                     if angle is not None:text+=f" / 肘角度変化={float(angle):.1f}°"
+                elif reason=="wall_gap":text="除外: 壁音間隔（直前候補から0.8秒未満）"
+                elif reason=="min_gap":text="除外: 最小ピーク間隔内の後続音"
+                elif reason=="not_top3":text="未検証: サウンド上位3件外"
+                elif reason=="top3_motion_not_selected":text="軽量確認済み: 手首移動が最大ではありません"
+                elif reason=="full_frame_target":text="全フレーム解析対象: 上位3件で手首移動最大"
+                elif reason=="pending":text="軽量姿勢確認待ち"
+                elif cand.get("selected"):text="採用候補"
                 else:text=f"不採用: {reason}"
                 x=min(event.x+12,max(self.timeline.winfo_width()-220,10)); y=max(event.y-42,6)
-                self.timeline.create_rectangle(x,y,x+210,y+38,fill="#2b1111",outline=RED,
+                box_h=52 if "\n" in text else 38
+                self.timeline.create_rectangle(x,y,x+250,y+box_h,fill="#20332b",
+                                               outline=candidate_marker_color(cand),
                                                tags="candidate_tooltip")
                 self.timeline.create_text(x+6,y+5,text=text,fill="white",anchor="nw",
                                           font=_tk_font(8),tags="candidate_tooltip")
@@ -6063,6 +6750,16 @@ class TennisApp(tk.Tk):
     #  タブ切替時のハンドラ
     # ══════════════════════════════════════════
     def _on_tab_changed(self,event=None):
+        try:selected=str(self.tabs.select())
+        except Exception:selected=""
+        experiment=selected==str(getattr(self,"tab_frame_validation",""))
+        if experiment and self.left.winfo_manager():
+            self.left.pack_forget(); self.main.pack_forget()
+            self.main.pack(fill="both",expand=True)
+        elif not experiment and not self.left.winfo_manager():
+            self.main.pack_forget()
+            self.left.pack(side="left",fill="y")
+            self.main.pack(side="right",fill="both",expand=True)
         self._refresh_active_tab()
 
     def _refresh_truth_summary(self):
@@ -6110,30 +6807,14 @@ class TennisApp(tk.Tk):
             self._truth_summary_info.set(f"正解DBを読み込めませんでした: {e}")
 
     def _refresh_active_tab(self):
-        try: idx=self.tabs.index(self.tabs.select())
+        try: selected=str(self.tabs.select())
         except Exception: return
-        if idx==1:
+        if selected==str(self.tab_hp_detail):
             self._refresh_hp_detail()
-        elif idx==2:
+        elif selected==str(self.tab_frame_validation):
+            self._rerender_experiment_images()
+        elif selected==str(self.tab_truth_summary):
             self._refresh_truth_summary()
-        elif idx==3:
-            # v18: クロス比較を統合したので同タイミング比較は idx 3 に繰上
-            if not self.peaks: return
-            self._update_c2_dropdowns()
-            if hasattr(self,"_c2_regen"): self._c2_regen()
-        elif idx==4:
-            # v46: Refiner
-            self._activate_refiner_tab()
-        elif idx==5:
-            if self.refiner:
-                try: self.refiner._3d_render_frame(self.refiner._mp3d_cur_idx)
-                except Exception: pass
-        elif idx==6:
-            # v62: MP-YOLO比較タブ
-            try: self._refresh_compare_tab()
-            except Exception: pass
-        elif idx==7:
-            self._refresh_history_tab()
 
     def _update_cs_dropdowns(self):
         if not hasattr(self,"cs_peak_sel"): return
@@ -7212,7 +7893,7 @@ class TennisApp(tk.Tk):
     }
 
     def _yolo_out_dir(self,video_path):
-        return os.path.join(os.path.dirname(video_path),"yolo")
+        return os.path.join(get_video_data_dir(video_path),"pose")
 
     def _yolo_data_file(self,video_path,rank,prefer_refined=False):
         """v62: 互換維持。source指定なしはMP優先→YOLO fallback"""
@@ -10648,6 +11329,7 @@ class RefinerFrame(tk.Frame):
         thumb_dirs = []
         if video_path:
             base = os.path.dirname(video_path)
+            thumb_dirs.append(os.path.join(get_video_data_dir(video_path),"thumbnails"))
             thumb_dirs.append(os.path.join(base, "1_thumbnails", stem))
         # JSON フォルダの兄弟も試す
         json_parent = os.path.dirname(os.path.dirname(self.cp_files[0]))
@@ -12583,13 +13265,10 @@ class RefinerFrame(tk.Frame):
             if self.analyzer is not None:
                 cam_dir = getattr(self.analyzer, "_video_meta_extra", {}).get("camera_dir", "")
                 if not cam_dir:
-                    # _meta_extra.json からも試行
+                    # Per-video sidecar metadataからも試行
                     vp = self.analyzer.video_path.get()
                     if vp:
-                        extra_path = os.path.splitext(vp)[0] + "_meta_extra.json"
-                        if os.path.exists(extra_path):
-                            with open(extra_path, "r", encoding="utf-8") as f:
-                                cam_dir = json.load(f).get("camera_dir", "")
+                        cam_dir=load_video_extra_metadata(vp).get("camera_dir","")
         except Exception: pass
         azim_map = {
             "後ろ": -90.0,          # 選手の背後から

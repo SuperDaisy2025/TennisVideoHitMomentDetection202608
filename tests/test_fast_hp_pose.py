@@ -12,6 +12,71 @@ TA = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(TA)
 
 
+def test_select_sound_top_candidates_keeps_three_strongest():
+    data={"times":np.array([0.,1.,2.,3.]),"combined":np.array([.2,.9,.5,.7])}
+    candidates=[{"idx":i,"time":float(i)} for i in range(4)]
+    result=TA.select_sound_top_candidates(candidates,data,limit=3)
+    assert [item["idx"] for item in result]==[1,3,2]
+    assert [item["sound_energy"] for item in result]==[.9,.7,.5]
+
+
+def test_motion_target_prefers_wrist_travel_over_sound():
+    data={"times":np.array([0.,1.]),"combined":np.array([.95,.50])}
+    candidates=[{"idx":0,"time":0.,"pose_travel":.2},
+                {"idx":1,"time":1.,"pose_travel":.8}]
+    assert TA.select_motion_validation_target(candidates,data)["idx"]==1
+
+
+def test_candidate_marker_palette():
+    assert TA.candidate_marker_color({"selected":None})=="#8a958e"
+    assert TA.candidate_marker_color({"selected":False})=="#ff5252"
+    assert TA.candidate_marker_color({"selected":True})=="#26c281"
+    assert TA.candidate_marker_color({"selected":True,"full_frame_target":True})=="#1976d2"
+
+
+def test_experiment_outlier_marks_low_confidence_and_isolated_ball():
+    frames=[]
+    xs=[.10,.20,.90,.40,.50]
+    for i,x in enumerate(xs):
+        frames.append({"time":i*.04,"kps":{"18":[x,.50,.9],"10":[.3+i*.01,.4,.9]}})
+    frames[0]["kps"]["10"][2]=.10
+    result=TA.mark_experiment_track_outliers(frames)
+    assert "右手首" in result[0]["track_warnings"]
+    assert "ボール" in result[2]["track_warnings"]
+
+
+def test_experiment_ball_direction_change_is_not_outlier():
+    # Two straight segments meet at index 2, which models a contact direction change.
+    frames=[]
+    points=[(.1,.5),(.2,.5),(.3,.5),(.3,.4),(.3,.3)]
+    for i,(x,y) in enumerate(points):
+        frames.append({"time":i*.04,"kps":{"18":[x,y,.9]}})
+    result=TA.mark_experiment_track_outliers(frames)
+    assert "ボール" not in result[2]["track_warnings"]
+
+
+def test_video_artifacts_use_same_name_sidecar_folder():
+    with tempfile.TemporaryDirectory() as folder:
+        video=Path(folder)/"sample.mp4"; video.write_bytes(b"video")
+        sidecar=Path(TA.get_video_data_dir(str(video)))
+        assert sidecar==Path(folder)/"sample"
+        assert Path(TA.get_db_path(str(video)))==sidecar/"tennis_labels.db"
+        assert Path(TA.get_video_metadata_path(str(video)))==sidecar/"metadata.json"
+        assert Path(TA.get_analysis_cache_path(str(video)))==sidecar/"audio"/"sample_analysis.npz"
+
+
+def test_experiment_cache_round_trip_without_frame_jpeg():
+    with tempfile.TemporaryDirectory() as folder:
+        video=Path(folder)/"sample.mp4"; video.write_bytes(b"video-data")
+        frames=[{"time":1.0,"frame_no":30,"kps":{"10":[.2,.3,.9]},
+                 "frame_jpeg":b"large-binary","score":.8}]
+        target={"time":1.0,"idx":5}
+        assert TA.save_experiment_cache(str(video),frames,0,target,.991,30.0)
+        restored=TA.load_experiment_cache(str(video),1.0)
+        assert restored["frames"][0]["kps"]["10"]==[.2,.3,.9]
+        assert "frame_jpeg" not in restored["frames"][0]
+
+
 def feat(x, y, serve=False, stroke=False, angle=120.0):
     return {
         "rw": np.array([x, y], dtype=float),
@@ -565,3 +630,50 @@ def test_audio_band_toggle_redraws_only_and_never_starts_pose():
     assert calls==["list","timeline","detail"]
     assert "姿勢・採否は変更しません" in app.status_var.get()
     assert app.btn_audio_filter.kwargs["bg"]==TA.audio_band_color("racket")
+
+
+def test_select_sound_rank_one_uses_surviving_candidates_only():
+    data={"times":np.array([0.,1.,2.]),"combined":np.array([.2,.9,.7])}
+    winner=TA.select_sound_rank_one([{"idx":0,"time":0.},{"idx":2,"time":2.}],data)
+    assert winner["idx"]==2
+    assert winner["sound_energy"]==.7
+
+
+def test_full_frame_contact_score_exposes_components_and_choice():
+    frames=[]
+    for i,t in enumerate((.90,.95,1.00,1.05,1.10)):
+        # Wrist accelerates into the center; ball changes direction there.
+        ball_x=(.8,.5,.1,.45,.75)[i]
+        frames.append({"time":t,"tracks":{"右手首":[i*.20,0.],
+            "左手首":[0.,0.],"ボール":[ball_x,0.],"重心":[0.,-.5]}})
+    scored,best=TA.score_full_frame_hit_candidates(frames,1.0)
+    assert len(scored)==5 and best is not None
+    assert sum(bool(row["selected"]) for row in scored)==1
+    assert {"score","audio_prior","right_speed","hand_change","ball_change","proximity"}.issubset(scored[best])
+    assert abs(scored[best]["time"]-1.0)<=.051
+
+
+def test_relative_tracks_keep_visible_wrist_when_torso_reference_flickers():
+    torso={"5":[.4,.3,.9],"6":[.6,.3,.9],"11":[.45,.6,.9],"12":[.55,.6,.9]}
+    frames=[{"time":0.,"kps":{**torso,"10":[.7,.4,.9]}},
+            {"time":.03,"kps":{"10":[.8,.4,.12]}},
+            {"time":.06,"kps":{**torso,"10":[.9,.4,.9]}}]
+    tracked=TA.build_person_relative_tracks(frames,min_conf=.05)
+    assert "右手首" in tracked[1]["tracks"]
+    assert tracked[1]["reference_borrowed"] is True
+    assert tracked[1]["pose_points"]==1
+
+
+def test_experiment_absolute_tracks_use_normalized_keypoint_values():
+    app=object.__new__(TA.TennisApp)
+    tracks=app._experiment_absolute_tracks({"kps":{"10":[.75,.25,.8],
+        "5":[.4,.3,.9],"6":[.6,.3,.9],"11":[.45,.7,.9],"12":[.55,.7,.9]}})
+    assert tracks["右手首"]==[.75,.25]
+    assert np.allclose(tracks["重心"],[.5,.5])
+
+
+def test_experiment_confidence_text_uses_pose_and_ball_scores():
+    text=TA.experiment_confidence_text({"10":[.2,.3,.876],"9":[.1,.4,.654],
+                                        "18":[.8,.2,.432]})
+    assert text=="Confidence\nRW   88%\nLW   65%\nBall 43%"
+    assert TA.experiment_confidence_text({})=="Confidence\nRW   --\nLW   --\nBall --"
