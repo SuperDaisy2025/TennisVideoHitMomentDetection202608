@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v117-batch"; APP_VERSION_DESC = "フォルダ一括ピーク・フレーム検証"
+APP_VERSION = "v118-batch"; APP_VERSION_DESC = "検証コメント・側面打点補正"
 GROUND_TRUTH_ENABLED = False
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
@@ -1197,7 +1197,21 @@ def mark_experiment_track_outliers(frames,confidence_limit=.15):
     return frames
 
 
-def score_full_frame_hit_candidates(frames,audio_time,sigma=.08):
+def ball_direction_change_prior(ball):
+    """Score the frame immediately before a reliable ball-direction change."""
+    points=np.asarray(ball,dtype=float); n=len(points); prior=np.zeros(n)
+    for i in range(1,n-1):
+        if not (np.isfinite(points[i-1:i+2]).all()):continue
+        incoming=points[i]-points[i-1]; outgoing=points[i+1]-points[i]
+        ni=float(np.linalg.norm(incoming)); no=float(np.linalg.norm(outgoing))
+        if ni<.05 or no<.05:continue
+        cosine=float(np.clip(np.dot(incoming,outgoing)/(ni*no),-1,1))
+        turn=(1.0-cosine)/2.0
+        prior[max(0,i-1)]=max(prior[max(0,i-1)],turn)
+    return prior
+
+
+def score_full_frame_hit_candidates(frames,audio_time,sigma=.08,side_view=False):
     """Attach transparent experimental contact scores to frame records.
 
     Tracks are person-relative (pelvis origin, shoulder-width scale). Missing
@@ -1234,23 +1248,38 @@ def score_full_frame_hit_candidates(frames,audio_time,sigma=.08):
         return np.clip(finite/max(top,eps),0,1)
     audio=np.exp(-.5*((times-float(audio_time))/max(float(sigma),.01))**2)
     ns,nc,nb=norm(hand_speed),norm(hand_change),norm(ball_change)
+    ball_turn=ball_direction_change_prior(ball) if side_view else np.zeros(n)
+    ball_signal=np.maximum(nb,ball_turn)
     reliability=np.asarray([.25 if f.get("track_warnings") else 1.0 for f in frames])
-    scores=(.30*audio+.28*ns+.18*nc+.16*nb+.08*proximity)*reliability
-    best=int(np.argmax(scores))
+    scores=(.30*audio+.28*ns+.18*nc+.16*ball_signal+.08*proximity)*reliability
+    # A clear side-view trajectory corner is stronger temporal evidence than
+    # the smooth wrist-speed maximum.  The contact image is the frame directly
+    # before that corner (the ball has not yet started its outgoing path).
+    # Limit this override to the audio neighbourhood so an unrelated/false ball
+    # track elsewhere in the inspection window cannot win.
+    turn_candidates=np.flatnonzero((ball_turn>=.35) & (np.abs(times-float(audio_time))<=.16)
+                                   & (reliability>=.5)) if side_view else np.array([],dtype=int)
+    if len(turn_candidates):
+        best=int(max(turn_candidates,key=lambda i:(ball_turn[i],audio[i],scores[i])))
+        selection_reason="側面映像: ボール方向転換の直前フレーム"
+    else:
+        best=int(np.argmax(scores)); selection_reason="複合スコア最大"
     output=[]
     for i,frame in enumerate(frames):
         contributions={"音声":.30*float(audio[i])*float(reliability[i]),
                        "手首速度":.28*float(ns[i])*float(reliability[i]),
                        "速度変化":.18*float(nc[i])*float(reliability[i]),
-                       "ボール変化":.16*float(nb[i])*float(reliability[i]),
+                       "ボール方向/変化":.16*float(ball_signal[i])*float(reliability[i]),
                        "手球近接":.08*float(proximity[i])*float(reliability[i])}
         item=dict(frame); item.update({"right_speed":float(rs[i]),"left_speed":float(ls[i]),
             "hand_change":float(hand_change[i]),"ball_change":float(ball_change[i]),
             "proximity":float(proximity[i]),"audio_prior":float(audio[i]),
             "normalized_hand_speed":float(ns[i]),"normalized_hand_change":float(nc[i]),
             "normalized_ball_change":float(nb[i]),"track_reliability":float(reliability[i]),
+            "ball_turn_prior":float(ball_turn[i]),
             "score_contributions":contributions,
-            "score":float(scores[i]),"selected":i==best})
+            "score":float(scores[i]),"selected":i==best,
+            "selection_reason":selection_reason if i==best else ""})
         output.append(item)
     return output,best
 
@@ -1681,6 +1710,26 @@ def load_batch_result(video_path):
     except Exception:return None
 
 
+def get_review_comments_path(video_path):
+    return os.path.join(get_video_data_dir(video_path),"review_comments.json")
+
+
+def load_review_comments(video_path):
+    path=get_review_comments_path(video_path)
+    if not os.path.exists(path):return {"hit_points":{},"frame_validation":{}}
+    try:
+        with open(path,"r",encoding="utf-8") as f:data=json.load(f)
+        data.setdefault("hit_points",{}); data.setdefault("frame_validation",{})
+        return data
+    except Exception:return {"hit_points":{},"frame_validation":{}}
+
+
+def save_review_comments(video_path,data):
+    path=get_review_comments_path(video_path)
+    with open(path,"w",encoding="utf-8") as f:json.dump(data,f,ensure_ascii=False,indent=2)
+    return path
+
+
 def format_batch_report(folder,results):
     """Human-readable, uploadable evidence report for a batch folder."""
     lines=["Hit Moment Analyzer 複数動画検証レポート",
@@ -1696,6 +1745,17 @@ def format_batch_report(folder,results):
                   f"コメント: {result.get('comment','') or '（未入力）'}"]
         settings=result.get("settings",{})
         lines.append(f"設定: 感度={settings.get('sensitivity','--')} / 壁打ち={settings.get('wall_mode','--')} / 音声帯={settings.get('audio_mode','combined')}")
+        review=result.get("review_comments",{})
+        frame_review=review.get("frame_validation",{})
+        if frame_review:
+            lines.append(f"フレーム検証コメント: {frame_review.get('comment','') or '（未入力）'}")
+            if frame_review.get("preferred_frame_no") is not None:
+                lines.append(f"ユーザー指定の正確なHP: F{frame_review['preferred_frame_no']} / {float(frame_review.get('preferred_time',0)):.3f}s")
+                lines.append(f"指定理由: {frame_review.get('preferred_reason','') or '（未入力）'}")
+        hp_comments=review.get("hit_points",{})
+        if hp_comments:
+            lines.append("ヒットポイント詳細コメント:")
+            for key,value in sorted(hp_comments.items()):lines.append(f"  {key}: {value.get('comment','')}")
         lines.append("音声ピーク候補:")
         candidates=result.get("audio_candidates",[])
         if not candidates:lines.append("  なし")
@@ -1735,7 +1795,7 @@ def _json_safe(value):
 def save_experiment_cache(video_path,frames,best,target,corrected,fps):
     try:
         stat=os.stat(video_path)
-        data={"version":1,"video_size":int(stat.st_size),"video_mtime_ns":int(stat.st_mtime_ns),
+        data={"version":2,"video_size":int(stat.st_size),"video_mtime_ns":int(stat.st_mtime_ns),
               "target_time":float(target.get("time",0)),"corrected":float(corrected),
               "fps":float(fps),"best":int(best),"target":_json_safe(target),
               "frames":_json_safe(frames),"saved_at":time.strftime("%Y-%m-%d %H:%M:%S")}
@@ -1751,6 +1811,7 @@ def load_experiment_cache(video_path,target_time):
     try:
         with open(path,"r",encoding="utf-8") as f:data=json.load(f)
         stat=os.stat(video_path)
+        if int(data.get("version",0))!=2:return None
         if int(data.get("video_size",-1))!=int(stat.st_size):return None
         if abs(float(data.get("target_time",-999))-float(target_time))>.001:return None
         if not data.get("frames"):return None
@@ -2725,6 +2786,14 @@ class TennisApp(tk.Tk):
         tk.Label(parent,textvariable=self._hp_rejected_reason_var,bg="#fff4f4",fg="#8b1a1a",
                  font=_tk_font(9),anchor="w",justify="left",wraplength=1200
                  ).pack(fill="x",padx=14,pady=(0,5),ipadx=6,ipady=3)
+        hp_comment_row=tk.Frame(parent,bg=PANEL); hp_comment_row.pack(fill="x",padx=14,pady=(0,6))
+        tk.Label(hp_comment_row,text="このHPのコメント",bg=PANEL,fg=ACCENT2,
+                 font=_tk_font(9,bold=True)).pack(side="left",padx=(0,7))
+        self._hp_detail_comment=tk.Text(hp_comment_row,height=2,bg="white",fg=TEXT,
+                                        font=_tk_font(9),wrap="word")
+        self._hp_detail_comment.pack(side="left",fill="x",expand=True)
+        self._hp_detail_comment.bind("<FocusOut>",self._save_hp_detail_comment)
+        self._hp_comment_key=None
 
     def _build_tab_frame_validation(self,parent):
         """Experimental, inspectable full-frame contact validation screen."""
@@ -2797,6 +2866,19 @@ class TennisApp(tk.Tk):
         tk.Label(parent,textvariable=self._experiment_quality_reason,bg="#fff8e8",fg="#7a3f00",
                  font=_tk_font(10,bold=True),anchor="w",justify="left",wraplength=1500
                  ).pack(fill="x",padx=8,pady=(0,7),ipadx=8,ipady=4)
+        review=tk.Frame(parent,bg=PANEL); review.pack(fill="x",padx=8,pady=(0,7))
+        tk.Label(review,text="検証コメント",bg=PANEL,fg=ACCENT2,
+                 font=_tk_font(9,bold=True)).pack(side="left",padx=(6,5))
+        self._experiment_comment=tk.Text(review,height=2,width=52,bg="white",fg=TEXT,
+                                         font=_tk_font(9),wrap="word")
+        self._experiment_comment.pack(side="left",fill="x",expand=True,pady=3)
+        self._experiment_comment.bind("<FocusOut>",self._save_experiment_review)
+        self._experiment_preferred_var=tk.StringVar(value="正確なHP: 未指定")
+        tk.Label(review,textvariable=self._experiment_preferred_var,bg=PANEL,fg=TEXT,
+                 font=_tk_font(9,bold=True)).pack(side="left",padx=8)
+        tk.Button(review,text="選択写真を正確なHPに指定",command=self._mark_preferred_experiment_frame,
+                  bg=ACCENT,fg="white",relief="flat",font=_tk_font(9,bold=True)
+                  ).pack(side="right",padx=5,ipadx=5,ipady=3)
 
     def _build_tab_batch_validation(self,parent):
         head=tk.Frame(parent,bg=PANEL); head.pack(fill="x",padx=8,pady=8)
@@ -2943,6 +3025,7 @@ class TennisApp(tk.Tk):
         results=[]
         for path in self._batch_videos:
             result=dict(self._batch_results.get(path,{"video":path,"status":"未解析"}))
+            result["review_comments"]=load_review_comments(path)
             results.append(result)
         report_path=os.path.join(folder,"HitMomentAnalyzer_batch_report.txt")
         try:
@@ -2977,6 +3060,7 @@ class TennisApp(tk.Tk):
             try:size=os.path.getsize(path)
             except Exception:size=-1
             if (self._batch_force_reanalyze.get() or not old or
+                    int(old.get("analysis_version",0))!=2 or
                     int(old.get("video_size",-2))!=int(size) or old.get("status")!="完了"):
                 pending.append(path)
         if not pending:
@@ -3069,7 +3153,8 @@ class TennisApp(tk.Tk):
             frames=[pose_at(frame_no/fps,with_ball=True) for frame_no in range(first,last+1)]
             frames=build_person_relative_tracks(frames,min_conf=.05)
             frames=mark_experiment_track_outliers(frames)
-            scored,best=score_full_frame_hit_candidates(frames,corrected)
+            side_view="横" in str(extra.get("camera_dir",""))
+            scored,best=score_full_frame_hit_candidates(frames,corrected,side_view=side_view)
             save_experiment_cache(path,scored,best,target,corrected,fps)
         cap.release()
         audio_rows=[]
@@ -3086,7 +3171,7 @@ class TennisApp(tk.Tk):
         selected=None if best is None else _json_safe(scored[best])
         return {"video":os.path.abspath(path),"video_size":os.path.getsize(path),"status":"完了",
                 "analyzed_at":time.strftime("%Y-%m-%d %H:%M:%S"),"comment":"",
-                "video_info":{"frame_count":frame_count,"fps":fps,"duration":duration},
+                "analysis_version":2,"video_info":{"frame_count":frame_count,"fps":fps,"duration":duration},
                 "settings":{"sensitivity":sensitivity,"wall_mode":wall,"audio_mode":"combined",
                             "first_minute_only":first60,"pose_backend":"rtmpose+yolo-ball"},
                 "audio_candidates":audio_rows,"target":_json_safe(target) if target else None,
@@ -4626,7 +4711,8 @@ class TennisApp(tk.Tk):
                         f"全フレーム解析中… {o}/{t}"))
                 frames=build_person_relative_tracks(frames,min_conf=.05)
                 frames=mark_experiment_track_outliers(frames)
-                scored,best=score_full_frame_hit_candidates(frames,corrected)
+                camera_dir=str((getattr(self,"_video_meta_extra",{}) or {}).get("camera_dir",""))
+                scored,best=score_full_frame_hit_candidates(frames,corrected,side_view="横" in camera_dir)
                 if self._gen==gen:self.after(0,lambda:self._show_experiment_results(
                     scored,best,target,corrected,fps))
             except Exception as e:
@@ -4662,6 +4748,7 @@ class TennisApp(tk.Tk):
         self._experiment_status.set(
             f"{'保存結果を復元' if restored else '完了'}: 上位3件の手首移動最大 {float(target['time']):.3f}s → 音速補正 {corrected:.3f}s / 自動候補 F{chosen['frame_no']} {chosen['time']:.3f}s")
         self._update_experiment_diagnostics()
+        self._load_experiment_review()
         if not restored:save_experiment_cache(self.video_path.get(),frames,best,target,corrected,fps)
 
     def _experiment_absolute_tracks(self,frame):
@@ -4772,6 +4859,39 @@ class TennisApp(tk.Tk):
         self._rerender_experiment_images()
         self._draw_experiment_graphs()
         self._update_experiment_diagnostics()
+
+    def _load_experiment_review(self):
+        if not hasattr(self,"_experiment_comment"):return
+        review=load_review_comments(self.video_path.get()).get("frame_validation",{})
+        self._experiment_comment.delete("1.0","end")
+        self._experiment_comment.insert("1.0",review.get("comment",""))
+        if review.get("preferred_frame_no") is not None:
+            self._experiment_preferred_var.set(
+                f"正確なHP: F{review['preferred_frame_no']} / {float(review.get('preferred_time',0)):.3f}s")
+        else:self._experiment_preferred_var.set("正確なHP: 未指定")
+
+    def _save_experiment_review(self,event=None):
+        path=self.video_path.get().strip()
+        if not path or not hasattr(self,"_experiment_comment"):return
+        data=load_review_comments(path); review=data.setdefault("frame_validation",{})
+        review["comment"]=self._experiment_comment.get("1.0","end").strip()
+        review["updated_at"]=time.strftime("%Y-%m-%d %H:%M:%S")
+        save_review_comments(path,data)
+
+    def _mark_preferred_experiment_frame(self):
+        if not getattr(self,"_experiment_frames",None):return
+        self._save_experiment_review(); index=max(0,min(self._experiment_selected_frame,len(self._experiment_frames)-1))
+        frame=self._experiment_frames[index]; path=self.video_path.get().strip()
+        data=load_review_comments(path); review=data.setdefault("frame_validation",{})
+        review.update({"preferred_frame_no":int(frame["frame_no"]),
+                       "preferred_time":float(frame["time"]),
+                       "preferred_reason":self._experiment_comment.get("1.0","end").strip(),
+                       "automatic_frame_no":int(self._experiment_frames[
+                           max(0,min(getattr(self,"_experiment_auto_frame",index),len(self._experiment_frames)-1))]["frame_no"]),
+                       "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")})
+        save_review_comments(path,data)
+        self._experiment_preferred_var.set(f"正確なHP: F{frame['frame_no']} / {float(frame['time']):.3f}s")
+        self._experiment_status.set("選択写真を正確なヒットポイントとして、コメント・理由と共に保存しました")
 
     def _update_experiment_diagnostics(self):
         if not getattr(self,"_experiment_frames",None):return
@@ -5082,6 +5202,7 @@ class TennisApp(tk.Tk):
         rejected=getattr(self,"_selected_rejected_candidate",None)
         if not hasattr(self,"_hp_detail_canvases") or (not self.peaks and not rejected):return
         peak=rejected if rejected is not None else self.peaks[self.peak_idx]
+        self._load_hp_detail_comment(peak,rejected is not None)
         samples=list(peak.get("pose_samples") or [])
         if rejected is not None and len(samples)<5:
             samples=self._rejected_preview_samples(peak)
@@ -5118,6 +5239,23 @@ class TennisApp(tk.Tk):
                 f"赤点 No{peak['rank']}（{float(peak['time']):.2f}s）の不採用理由: {label}")
         else:
             self._hp_rejected_reason_var.set("")
+
+    def _save_hp_detail_comment(self,event=None):
+        if not getattr(self,"_hp_comment_key",None) or not hasattr(self,"_hp_detail_comment"):return
+        path=self.video_path.get().strip()
+        if not path:return
+        data=load_review_comments(path); data.setdefault("hit_points",{})[self._hp_comment_key]={
+            "comment":self._hp_detail_comment.get("1.0","end").strip(),
+            "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")}
+        save_review_comments(path,data)
+
+    def _load_hp_detail_comment(self,peak,rejected=False):
+        if not hasattr(self,"_hp_detail_comment"):return
+        key=f"{'rejected' if rejected else 'accepted'}:{int(peak.get('rank',0))}:{float(peak.get('time',0)):.3f}"
+        if key==getattr(self,"_hp_comment_key",None):return
+        self._save_hp_detail_comment(); self._hp_comment_key=key
+        entry=load_review_comments(self.video_path.get()).get("hit_points",{}).get(key,{})
+        self._hp_detail_comment.delete("1.0","end"); self._hp_detail_comment.insert("1.0",entry.get("comment",""))
 
     def _on_error(self,msg):
         try: self.progress.stop()

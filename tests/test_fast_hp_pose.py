@@ -696,3 +696,38 @@ def test_experiment_confidence_text_uses_pose_and_ball_scores():
                                         "18":[.8,.2,.432]})
     assert text=="Confidence\nRW   88%\nLW   65%\nBall 43%"
     assert TA.experiment_confidence_text({})=="Confidence\nRW   --\nLW   --\nBall --"
+
+
+def test_ball_direction_change_marks_frame_before_the_corner():
+    ball=np.array([[.10,.4],[.25,.4],[.40,.4],[.40,.55],[.40,.70]])
+    prior=TA.ball_direction_change_prior(ball)
+    assert int(np.argmax(prior))==1
+    assert prior[1]>.49
+
+
+def test_side_view_selects_frame_before_reliable_ball_turn():
+    frames=[]
+    ball=((.10,.4),(.25,.4),(.40,.4),(.40,.55),(.40,.70))
+    for i,t in enumerate((.90,.95,1.00,1.05,1.10)):
+        frames.append({"time":t,"tracks":{"右手首":[i*.05,0.],
+            "左手首":[0.,0.],"ボール":ball[i],"重心":[0.,-.5]}})
+    scored,best=TA.score_full_frame_hit_candidates(frames,1.0,side_view=True)
+    assert best==1
+    assert scored[best]["time"]==.95
+    assert "方向転換の直前" in scored[best]["selection_reason"]
+
+
+def test_review_comments_round_trip_and_report():
+    with tempfile.TemporaryDirectory() as folder:
+        video=str(Path(folder)/"sample.mp4")
+        review={"hit_points":{"accepted:1:1.000":{"comment":"良い打点"}},
+                "frame_validation":{"comment":"次フレームが正確",
+                                    "preferred_frame_no":31,"preferred_time":1.033,
+                                    "preferred_reason":"ボールが離れ始める直前"}}
+        TA.save_review_comments(video,review)
+        assert TA.load_review_comments(video)==review
+        report=TA.format_batch_report(folder,[{"video":video,"status":"完了",
+            "video_info":{},"review_comments":review}])
+        assert "F31 / 1.033s" in report
+        assert "ボールが離れ始める直前" in report
+        assert "良い打点" in report
