@@ -2810,6 +2810,10 @@ class TennisApp(tk.Tk):
         self._batch_start_btn=tk.Button(head,text="一括解析開始",command=self._start_batch_validation,
                   bg=ACCENT2,fg="white",relief="flat",font=_tk_font(10,bold=True))
         self._batch_start_btn.pack(side="left",padx=3,ipadx=8,ipady=3)
+        self._batch_force_reanalyze=tk.BooleanVar(value=False)
+        tk.Checkbutton(head,text="完了済みも再解析",variable=self._batch_force_reanalyze,
+                       bg=PANEL,fg=TEXT,selectcolor="white",font=_tk_font(8,bold=True)
+                       ).pack(side="left",padx=4)
         body=tk.PanedWindow(parent,orient="horizontal",bg=BG,sashwidth=7)
         body.pack(fill="both",expand=True,padx=8,pady=(0,5))
         left=tk.Frame(body,bg=PANEL,width=520); right=tk.Frame(body,bg=BG,width=780)
@@ -2972,7 +2976,9 @@ class TennisApp(tk.Tk):
             old=self._batch_results.get(path)
             try:size=os.path.getsize(path)
             except Exception:size=-1
-            if not old or int(old.get("video_size",-2))!=int(size) or old.get("status")!="完了":pending.append(path)
+            if (self._batch_force_reanalyze.get() or not old or
+                    int(old.get("video_size",-2))!=int(size) or old.get("status")!="完了"):
+                pending.append(path)
         if not pending:
             self._batch_running=False; self._batch_start_btn.configure(state="normal")
             self._write_batch_report(); return
