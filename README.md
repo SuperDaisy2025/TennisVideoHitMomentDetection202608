@@ -1,5 +1,7 @@
 # Hit Moment Analyzer
 
+新PCへの引継ぎは [MIGRATION.md](MIGRATION.md)、起動確認は [NEW_PC_CHECKLIST.md](NEW_PC_CHECKLIST.md)、現在の設計と保存方式は [HANDOFF.md](HANDOFF.md) を参照してください。
+
 ## v118-batch: 検証コメント・側面打点補正
 
 - 「ヒットポイント詳細」の各採用／除外候補にコメントを保存します。
