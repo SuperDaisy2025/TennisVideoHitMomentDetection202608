@@ -77,6 +77,25 @@ def test_experiment_cache_round_trip_without_frame_jpeg():
         assert "frame_jpeg" not in restored["frames"][0]
 
 
+def test_batch_result_round_trip_and_report_contains_evidence():
+    with tempfile.TemporaryDirectory() as folder:
+        video=Path(folder)/"match.mp4"; video.write_bytes(b"video-data")
+        result={"video":str(video),"status":"完了","comment":"壁音を要確認",
+                "video_info":{"frame_count":300,"fps":30,"duration":10},
+                "settings":{"sensitivity":.4,"wall_mode":True,"audio_mode":"combined"},
+                "audio_candidates":[{"rank":1,"time":1.2,"energy":.8,"state":"採用","reason":"swing"}],
+                "selected_frame":{"frame_no":35,"time":1.167,"score":.72},
+                "frames":[{"frame_no":35,"time":1.167,"score":.72,"audio_prior":.9,
+                           "kps":{"10":[.5,.4,.88],"9":[.3,.4,.77]},"track_warnings":{}}]}
+        TA.save_batch_result(str(video),result)
+        restored=TA.load_batch_result(str(video))
+        report=TA.format_batch_report(folder,[restored])
+        assert "壁音を要確認" in report
+        assert "300フレーム" in report
+        assert "energy=0.8000" in report
+        assert "F35" in report and "conf=88.0%" in report
+
+
 def feat(x, y, serve=False, stroke=False, angle=120.0):
     return {
         "rw": np.array([x, y], dtype=float),
@@ -677,3 +696,38 @@ def test_experiment_confidence_text_uses_pose_and_ball_scores():
                                         "18":[.8,.2,.432]})
     assert text=="Confidence\nRW   88%\nLW   65%\nBall 43%"
     assert TA.experiment_confidence_text({})=="Confidence\nRW   --\nLW   --\nBall --"
+
+
+def test_ball_direction_change_marks_frame_before_the_corner():
+    ball=np.array([[.10,.4],[.25,.4],[.40,.4],[.40,.55],[.40,.70]])
+    prior=TA.ball_direction_change_prior(ball)
+    assert int(np.argmax(prior))==1
+    assert prior[1]>.49
+
+
+def test_side_view_selects_frame_before_reliable_ball_turn():
+    frames=[]
+    ball=((.10,.4),(.25,.4),(.40,.4),(.40,.55),(.40,.70))
+    for i,t in enumerate((.90,.95,1.00,1.05,1.10)):
+        frames.append({"time":t,"tracks":{"右手首":[i*.05,0.],
+            "左手首":[0.,0.],"ボール":ball[i],"重心":[0.,-.5]}})
+    scored,best=TA.score_full_frame_hit_candidates(frames,1.0,side_view=True)
+    assert best==1
+    assert scored[best]["time"]==.95
+    assert "方向転換の直前" in scored[best]["selection_reason"]
+
+
+def test_review_comments_round_trip_and_report():
+    with tempfile.TemporaryDirectory() as folder:
+        video=str(Path(folder)/"sample.mp4")
+        review={"hit_points":{"accepted:1:1.000":{"comment":"良い打点"}},
+                "frame_validation":{"comment":"次フレームが正確",
+                                    "preferred_frame_no":31,"preferred_time":1.033,
+                                    "preferred_reason":"ボールが離れ始める直前"}}
+        TA.save_review_comments(video,review)
+        assert TA.load_review_comments(video)==review
+        report=TA.format_batch_report(folder,[{"video":video,"status":"完了",
+            "video_info":{},"review_comments":review}])
+        assert "F31 / 1.033s" in report
+        assert "ボールが離れ始める直前" in report
+        assert "良い打点" in report

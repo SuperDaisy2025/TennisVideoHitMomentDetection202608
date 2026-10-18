@@ -321,7 +321,7 @@ BG=     "#eaf4ec"; PANEL=  "#d7eadb"; PANEL2= "#e1f0e4"
 ACCENT= "#d85f35"; ACCENT2="#2f7d5a"; GOLD=   "#a96d0b"
 GREEN=  "#23835b"; TEXT=   "#173a2b"; SUBTEXT="#557064"
 BORDER= "#a9c8b2"; DARK2=  "#f5fbf6"; RED= "#c93f4a"
-APP_VERSION = "v116-exp"; APP_VERSION_DESC = "動画別サイドカーフォルダ"
+APP_VERSION = "v118-batch"; APP_VERSION_DESC = "検証コメント・側面打点補正"
 GROUND_TRUTH_ENABLED = False
 
 # 音声HP候補を姿勢で検証する高速パラメータ。
@@ -1197,7 +1197,21 @@ def mark_experiment_track_outliers(frames,confidence_limit=.15):
     return frames
 
 
-def score_full_frame_hit_candidates(frames,audio_time,sigma=.08):
+def ball_direction_change_prior(ball):
+    """Score the frame immediately before a reliable ball-direction change."""
+    points=np.asarray(ball,dtype=float); n=len(points); prior=np.zeros(n)
+    for i in range(1,n-1):
+        if not (np.isfinite(points[i-1:i+2]).all()):continue
+        incoming=points[i]-points[i-1]; outgoing=points[i+1]-points[i]
+        ni=float(np.linalg.norm(incoming)); no=float(np.linalg.norm(outgoing))
+        if ni<.05 or no<.05:continue
+        cosine=float(np.clip(np.dot(incoming,outgoing)/(ni*no),-1,1))
+        turn=(1.0-cosine)/2.0
+        prior[max(0,i-1)]=max(prior[max(0,i-1)],turn)
+    return prior
+
+
+def score_full_frame_hit_candidates(frames,audio_time,sigma=.08,side_view=False):
     """Attach transparent experimental contact scores to frame records.
 
     Tracks are person-relative (pelvis origin, shoulder-width scale). Missing
@@ -1234,23 +1248,38 @@ def score_full_frame_hit_candidates(frames,audio_time,sigma=.08):
         return np.clip(finite/max(top,eps),0,1)
     audio=np.exp(-.5*((times-float(audio_time))/max(float(sigma),.01))**2)
     ns,nc,nb=norm(hand_speed),norm(hand_change),norm(ball_change)
+    ball_turn=ball_direction_change_prior(ball) if side_view else np.zeros(n)
+    ball_signal=np.maximum(nb,ball_turn)
     reliability=np.asarray([.25 if f.get("track_warnings") else 1.0 for f in frames])
-    scores=(.30*audio+.28*ns+.18*nc+.16*nb+.08*proximity)*reliability
-    best=int(np.argmax(scores))
+    scores=(.30*audio+.28*ns+.18*nc+.16*ball_signal+.08*proximity)*reliability
+    # A clear side-view trajectory corner is stronger temporal evidence than
+    # the smooth wrist-speed maximum.  The contact image is the frame directly
+    # before that corner (the ball has not yet started its outgoing path).
+    # Limit this override to the audio neighbourhood so an unrelated/false ball
+    # track elsewhere in the inspection window cannot win.
+    turn_candidates=np.flatnonzero((ball_turn>=.35) & (np.abs(times-float(audio_time))<=.16)
+                                   & (reliability>=.5)) if side_view else np.array([],dtype=int)
+    if len(turn_candidates):
+        best=int(max(turn_candidates,key=lambda i:(ball_turn[i],audio[i],scores[i])))
+        selection_reason="側面映像: ボール方向転換の直前フレーム"
+    else:
+        best=int(np.argmax(scores)); selection_reason="複合スコア最大"
     output=[]
     for i,frame in enumerate(frames):
         contributions={"音声":.30*float(audio[i])*float(reliability[i]),
                        "手首速度":.28*float(ns[i])*float(reliability[i]),
                        "速度変化":.18*float(nc[i])*float(reliability[i]),
-                       "ボール変化":.16*float(nb[i])*float(reliability[i]),
+                       "ボール方向/変化":.16*float(ball_signal[i])*float(reliability[i]),
                        "手球近接":.08*float(proximity[i])*float(reliability[i])}
         item=dict(frame); item.update({"right_speed":float(rs[i]),"left_speed":float(ls[i]),
             "hand_change":float(hand_change[i]),"ball_change":float(ball_change[i]),
             "proximity":float(proximity[i]),"audio_prior":float(audio[i]),
             "normalized_hand_speed":float(ns[i]),"normalized_hand_change":float(nc[i]),
             "normalized_ball_change":float(nb[i]),"track_reliability":float(reliability[i]),
+            "ball_turn_prior":float(ball_turn[i]),
             "score_contributions":contributions,
-            "score":float(scores[i]),"selected":i==best})
+            "score":float(scores[i]),"selected":i==best,
+            "selection_reason":selection_reason if i==best else ""})
         output.append(item)
     return output,best
 
@@ -1663,6 +1692,97 @@ def get_experiment_cache_path(video_path):
     return os.path.join(folder,"frame_validation.json")
 
 
+def get_batch_result_path(video_path):
+    return os.path.join(get_video_data_dir(video_path),"batch_validation.json")
+
+
+def save_batch_result(video_path,result):
+    path=get_batch_result_path(video_path)
+    with open(path,"w",encoding="utf-8") as f:json.dump(_json_safe(result),f,ensure_ascii=False,indent=2)
+    return path
+
+
+def load_batch_result(video_path):
+    path=get_batch_result_path(video_path)
+    if not os.path.exists(path):return None
+    try:
+        with open(path,"r",encoding="utf-8") as f:return json.load(f)
+    except Exception:return None
+
+
+def get_review_comments_path(video_path):
+    return os.path.join(get_video_data_dir(video_path),"review_comments.json")
+
+
+def load_review_comments(video_path):
+    path=get_review_comments_path(video_path)
+    if not os.path.exists(path):return {"hit_points":{},"frame_validation":{}}
+    try:
+        with open(path,"r",encoding="utf-8") as f:data=json.load(f)
+        data.setdefault("hit_points",{}); data.setdefault("frame_validation",{})
+        return data
+    except Exception:return {"hit_points":{},"frame_validation":{}}
+
+
+def save_review_comments(video_path,data):
+    path=get_review_comments_path(video_path)
+    with open(path,"w",encoding="utf-8") as f:json.dump(data,f,ensure_ascii=False,indent=2)
+    return path
+
+
+def format_batch_report(folder,results):
+    """Human-readable, uploadable evidence report for a batch folder."""
+    lines=["Hit Moment Analyzer 複数動画検証レポート",
+           f"対象フォルダ: {os.path.abspath(folder)}",
+           f"更新日時: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+           f"動画数: {len(results)}","="*88]
+    for number,result in enumerate(results,1):
+        video=result.get("video",""); info=result.get("video_info",{})
+        lines += ["",f"[{number}] {os.path.basename(video)}",
+                  f"パス: {video}",
+                  f"動画: {info.get('frame_count','--')}フレーム / {float(info.get('fps',0)):.3f}fps / {float(info.get('duration',0)):.3f}秒",
+                  f"状態: {result.get('status','未解析')}",
+                  f"コメント: {result.get('comment','') or '（未入力）'}"]
+        settings=result.get("settings",{})
+        lines.append(f"設定: 感度={settings.get('sensitivity','--')} / 壁打ち={settings.get('wall_mode','--')} / 音声帯={settings.get('audio_mode','combined')}")
+        review=result.get("review_comments",{})
+        frame_review=review.get("frame_validation",{})
+        if frame_review:
+            lines.append(f"フレーム検証コメント: {frame_review.get('comment','') or '（未入力）'}")
+            if frame_review.get("preferred_frame_no") is not None:
+                lines.append(f"ユーザー指定の正確なHP: F{frame_review['preferred_frame_no']} / {float(frame_review.get('preferred_time',0)):.3f}s")
+                lines.append(f"指定理由: {frame_review.get('preferred_reason','') or '（未入力）'}")
+        hp_comments=review.get("hit_points",{})
+        if hp_comments:
+            lines.append("ヒットポイント詳細コメント:")
+            for key,value in sorted(hp_comments.items()):lines.append(f"  {key}: {value.get('comment','')}")
+        lines.append("音声ピーク候補:")
+        candidates=result.get("audio_candidates",[])
+        if not candidates:lines.append("  なし")
+        for c in candidates:
+            lines.append(f"  No{int(c.get('rank',0)):02d}  t={float(c.get('time',0)):.3f}s  energy={float(c.get('energy',0)):.4f}  {c.get('state','未検証')}  {c.get('reason','')}")
+        target=result.get("target") or {}
+        if target:
+            lines.append(f"フレーム検証対象: t={float(target.get('time',0)):.3f}s / 手首移動={target.get('pose_travel','--')} / 音={float(target.get('sound_energy',0)):.4f}")
+        else:lines.append("フレーム検証対象: なし")
+        selected=result.get("selected_frame") or {}
+        if selected:
+            lines.append(f"自動選択フレーム: F{selected.get('frame_no','--')} / {float(selected.get('time',0)):.3f}s / score={float(selected.get('score',0)):.4f}")
+        lines.append("検証フレーム（RW=右手首、LW=左手首、Ball=ボール。x,yは画像正規化座標）:")
+        frames=result.get("frames",[])
+        if not frames:lines.append("  なし")
+        for f in frames:
+            kps=f.get("kps",{})
+            def kp(key):
+                v=kps.get(key)
+                return "--" if not v else f"x={float(v[0]):.4f}, y={float(v[1]):.4f}, conf={float(v[2]):.1%}"
+            warning=" / ".join(f"{k}:{v}" for k,v in f.get("track_warnings",{}).items()) or "なし"
+            lines.append(f"  F{int(f.get('frame_no',0))}  {float(f.get('time',0)):.3f}s  score={float(f.get('score',0)):.4f}  音={float(f.get('audio_prior',0)):.4f}")
+            lines.append(f"    RW[{kp('10')}]  LW[{kp('9')}]  Ball[{kp('18')}]  注意={warning}")
+        lines.append("-"*88)
+    return "\n".join(lines)+"\n"
+
+
 def _json_safe(value):
     if isinstance(value,dict):return {str(k):_json_safe(v) for k,v in value.items() if k!="frame_jpeg"}
     if isinstance(value,(list,tuple)):return [_json_safe(v) for v in value]
@@ -1675,7 +1795,7 @@ def _json_safe(value):
 def save_experiment_cache(video_path,frames,best,target,corrected,fps):
     try:
         stat=os.stat(video_path)
-        data={"version":1,"video_size":int(stat.st_size),"video_mtime_ns":int(stat.st_mtime_ns),
+        data={"version":2,"video_size":int(stat.st_size),"video_mtime_ns":int(stat.st_mtime_ns),
               "target_time":float(target.get("time",0)),"corrected":float(corrected),
               "fps":float(fps),"best":int(best),"target":_json_safe(target),
               "frames":_json_safe(frames),"saved_at":time.strftime("%Y-%m-%d %H:%M:%S")}
@@ -1691,6 +1811,7 @@ def load_experiment_cache(video_path,target_time):
     try:
         with open(path,"r",encoding="utf-8") as f:data=json.load(f)
         stat=os.stat(video_path)
+        if int(data.get("version",0))!=2:return None
         if int(data.get("video_size",-1))!=int(stat.st_size):return None
         if abs(float(data.get("target_time",-999))-float(target_time))>.001:return None
         if not data.get("frames"):return None
@@ -2476,16 +2597,19 @@ class TennisApp(tk.Tk):
         self.tab_main    = tk.Frame(self.tabs,bg=BG)
         self.tab_hp_detail = tk.Frame(self.tabs,bg=BG)
         self.tab_frame_validation = tk.Frame(self.tabs,bg=BG)
+        self.tab_batch_validation = tk.Frame(self.tabs,bg=BG)
         self.tab_truth_summary = tk.Frame(self.tabs,bg=BG)
         self.tabs.add(self.tab_main,   text="ヒットポイント一覧")
         self.tabs.add(self.tab_hp_detail, text="ヒットポイント詳細")
         self.tabs.add(self.tab_frame_validation, text="フレーム検証（実験）")
+        self.tabs.add(self.tab_batch_validation, text="フォルダ一括検証")
         if GROUND_TRUTH_ENABLED:self.tabs.add(self.tab_truth_summary, text="正解DBサマリ")
         self.tabs.bind("<<NotebookTabChanged>>",self._on_tab_changed)
 
         self._build_tab_main(self.tab_main)
         self._build_tab_hp_detail(self.tab_hp_detail)
         self._build_tab_frame_validation(self.tab_frame_validation)
+        self._build_tab_batch_validation(self.tab_batch_validation)
         if GROUND_TRUTH_ENABLED:self._build_tab_truth_summary(self.tab_truth_summary)
         # v63: 今回の画面はヒットポイント検出に限定する。
         self.refiner = None
@@ -2662,6 +2786,14 @@ class TennisApp(tk.Tk):
         tk.Label(parent,textvariable=self._hp_rejected_reason_var,bg="#fff4f4",fg="#8b1a1a",
                  font=_tk_font(9),anchor="w",justify="left",wraplength=1200
                  ).pack(fill="x",padx=14,pady=(0,5),ipadx=6,ipady=3)
+        hp_comment_row=tk.Frame(parent,bg=PANEL); hp_comment_row.pack(fill="x",padx=14,pady=(0,6))
+        tk.Label(hp_comment_row,text="このHPのコメント",bg=PANEL,fg=ACCENT2,
+                 font=_tk_font(9,bold=True)).pack(side="left",padx=(0,7))
+        self._hp_detail_comment=tk.Text(hp_comment_row,height=2,bg="white",fg=TEXT,
+                                        font=_tk_font(9),wrap="word")
+        self._hp_detail_comment.pack(side="left",fill="x",expand=True)
+        self._hp_detail_comment.bind("<FocusOut>",self._save_hp_detail_comment)
+        self._hp_comment_key=None
 
     def _build_tab_frame_validation(self,parent):
         """Experimental, inspectable full-frame contact validation screen."""
@@ -2734,6 +2866,316 @@ class TennisApp(tk.Tk):
         tk.Label(parent,textvariable=self._experiment_quality_reason,bg="#fff8e8",fg="#7a3f00",
                  font=_tk_font(10,bold=True),anchor="w",justify="left",wraplength=1500
                  ).pack(fill="x",padx=8,pady=(0,7),ipadx=8,ipady=4)
+        review=tk.Frame(parent,bg=PANEL); review.pack(fill="x",padx=8,pady=(0,7))
+        tk.Label(review,text="検証コメント",bg=PANEL,fg=ACCENT2,
+                 font=_tk_font(9,bold=True)).pack(side="left",padx=(6,5))
+        self._experiment_comment=tk.Text(review,height=2,width=52,bg="white",fg=TEXT,
+                                         font=_tk_font(9),wrap="word")
+        self._experiment_comment.pack(side="left",fill="x",expand=True,pady=3)
+        self._experiment_comment.bind("<FocusOut>",self._save_experiment_review)
+        self._experiment_preferred_var=tk.StringVar(value="正確なHP: 未指定")
+        tk.Label(review,textvariable=self._experiment_preferred_var,bg=PANEL,fg=TEXT,
+                 font=_tk_font(9,bold=True)).pack(side="left",padx=8)
+        tk.Button(review,text="選択写真を正確なHPに指定",command=self._mark_preferred_experiment_frame,
+                  bg=ACCENT,fg="white",relief="flat",font=_tk_font(9,bold=True)
+                  ).pack(side="right",padx=5,ipadx=5,ipady=3)
+
+    def _build_tab_batch_validation(self,parent):
+        head=tk.Frame(parent,bg=PANEL); head.pack(fill="x",padx=8,pady=8)
+        tk.Label(head,text="フォルダ一括ピーク・フレーム検証",bg=PANEL,fg=ACCENT2,
+                 font=_tk_font(14,bold=True)).pack(side="left",padx=6)
+        self._batch_folder_var=tk.StringVar(value="")
+        tk.Entry(head,textvariable=self._batch_folder_var,bg="white",fg=TEXT,
+                 font=_tk_font(9)).pack(side="left",fill="x",expand=True,padx=8,ipady=4)
+        tk.Button(head,text="フォルダ選択",command=self._batch_pick_folder,bg=DARK2,fg=TEXT,
+                  relief="flat",font=_tk_font(9,bold=True)).pack(side="left",padx=3,ipadx=6,ipady=3)
+        self._batch_start_btn=tk.Button(head,text="一括解析開始",command=self._start_batch_validation,
+                  bg=ACCENT2,fg="white",relief="flat",font=_tk_font(10,bold=True))
+        self._batch_start_btn.pack(side="left",padx=3,ipadx=8,ipady=3)
+        self._batch_force_reanalyze=tk.BooleanVar(value=False)
+        tk.Checkbutton(head,text="完了済みも再解析",variable=self._batch_force_reanalyze,
+                       bg=PANEL,fg=TEXT,selectcolor="white",font=_tk_font(8,bold=True)
+                       ).pack(side="left",padx=4)
+        body=tk.PanedWindow(parent,orient="horizontal",bg=BG,sashwidth=7)
+        body.pack(fill="both",expand=True,padx=8,pady=(0,5))
+        left=tk.Frame(body,bg=PANEL,width=520); right=tk.Frame(body,bg=BG,width=780)
+        body.add(left,minsize=420); body.add(right,minsize=520)
+        cols=("no","file","status","peak","frame")
+        self._batch_tree=ttk.Treeview(left,columns=cols,show="headings",selectmode="browse")
+        for col,title,width in zip(cols,("No","動画ファイル","状態","候補","選択F"),(45,270,110,55,70)):
+            self._batch_tree.heading(col,text=title); self._batch_tree.column(col,width=width,anchor="center")
+        sb=tk.Scrollbar(left,orient="vertical",command=self._batch_tree.yview)
+        self._batch_tree.configure(yscrollcommand=sb.set); sb.pack(side="right",fill="y")
+        self._batch_tree.pack(fill="both",expand=True)
+        self._batch_tree.bind("<<TreeviewSelect>>",self._on_batch_select)
+        nav=tk.Frame(left,bg=PANEL); nav.pack(fill="x",pady=5)
+        tk.Button(nav,text="◀ 前の動画",command=lambda:self._batch_move(-1),bg=DARK2,fg=TEXT,
+                  relief="flat",font=_tk_font(9,bold=True)).pack(side="left",padx=4,ipadx=7)
+        tk.Button(nav,text="次の動画 ▶",command=lambda:self._batch_move(1),bg=DARK2,fg=TEXT,
+                  relief="flat",font=_tk_font(9,bold=True)).pack(side="left",padx=4,ipadx=7)
+        tk.Button(nav,text="単体画面で開く",command=self._open_batch_video,bg=ACCENT,fg="white",
+                  relief="flat",font=_tk_font(9,bold=True)).pack(side="right",padx=4,ipadx=7)
+        self._batch_preview=tk.Canvas(right,bg="#173128",height=330,highlightthickness=0)
+        self._batch_preview.pack(fill="both",expand=True)
+        self._batch_summary_var=tk.StringVar(value="フォルダを選択してください")
+        tk.Label(right,textvariable=self._batch_summary_var,bg=PANEL2,fg=TEXT,anchor="w",
+                 justify="left",font=_tk_font(10,bold=True),wraplength=900
+                 ).pack(fill="x",pady=(5,3),ipadx=7,ipady=5)
+        tk.Label(right,text="この動画についての検証コメント（レポートへ自動反映）",bg=BG,
+                 fg=ACCENT2,font=_tk_font(10,bold=True),anchor="w").pack(fill="x",pady=(5,2))
+        self._batch_comment=tk.Text(right,height=5,bg="white",fg=TEXT,font=_tk_font(10),wrap="word")
+        self._batch_comment.pack(fill="x"); self._batch_comment.bind("<FocusOut>",self._save_batch_comment)
+        foot=tk.Frame(parent,bg=PANEL); foot.pack(fill="x",padx=8,pady=(0,8))
+        self._batch_progress_var=tk.StringVar(value="未実行")
+        tk.Label(foot,textvariable=self._batch_progress_var,bg=PANEL,fg=TEXT,
+                 font=_tk_font(9),anchor="w").pack(side="left",fill="x",expand=True,padx=6)
+        tk.Button(foot,text="レポート更新",command=self._write_batch_report,bg=DARK2,fg=TEXT,
+                  relief="flat",font=_tk_font(9,bold=True)).pack(side="right",padx=4,ipadx=7)
+        self._batch_videos=[]; self._batch_results={}; self._batch_selected_index=0
+        self._batch_running=False; self._batch_preview_ref=None
+
+    def _batch_pick_folder(self):
+        folder=filedialog.askdirectory(title="複数動画を解析するフォルダを選択")
+        if not folder:return
+        self._batch_folder_var.set(folder)
+        exts=(".mp4",".mov",".avi",".mkv",".m4v")
+        self._batch_videos=sorted(os.path.join(folder,name) for name in os.listdir(folder)
+                                  if os.path.isfile(os.path.join(folder,name)) and name.lower().endswith(exts))
+        self._batch_results={}
+        for path in self._batch_videos:
+            result=load_batch_result(path)
+            if result:self._batch_results[path]=result
+        self._refresh_batch_tree()
+        if self._batch_videos:
+            self._batch_select_index(0)
+            self._batch_progress_var.set(
+                f"{len(self._batch_videos)}本（保存結果 {len(self._batch_results)}本）。一括解析開始で未解析分を処理します")
+        else:self._batch_progress_var.set("動画ファイルがありません")
+
+    def _refresh_batch_tree(self):
+        tree=self._batch_tree
+        for item in tree.get_children():tree.delete(item)
+        for i,path in enumerate(self._batch_videos,1):
+            result=self._batch_results.get(path,{})
+            selected=result.get("selected_frame") or {}
+            tree.insert("","end",iid=str(i-1),values=(i,os.path.basename(path),
+                result.get("status","未解析"),len(result.get("audio_candidates",[])),
+                selected.get("frame_no","--")))
+
+    def _batch_select_index(self,index):
+        if not self._batch_videos:return
+        index=max(0,min(int(index),len(self._batch_videos)-1)); self._batch_selected_index=index
+        self._batch_tree.selection_set(str(index)); self._batch_tree.focus(str(index)); self._batch_tree.see(str(index))
+        self._show_batch_selected()
+
+    def _on_batch_select(self,event=None):
+        selection=self._batch_tree.selection()
+        if not selection:return
+        self._batch_selected_index=int(selection[0]); self._show_batch_selected()
+
+    def _batch_move(self,delta):
+        self._save_batch_comment()
+        self._batch_select_index(self._batch_selected_index+int(delta))
+
+    def _show_batch_selected(self):
+        if not self._batch_videos:return
+        path=self._batch_videos[self._batch_selected_index]; result=self._batch_results.get(path,{})
+        self._batch_comment.delete("1.0","end"); self._batch_comment.insert("1.0",result.get("comment",""))
+        info=result.get("video_info",{}); selected=result.get("selected_frame") or {}
+        self._batch_summary_var.set(
+            f"{self._batch_selected_index+1}/{len(self._batch_videos)}  {os.path.basename(path)}\n"
+            f"状態: {result.get('status','未解析')}　{info.get('frame_count','--')}フレーム　"
+            f"{float(info.get('fps',0)):.2f}fps　{float(info.get('duration',0)):.2f}秒\n"
+            f"音声候補: {len(result.get('audio_candidates',[]))}件　選択フレーム: "
+            f"{('F'+str(selected.get('frame_no'))) if selected else '--'}")
+        self._draw_batch_preview(path,selected)
+
+    def _draw_batch_preview(self,path,selected):
+        cv=self._batch_preview; cv.delete("all"); cv.update_idletasks()
+        if not selected:
+            cv.create_text(max(cv.winfo_width(),300)//2,max(cv.winfo_height(),220)//2,
+                           text="解析結果なし",fill="white",font=_tk_font(14,bold=True)); return
+        frame=grab_frame(path,float(selected.get("time",0)))
+        if frame is None:return
+        image=Image.fromarray(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)); draw=ImageDraw.Draw(image,"RGBA")
+        iw,ih=image.size
+        for key,value in selected.get("kps",{}).items():
+            try:
+                if float(value[2])>=.05:
+                    x,y=float(value[0])*iw,float(value[1])*ih; r=max(4,int(min(iw,ih)*.008))
+                    draw.ellipse((x-r,y-r,x+r,y+r),fill=KP_COLORS[int(key)],outline="white",width=2)
+            except Exception:pass
+        cw=max(cv.winfo_width(),400); ch=max(cv.winfo_height(),260)
+        image.thumbnail((cw,ch),Image.LANCZOS); self._batch_preview_ref=ImageTk.PhotoImage(image)
+        cv.create_image(cw//2,ch//2,image=self._batch_preview_ref,anchor="center")
+
+    def _save_batch_comment(self,event=None):
+        if not self._batch_videos:return
+        path=self._batch_videos[self._batch_selected_index]
+        result=self._batch_results.get(path,{"video":path,"status":"未解析"})
+        result["comment"]=self._batch_comment.get("1.0","end").strip()
+        self._batch_results[path]=result
+        try:save_batch_result(path,result)
+        except Exception:pass
+        self._write_batch_report(silent=True)
+
+    def _write_batch_report(self,silent=False):
+        folder=self._batch_folder_var.get().strip()
+        if not folder:return None
+        results=[]
+        for path in self._batch_videos:
+            result=dict(self._batch_results.get(path,{"video":path,"status":"未解析"}))
+            result["review_comments"]=load_review_comments(path)
+            results.append(result)
+        report_path=os.path.join(folder,"HitMomentAnalyzer_batch_report.txt")
+        try:
+            with open(report_path,"w",encoding="utf-8-sig") as f:f.write(format_batch_report(folder,results))
+            if not silent:self._batch_progress_var.set(f"レポート更新: {report_path}")
+            return report_path
+        except Exception as e:
+            if not silent:messagebox.showerror("レポート",str(e))
+            return None
+
+    def _open_batch_video(self):
+        if not self._batch_videos:return
+        self._save_batch_comment(); path=self._batch_videos[self._batch_selected_index]
+        self.video_path.set(path); self._cached_video_path=""
+        extra=load_video_extra_metadata(path)
+        self._video_meta_extra=extra
+        self.sensitivity.set(float(extra.get("sensitivity",.4)))
+        self.wall_mode.set(extra.get("content_type")=="壁打ち")
+        self._analysis_first_minute=bool(extra.get("first_minute_only",False))
+        self._proceed_video_load(path)
+
+    def _start_batch_validation(self):
+        if self._batch_running:return
+        if not self._batch_videos:
+            self._batch_pick_folder()
+            if not self._batch_videos:return
+        self._save_batch_comment(); self._batch_running=True
+        self._batch_start_btn.configure(state="disabled")
+        pending=[]
+        for path in self._batch_videos:
+            old=self._batch_results.get(path)
+            try:size=os.path.getsize(path)
+            except Exception:size=-1
+            if (self._batch_force_reanalyze.get() or not old or
+                    int(old.get("analysis_version",0))!=2 or
+                    int(old.get("video_size",-2))!=int(size) or old.get("status")!="完了"):
+                pending.append(path)
+        if not pending:
+            self._batch_running=False; self._batch_start_btn.configure(state="normal")
+            self._write_batch_report(); return
+        def _worker():
+            try:
+                import onnxruntime as ort
+                from rtmlib import Body
+                from ultralytics import YOLO
+                device="cuda" if "CUDAExecutionProvider" in ort.get_available_providers() else "cpu"
+                pose=Body(to_openpose=False,mode="lightweight",backend="onnxruntime",device=device)
+                ball_model=YOLO("yolov8n.pt")
+                for number,path in enumerate(pending,1):
+                    self.after(0,lambda n=number,total=len(pending),p=path:
+                               self._batch_progress_var.set(f"{n}/{total} 解析中: {os.path.basename(p)}"))
+                    previous=self._batch_results.get(path,{})
+                    try:result=self._analyze_batch_video(path,pose,ball_model)
+                    except Exception as e:
+                        result={"video":path,"video_size":os.path.getsize(path),"status":f"エラー: {e}",
+                                "comment":previous.get("comment","")}
+                    result["comment"]=previous.get("comment",result.get("comment",""))
+                    self._batch_results[path]=result; save_batch_result(path,result)
+                    self.after(0,self._refresh_batch_tree); self._write_batch_report(silent=True)
+                self.after(0,lambda:self._batch_progress_var.set(
+                    f"完了: {len(pending)}本 / レポート {os.path.join(self._batch_folder_var.get(),'HitMomentAnalyzer_batch_report.txt')}"))
+            except Exception as e:
+                err=str(e); self.after(0,lambda message=err:messagebox.showerror("一括解析",message))
+            finally:
+                self._batch_running=False; self.after(0,lambda:self._batch_start_btn.configure(state="normal"))
+                self.after(0,self._show_batch_selected)
+        threading.Thread(target=_worker,daemon=True).start()
+
+    def _analyze_batch_video(self,path,pose,ball_model):
+        """Analyze one video without mutating the currently open single-video UI."""
+        extra=load_video_extra_metadata(path); sensitivity=float(extra.get("sensitivity",.4))
+        wall=extra.get("content_type")=="壁打ち"; first60=bool(extra.get("first_minute_only",False))
+        cache_path=get_analysis_cache_path(path,first60); data=load_analysis_cache(cache_path)
+        required={"combined","impact","wall","broadband"}
+        if data is None or not required.issubset(data):
+            stem=os.path.splitext(os.path.basename(path))[0]
+            audio_dir=os.path.join(get_video_data_dir(path),"audio"); os.makedirs(audio_dir,exist_ok=True)
+            audio_path=os.path.join(audio_dir,f"{stem}_first60.mp3" if first60 else f"{stem}.mp3")
+            extract_audio(path,audio_path,60.0 if first60 else None); data=analyze_audio(audio_path)
+            save_analysis_cache(cache_path,data)
+        indices,_,rejected=detect_peaks(data,sensitivity,WALL_PEAK_MIN_GAP if wall else 1.0,
+            wall_mode=wall,use_frequency_filter=True,return_rejected=True,frequency_mode="combined")
+        candidates=[{"idx":int(i),"time":float(data["times"][i])} for i in indices]
+        top=select_sound_top_candidates(candidates,data,"combined",3)
+        energy=audio_energy_series(data,"combined"); times=np.asarray(data.get("times",[]),dtype=float)
+        audit={int(c["idx"]):{"state":"上位3件外","reason":"軽量姿勢未検証"} for c in candidates}
+        for i in rejected:audit[int(i)]={"state":"除外","reason":"壁音間隔" if wall else "最小ピーク間隔"}
+        cap=cv2.VideoCapture(path); fps=cap.get(cv2.CAP_PROP_FPS) or 30.0
+        frame_count=int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0); duration=frame_count/fps if fps else 0
+        sound_delay=3.0/SOUND_SPEED
+        def pose_at(t,with_ball=False):
+            frame_no=max(0,min(max(0,frame_count-1),int(round(max(0,t)*fps))))
+            cap.set(cv2.CAP_PROP_POS_FRAMES,frame_no); ok,bgr=cap.read()
+            if not ok:return {"time":frame_no/fps,"frame_no":frame_no,"kps":{},"feat":None}
+            h,w=bgr.shape[:2]; keypoints,scores=pose(bgr); kps=rtmpose_result_to_coco(keypoints,scores,w,h)
+            if with_ball:
+                obj=ball_model.predict(bgr,verbose=False,conf=.06,imgsz=1280,classes=[32])[0]
+                if obj.boxes is not None and len(obj.boxes)>0:
+                    confs=obj.boxes.conf.cpu().numpy(); boxes=obj.boxes.xyxy.cpu().numpy()
+                    centers=np.column_stack(((boxes[:,0]+boxes[:,2])*.5/w,(boxes[:,1]+boxes[:,3])*.5/h))
+                    wrists=[np.asarray(v[:2]) for v in (kps.get("9"),kps.get("10")) if v and float(v[2])>=.15]
+                    if wrists:
+                        distances=np.min(np.stack([np.linalg.norm(centers-wr,axis=1) for wr in wrists]),axis=0)
+                        bi=int(np.argmin(distances-.06*confs))
+                    else:bi=int(np.argmax(confs))
+                    box=boxes[bi]; kps["18"]=[float((box[0]+box[2])*.5/w),float((box[1]+box[3])*.5/h),float(confs[bi])]
+            return {"time":frame_no/fps,"frame_no":frame_no,"kps":kps,"feat":self._coco_pose_features(kps)}
+        accepted=[]
+        for cand in top:
+            center=max(0,float(cand["time"])-sound_delay)
+            samples=[pose_at(min(duration,max(0,center+d))) for d in HP_POSE_SAMPLE_OFFSETS]
+            verdict=self._classify_hp_pose_triplet(samples)
+            audit[int(cand["idx"])]={"state":"採用" if verdict["keep"] else "除外",
+                                     "reason":verdict.get("reason",""),"travel":verdict.get("travel")}
+            if verdict["keep"]:
+                item=dict(cand); item.update({"pose_travel":verdict.get("travel"),
+                    "pose_arm_change":verdict.get("arm_change"),"pose_shot":verdict.get("shot")})
+                accepted.append(item)
+        target=select_motion_validation_target(accepted,data,"combined")
+        scored=[]; best=None
+        if target:
+            corrected=max(0,float(target["time"])-sound_delay)
+            first=max(0,int(math.floor((corrected-.2)*fps)))
+            last=min(max(0,frame_count-1),int(math.ceil((corrected+.2)*fps)))
+            frames=[pose_at(frame_no/fps,with_ball=True) for frame_no in range(first,last+1)]
+            frames=build_person_relative_tracks(frames,min_conf=.05)
+            frames=mark_experiment_track_outliers(frames)
+            side_view="横" in str(extra.get("camera_dir",""))
+            scored,best=score_full_frame_hit_candidates(frames,corrected,side_view=side_view)
+            save_experiment_cache(path,scored,best,target,corrected,fps)
+        cap.release()
+        audio_rows=[]
+        combined=[]
+        for c in candidates+[{"idx":int(i),"time":float(times[i])} for i in rejected]:
+            idx=int(c["idx"])
+            if idx in combined:continue
+            combined.append(idx); state=audit.get(idx,{})
+            audio_rows.append({"rank":len(audio_rows)+1,"idx":idx,"time":float(c["time"]),
+                "energy":float(energy[idx]) if idx<len(energy) else 0.0,
+                "state":state.get("state","未検証"),"reason":state.get("reason","")})
+        audio_rows.sort(key=lambda c:c["time"])
+        for i,row in enumerate(audio_rows,1):row["rank"]=i
+        selected=None if best is None else _json_safe(scored[best])
+        return {"video":os.path.abspath(path),"video_size":os.path.getsize(path),"status":"完了",
+                "analyzed_at":time.strftime("%Y-%m-%d %H:%M:%S"),"comment":"",
+                "analysis_version":2,"video_info":{"frame_count":frame_count,"fps":fps,"duration":duration},
+                "settings":{"sensitivity":sensitivity,"wall_mode":wall,"audio_mode":"combined",
+                            "first_minute_only":first60,"pose_backend":"rtmpose+yolo-ball"},
+                "audio_candidates":audio_rows,"target":_json_safe(target) if target else None,
+                "selected_frame":selected,"frames":_json_safe(scored)}
 
     def _initialize_experiment_split(self):
         if self._experiment_split_initialized:return
@@ -4269,7 +4711,8 @@ class TennisApp(tk.Tk):
                         f"全フレーム解析中… {o}/{t}"))
                 frames=build_person_relative_tracks(frames,min_conf=.05)
                 frames=mark_experiment_track_outliers(frames)
-                scored,best=score_full_frame_hit_candidates(frames,corrected)
+                camera_dir=str((getattr(self,"_video_meta_extra",{}) or {}).get("camera_dir",""))
+                scored,best=score_full_frame_hit_candidates(frames,corrected,side_view="横" in camera_dir)
                 if self._gen==gen:self.after(0,lambda:self._show_experiment_results(
                     scored,best,target,corrected,fps))
             except Exception as e:
@@ -4305,6 +4748,7 @@ class TennisApp(tk.Tk):
         self._experiment_status.set(
             f"{'保存結果を復元' if restored else '完了'}: 上位3件の手首移動最大 {float(target['time']):.3f}s → 音速補正 {corrected:.3f}s / 自動候補 F{chosen['frame_no']} {chosen['time']:.3f}s")
         self._update_experiment_diagnostics()
+        self._load_experiment_review()
         if not restored:save_experiment_cache(self.video_path.get(),frames,best,target,corrected,fps)
 
     def _experiment_absolute_tracks(self,frame):
@@ -4415,6 +4859,39 @@ class TennisApp(tk.Tk):
         self._rerender_experiment_images()
         self._draw_experiment_graphs()
         self._update_experiment_diagnostics()
+
+    def _load_experiment_review(self):
+        if not hasattr(self,"_experiment_comment"):return
+        review=load_review_comments(self.video_path.get()).get("frame_validation",{})
+        self._experiment_comment.delete("1.0","end")
+        self._experiment_comment.insert("1.0",review.get("comment",""))
+        if review.get("preferred_frame_no") is not None:
+            self._experiment_preferred_var.set(
+                f"正確なHP: F{review['preferred_frame_no']} / {float(review.get('preferred_time',0)):.3f}s")
+        else:self._experiment_preferred_var.set("正確なHP: 未指定")
+
+    def _save_experiment_review(self,event=None):
+        path=self.video_path.get().strip()
+        if not path or not hasattr(self,"_experiment_comment"):return
+        data=load_review_comments(path); review=data.setdefault("frame_validation",{})
+        review["comment"]=self._experiment_comment.get("1.0","end").strip()
+        review["updated_at"]=time.strftime("%Y-%m-%d %H:%M:%S")
+        save_review_comments(path,data)
+
+    def _mark_preferred_experiment_frame(self):
+        if not getattr(self,"_experiment_frames",None):return
+        self._save_experiment_review(); index=max(0,min(self._experiment_selected_frame,len(self._experiment_frames)-1))
+        frame=self._experiment_frames[index]; path=self.video_path.get().strip()
+        data=load_review_comments(path); review=data.setdefault("frame_validation",{})
+        review.update({"preferred_frame_no":int(frame["frame_no"]),
+                       "preferred_time":float(frame["time"]),
+                       "preferred_reason":self._experiment_comment.get("1.0","end").strip(),
+                       "automatic_frame_no":int(self._experiment_frames[
+                           max(0,min(getattr(self,"_experiment_auto_frame",index),len(self._experiment_frames)-1))]["frame_no"]),
+                       "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")})
+        save_review_comments(path,data)
+        self._experiment_preferred_var.set(f"正確なHP: F{frame['frame_no']} / {float(frame['time']):.3f}s")
+        self._experiment_status.set("選択写真を正確なヒットポイントとして、コメント・理由と共に保存しました")
 
     def _update_experiment_diagnostics(self):
         if not getattr(self,"_experiment_frames",None):return
@@ -4725,6 +5202,7 @@ class TennisApp(tk.Tk):
         rejected=getattr(self,"_selected_rejected_candidate",None)
         if not hasattr(self,"_hp_detail_canvases") or (not self.peaks and not rejected):return
         peak=rejected if rejected is not None else self.peaks[self.peak_idx]
+        self._load_hp_detail_comment(peak,rejected is not None)
         samples=list(peak.get("pose_samples") or [])
         if rejected is not None and len(samples)<5:
             samples=self._rejected_preview_samples(peak)
@@ -4761,6 +5239,23 @@ class TennisApp(tk.Tk):
                 f"赤点 No{peak['rank']}（{float(peak['time']):.2f}s）の不採用理由: {label}")
         else:
             self._hp_rejected_reason_var.set("")
+
+    def _save_hp_detail_comment(self,event=None):
+        if not getattr(self,"_hp_comment_key",None) or not hasattr(self,"_hp_detail_comment"):return
+        path=self.video_path.get().strip()
+        if not path:return
+        data=load_review_comments(path); data.setdefault("hit_points",{})[self._hp_comment_key]={
+            "comment":self._hp_detail_comment.get("1.0","end").strip(),
+            "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")}
+        save_review_comments(path,data)
+
+    def _load_hp_detail_comment(self,peak,rejected=False):
+        if not hasattr(self,"_hp_detail_comment"):return
+        key=f"{'rejected' if rejected else 'accepted'}:{int(peak.get('rank',0))}:{float(peak.get('time',0)):.3f}"
+        if key==getattr(self,"_hp_comment_key",None):return
+        self._save_hp_detail_comment(); self._hp_comment_key=key
+        entry=load_review_comments(self.video_path.get()).get("hit_points",{}).get(key,{})
+        self._hp_detail_comment.delete("1.0","end"); self._hp_detail_comment.insert("1.0",entry.get("comment",""))
 
     def _on_error(self,msg):
         try: self.progress.stop()
@@ -6752,7 +7247,8 @@ class TennisApp(tk.Tk):
     def _on_tab_changed(self,event=None):
         try:selected=str(self.tabs.select())
         except Exception:selected=""
-        experiment=selected==str(getattr(self,"tab_frame_validation",""))
+        experiment=selected in (str(getattr(self,"tab_frame_validation","")),
+                                str(getattr(self,"tab_batch_validation","")))
         if experiment and self.left.winfo_manager():
             self.left.pack_forget(); self.main.pack_forget()
             self.main.pack(fill="both",expand=True)
@@ -6813,6 +7309,8 @@ class TennisApp(tk.Tk):
             self._refresh_hp_detail()
         elif selected==str(self.tab_frame_validation):
             self._rerender_experiment_images()
+        elif selected==str(self.tab_batch_validation):
+            self._show_batch_selected()
         elif selected==str(self.tab_truth_summary):
             self._refresh_truth_summary()
 
